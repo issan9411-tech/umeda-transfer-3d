@@ -27,19 +27,19 @@ export function addMidosujiUmeda(b: NetBuilder): void {
       { key: 'n', t: 0.9, name: '北寄り（北改札・阪急方面）' },
     ],
   });
-  const gate = (key: string, at: LatLon, outAt: LatLon, name: string, stop: string, busy: number) => {
+  const gate = (key: string, at: LatLon, outAt: LatLon, name: string, stop: string, busy: number, towardPlatform: number) => {
     const inId = `m_${key}_in`;
     const conc = `m_${key}_conc`;
-    b.node(conc, 'vertical', `${name}内コンコース`, offset(at, 180, 0.1), 'B1', { station: st, paid: true, y: -5.5 });
+    b.node(conc, 'vertical', `${name}内コンコース`, offset(at, towardPlatform, 8), 'B1', { station: st, paid: true, y: -5.5 });
     b.vertical(stop, conc, ['stairs', 'esc'], { busy });
     b.node(inId, 'gate', `御堂筋線 ${name}`, at, 'B1', { station: st, paid: true, label: true, y: -5.5 });
     b.walk(conc, inId, { busy });
     b.node(`m_${key}_out`, 'junction', `御堂筋線 ${name}前`, outAt, 'B1', { station: st, y: -6 });
     b.gate(inId, `m_${key}_out`, `御堂筋線梅田 ${name}`, { busy, width: 20 });
   };
-  gate('n', [34.70345, 135.4987], [34.70362, 135.49868], '北改札', s.n, 3);
-  gate('c', [34.7019, 135.49805], [34.7019, 135.4978], '中改札', s.m, 2);
-  gate('s', [34.70055, 135.49838], [34.70038, 135.49838], '南改札', s.s, 3);
+  gate('n', [34.70345, 135.4987], [34.70362, 135.49868], '北改札', s.n, 3, 180);
+  gate('c', [34.7019, 135.49805], [34.7019, 135.4978], '中改札', s.m, 2, 90);
+  gate('s', [34.70055, 135.49838], [34.70038, 135.49838], '南改札', s.s, 3, 0);
   // Step-free: one elevator from the middle of the platform to the 中改札 concourse.
   b.elev(s.m, 'm_c_conc');
 }
@@ -84,7 +84,8 @@ export function addHigashiUmeda(b: NetBuilder): void {
 export function addNishiUmeda(b: NetBuilder): void {
   const st = 'nishiumeda';
   const N: LatLon = [34.70045, 135.49545];
-  const S: LatLon = [34.69885, 135.49565];
+  // South gate ≈70 m north of JR北新地 西改札 (sources: 1–2 min, ≈100 m gate to gate).
+  const S: LatLon = [34.6994, 135.4956];
   const s = b.platform({
     id: 'y-1-2',
     station: st,

@@ -100,6 +100,7 @@ export class UmedaView {
 
     this.renderer.domElement.addEventListener('pointermove', (ev) => this.onPointerMove(ev));
     this.renderer.domElement.addEventListener('pointerdown', (ev) => this.onPointerDown(ev));
+    this.renderer.domElement.addEventListener('pointerleave', () => this.clearHover());
     this.renderer.domElement.addEventListener('click', (ev) => this.onClick(ev));
   }
 
@@ -329,8 +330,11 @@ export class UmedaView {
     this.clearGroup(this.labelGroup);
     if (!this.showLabels) return;
     for (const s of this.g.net.stations) {
-      const lvl = this.g.net.levels.reduce((best, l) => (Math.abs(l.y - s.anchor[1]) < Math.abs(best.y - s.anchor[1]) ? l : best));
-      if (!this.levelVisible(lvl.id)) continue;
+      // A station label follows its platforms' levels (the anchor may sit on another level).
+      const platLevels = this.g.net.platforms.filter((p) => p.stationId === s.id).map((p) => p.level);
+      const nearest = this.g.net.levels.reduce((best, l) => (Math.abs(l.y - s.anchor[1]) < Math.abs(best.y - s.anchor[1]) ? l : best));
+      const visible = platLevels.length ? platLevels.some((l) => this.levelVisible(l)) : this.levelVisible(nearest.id);
+      if (!visible) continue;
       const el = document.createElement('div');
       el.className = 'lbl lbl-station';
       el.style.setProperty('--c', s.color);
@@ -381,14 +385,13 @@ export class UmedaView {
       const isSel = idx === this.selected;
       const pts = r.path.nodes.map((ni) => this.v(this.g.nodes[ni]).add(new THREE.Vector3(0, isSel ? 1.4 : 0.9, 0)));
       if (pts.length < 2) return;
-      const path = new THREE.CurvePath<THREE.Vector3>();
-      for (let i = 0; i < pts.length - 1; i++) {
-        if (pts[i].distanceTo(pts[i + 1]) < 0.01) continue;
-        path.add(new THREE.LineCurve3(pts[i], pts[i + 1]));
-      }
-      if (path.curves.length === 0) return;
-      const segs = Math.min(1200, Math.max(16, path.curves.length * 6));
-      const geo = new THREE.TubeGeometry(path as unknown as THREE.Curve<THREE.Vector3>, segs, isSel ? 1.7 : 0.9, 8, false);
+      const q = [pts[0]];
+      for (let i = 0; i < pts.length - 1; i++) if (pts[i].distanceTo(pts[i + 1]) >= 0.01) q.push(pts[i + 1]);
+      const nSeg = q.length - 1;
+      if (nSeg === 0) return;
+      // An integer number of samples per segment, so every route vertex is sampled exactly.
+      const k = Math.max(1, Math.min(6, Math.floor(1200 / nSeg)));
+      const geo = new THREE.TubeGeometry(new PolylineCurve(q), nSeg * k, isSel ? 1.7 : 0.9, 8, false);
       const mat = isSel
         ? new THREE.MeshLambertMaterial({ color: p.accent, emissive: p.accent, emissiveIntensity: 0.55 })
         : new THREE.MeshLambertMaterial({ color: p.alt, transparent: true, opacity: 0.55, depthWrite: false });
@@ -397,12 +400,12 @@ export class UmedaView {
       this.routeGroup.add(tube);
 
       if (isSel) {
-        // Gate names along the route stay visible at every zoom level.
+        // Gate and landmark names along the route stay visible at every zoom level.
         for (const ni of r.path.nodes) {
           const n = this.g.nodes[ni];
-          if (n.kind !== 'gate' || !n.paid) continue;
+          if (!n.label && !(n.kind === 'gate' && n.paid)) continue;
           const el = document.createElement('div');
-          el.className = 'lbl lbl-node lbl-gate lbl-route';
+          el.className = `lbl lbl-node lbl-${n.kind} lbl-route`;
           el.textContent = n.name;
           const obj = new CSS2DObject(el);
           obj.position.copy(this.v(n)).add(new THREE.Vector3(0, 4, 0));
@@ -602,7 +605,7 @@ export class UmedaView {
   }
 
   /** Updates the crowd instances from packed positions. */
-  setCrowd(positions: Float32Array | null, colors: Uint32Array | null, count: number): void {
+  setCrowd(positions: Float32Array | null, colors: Uint32Array | null, count: number, edgeOf: Int32Array | null = null): void {
     if (!positions || !colors || count === 0) {
       if (this.crowdMesh) this.crowdMesh.count = 0;
       return;
@@ -622,12 +625,22 @@ export class UmedaView {
     }
     const m4 = new THREE.Matrix4();
     const mesh = this.crowdMesh;
+    // Agents are drawn oversized for the overview; shrink them as the camera closes in.
+    const sc = Math.min(1, Math.max(0.3, this.camera.position.distanceTo(this.controls.target) / 500));
     let w = 0;
     for (let i = 0; i < count; i++) {
       const y = positions[i * 3 + 1];
-      const lvl = this.levelOfY(y);
-      if (lvl && !this.levelVisible(lvl)) continue;
-      m4.makeTranslation(positions[i * 3], this.Y(y) + 3.8, positions[i * 3 + 2]);
+      if (edgeOf) {
+        // Same rule as the network lines: hidden only when both ends of its edge are hidden.
+        const ed = this.g.edges[edgeOf[i]];
+        const la = this.g.nodes[this.g.nodeIndex.get(ed.a) as number].level;
+        const lb = this.g.nodes[this.g.nodeIndex.get(ed.b) as number].level;
+        if (!this.levelVisible(la) && !this.levelVisible(lb)) continue;
+      } else {
+        const lvl = this.levelOfY(y);
+        if (lvl && !this.levelVisible(lvl)) continue;
+      }
+      m4.makeScale(sc, sc, sc).setPosition(positions[i * 3], this.Y(y) + 3.8 * sc, positions[i * 3 + 2]);
       mesh.setMatrixAt(w, m4);
       mesh.setColorAt(w, tmpColor.setHex(colors[i]));
       w++;
@@ -670,8 +683,20 @@ export class UmedaView {
     return [ev.clientX - rect.left, ev.clientY - rect.top];
   }
 
+  private clearHover(): void {
+    if (this.hovered) {
+      (this.hovered.material as THREE.MeshLambertMaterial).emissiveIntensity = this.hovered.userData.baseEmissive;
+      this.hovered = null;
+    }
+    this.renderer.domElement.style.cursor = '';
+    this.events.onHoverPlatform?.(null, 0, 0);
+  }
+
   private onPointerMove(ev: PointerEvent): void {
-    if (ev.buttons) return;
+    if (ev.buttons) {
+      this.clearHover();
+      return;
+    }
     const m = this.pickPlatform(ev);
     const [x, y] = this.local(ev);
     if (m !== this.hovered) {
@@ -687,6 +712,7 @@ export class UmedaView {
 
   private onPointerDown(ev: PointerEvent): void {
     this.downAt = [ev.clientX, ev.clientY];
+    this.clearHover();
   }
 
   private onClick(ev: MouseEvent): void {
@@ -747,6 +773,34 @@ export class UmedaView {
 }
 
 // ---------------------------------------------------------------- geometry utils
+
+/**
+ * Polyline parameterised uniformly per segment (not by arc length), so that TubeGeometry samples
+ * land on the vertices instead of cutting corners.
+ */
+class PolylineCurve extends THREE.Curve<THREE.Vector3> {
+  private pts: THREE.Vector3[];
+
+  constructor(pts: THREE.Vector3[]) {
+    super();
+    this.pts = pts;
+  }
+
+  override getPoint(t: number, target = new THREE.Vector3()): THREE.Vector3 {
+    const n = this.pts.length - 1;
+    const f = Math.min(Math.max(t, 0), 1) * n;
+    const i = Math.min(Math.floor(f), n - 1);
+    return target.lerpVectors(this.pts[i], this.pts[i + 1], f - i);
+  }
+
+  override getPointAt(u: number, target?: THREE.Vector3): THREE.Vector3 {
+    return this.getPoint(u, target);
+  }
+
+  override getTangentAt(u: number, target?: THREE.Vector3): THREE.Vector3 {
+    return this.getTangent(u, target);
+  }
+}
 
 /** Andrew's monotone chain convex hull. */
 export function convexHull(points: [number, number][]): [number, number][] {

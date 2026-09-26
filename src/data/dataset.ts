@@ -6,9 +6,15 @@ export interface ReferenceTime {
   to: string;
   /** Minutes quoted by the source. */
   minutes: number;
-  /** Acceptable band for the model's "typical" value, in minutes. */
+  /** Acceptable band for the model value, in minutes (always contains `minutes`). */
   range: [number, number];
   source: string;
+  /**
+   * For figures measured gate to gate: the model is evaluated between these two nodes
+   * instead of platform to platform.
+   */
+  fromNode?: string;
+  toNode?: string;
 }
 
 export interface DataSource {

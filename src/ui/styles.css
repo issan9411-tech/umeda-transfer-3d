@@ -114,6 +114,15 @@ input {
   display: none !important;
 }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
 .app {
   display: grid;
   grid-template-columns: var(--panel-w) minmax(0, 1fr);
@@ -635,6 +644,11 @@ input[type="radio"] {
 
 .step:hover {
   background: var(--surface-2);
+}
+
+.step:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
 }
 
 .step.is-now {

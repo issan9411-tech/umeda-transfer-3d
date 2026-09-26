@@ -56,7 +56,8 @@ export const KIND_COLORS: Record<EdgeKind, number> = {
 /** Green → amber → red ramp for crowd density (persons/m²). */
 export function heatColor(rho: number, out = new THREE.Color()): THREE.Color {
   const t = Math.max(0, Math.min(1, rho / 2));
-  if (t < 0.5) return out.setRGB(0.12 + t * 1.6, 0.66 - t * 0.1, 0.35 - t * 0.5);
+  // Values are sRGB (they match the CSS legend), so convert like setHex does.
+  if (t < 0.5) return out.setRGB(0.12 + t * 1.6, 0.66 - t * 0.1, 0.35 - t * 0.5, THREE.SRGBColorSpace);
   const u = (t - 0.5) * 2;
-  return out.setRGB(0.92, 0.61 - u * 0.4, 0.1 + u * 0.12);
+  return out.setRGB(0.92, 0.61 - u * 0.4, 0.1 + u * 0.12, THREE.SRGBColorSpace);
 }

@@ -1,5 +1,5 @@
 import { arcIndex, buildCostModel, type CostModel, type CostOptions } from './cost';
-import { paidAreaBans, type Graph } from './graph';
+import { transferBans, type Graph } from './graph';
 import { buildInstructions, type Instruction } from './instructions';
 import { diverseRoutes } from './ksp';
 import type { Path } from './search';
@@ -212,8 +212,8 @@ export function planRoute(g: Graph, query: RouteQuery, model?: CostModel): Route
   const m = model ?? buildCostModel(g, query.options);
   const sources = endpointSources(g, query.from, query.boarding);
   const targets = endpointTargets(g, query.to);
-  const bannedNodes = paidAreaBans(g, [query.from.stationId, query.to.stationId]);
-  const paths = diverseRoutes(g, m, sources, targets, Math.max(1, query.alternatives), { bannedNodes });
+  const bans = transferBans(g, query.from.stationId, query.to.stationId);
+  const paths = diverseRoutes(g, m, sources, targets, Math.max(1, query.alternatives), bans);
   const routes = paths.map((p) => summarize(g, m, p));
   assignTags(g, routes);
   return { query, model: m, routes };

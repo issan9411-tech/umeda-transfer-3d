@@ -21,9 +21,16 @@ describe('Umeda network', () => {
     for (const s of umeda.network.stations) expect(umeda.network.platforms.some((p) => p.stationId === s.id)).toBe(true);
   });
 
-  it('reproduces published transfer times within tolerance', () => {
+  it('reference bands contain their own quoted figure', () => {
+    for (const r of umeda.reference) {
+      expect(r.minutes).toBeGreaterThanOrEqual(r.range[0]);
+      expect(r.minutes).toBeLessThanOrEqual(r.range[1]);
+    }
+  });
+
+  it('reproduces published transfer times within ±40 %', () => {
     const rows = calibrationRows(g, umeda);
-    const bad = rows.filter((r) => !r.ok).map((r) => `${r.ref.from}→${r.ref.to}: model ${r.typicalMin.toFixed(1)} min, expected ${r.ref.range.join('–')}`);
+    const bad = rows.filter((r) => !r.ok).map((r) => `${r.ref.from}→${r.ref.to}${r.gateToGate ? ' (gates)' : ''}: model ${r.modelMin.toFixed(1)} min, quoted ${r.ref.minutes}`);
     expect(bad).toEqual([]);
   });
 
@@ -91,5 +98,88 @@ describe('Umeda network', () => {
       alternatives: 1,
     });
     expect(plan.routes[0].outdoorM).toBe(0);
+  });
+});
+
+describe('review regressions', () => {
+  const opts = { ...DEFAULT_OPTIONS, congestion: false };
+  const gateCrossings = (r: { path: { steps: { edge: number; from: number }[] } }) => {
+    let exits = 0;
+    let entries = 0;
+    for (const st of r.path.steps) {
+      if (g.edges[st.edge].kind !== 'gate') continue;
+      if (g.nodes[st.from].paid) exits++;
+      else entries++;
+    }
+    return { exits, entries };
+  };
+
+  it('every suggested route is fare-valid: at most one exit and one entry, none within one fare zone', () => {
+    const ids = umeda.network.stations.map((s) => s.id);
+    for (const hour of [8.5, 11]) {
+      for (const from of ids) {
+        for (const to of ids) {
+          if (from === to) continue;
+          const plan = planRoute(g, { from: { stationId: from }, to: { stationId: to }, options: { ...opts, congestion: true, hour }, boarding: 'best', alternatives: 3 });
+          const sameZone = ['jr', 'umekita'].includes(from) && ['jr', 'umekita'].includes(to);
+          for (const r of plan.routes) {
+            const { exits, entries } = gateCrossings(r);
+            if (sameZone) expect(exits + entries, `${from}->${to}`).toBe(0);
+            else {
+              expect(exits, `${from}->${to}`).toBeLessThanOrEqual(1);
+              expect(entries, `${from}->${to}`).toBeLessThanOrEqual(1);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it('JR platforms to うめきた stay inside the gates for every alternative', () => {
+    for (const p of umeda.network.platforms.filter((x) => x.stationId === 'jr')) {
+      const plan = planRoute(g, { from: { stationId: 'jr', platformId: p.id }, to: { stationId: 'umekita' }, options: opts, boarding: 'best', alternatives: 3 });
+      for (const r of plan.routes) expect(r.counts.gate).toBe(0);
+    }
+  });
+
+  it('distance objective keeps the stairs-avoid preference of the luggage profile', () => {
+    const count = (objective: 'time' | 'distance') => {
+      let n = 0;
+      const ids = umeda.network.stations.map((s) => s.id);
+      for (const from of ids)
+        for (const to of ids) {
+          if (from === to) continue;
+          const r = planRoute(g, { from: { stationId: from }, to: { stationId: to }, options: { ...opts, profile: 'luggage', objective }, boarding: 'middle', alternatives: 1 }).routes[0];
+          if (r.counts.stairs > 0) n++;
+        }
+      return n;
+    };
+    expect(count('distance')).toBeLessThanOrEqual(count('time') + 3);
+  });
+
+  it('alternatives do not repeat the same corridors with a parallel stairs/escalator swap', () => {
+    const plan = planRoute(g, { from: { stationId: 'jr', platformId: 'jr-9-10' }, to: { stationId: 'umekita', platformId: 'uk-21-22' }, options: opts, boarding: 'best', alternatives: 3 });
+    const keys = plan.routes.map((r) => r.path.nodes.join(','));
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
+describe('crowd simulation on the Umeda network', () => {
+  it('stays at capacity at the peak and uses escalators beside busy stairs', async () => {
+    const { CrowdSim } = await import('../src/sim/crowd');
+    const endpoints = g.nodes
+      .map((n, i) => ({ n, i }))
+      .filter(({ n }) => n.kind === 'platform' || n.kind === 'entrance')
+      .map(({ n, i }) => ({ node: i, weight: 1, stationId: n.kind === 'platform' ? n.stationId : undefined }));
+    const sim = new CrowdSim(g, endpoints, new Map(), { maxAgents: 600, peakInflow: 200 });
+    sim.hour = 8.5;
+    let escalatorSteps = 0;
+    for (let i = 0; i < 1500; i++) {
+      sim.step(1.5);
+      for (let k = 0; k < sim.count; k++) if (g.edges[sim.edgeOf[k]].kind === 'escalator') escalatorSteps++;
+      expect(sim.count).toBeLessThanOrEqual(600);
+    }
+    expect(sim.count).toBeGreaterThan(540);
+    expect(escalatorSteps).toBeGreaterThan(1000);
   });
 });

@@ -151,7 +151,11 @@ export function addWalkways(b: NetBuilder): void {
   b.path(['f_ek2_b1', 'f_ek4_b1', 't_s_out'], { name: '大阪駅前ビル地下', busy: 1 });
 
   // 北新地 西改札 ↔ 西梅田 南改札 (1–3 min).
-  b.vertical('ks_w_out', 'y_s_out', ['stairs', 'esc'], { name: '地下鉄（西梅田）連絡口' });
+  b.j('f_ksw_b1', '地下鉄（西梅田）連絡口 地下1階', [34.69866, 135.4957], 'B1', B1);
+  b.vertical('ks_w_out', 'f_ksw_b1', ['stairs', 'esc'], { name: '地下鉄（西梅田）連絡口' });
+  b.walk('f_ksw_b1', 'y_s_out', { name: '西梅田 南改札への連絡通路', busy: 1 });
+  // Free passage along the east side of 西梅田 station north to ディアモール西 (阪神西口・ハービス方面).
+  b.walk('y_s_out', 'f_dm_w', { name: '西梅田駅東側 地下通路', busy: 1 });
 
   // 西梅田 北改札 ↔ JR 桜橋口 / KITTE大阪.
   b.j('f_sak_b1', 'JR桜橋口 地下', [34.7015, 135.4953], 'B1', B1);
@@ -172,7 +176,7 @@ export function addWalkways(b: NetBuilder): void {
   ent('e_park', 'うめきた公園', [34.70351, 135.49263], 'f_ugp1');
   ent('e_kitte', 'KITTE大阪・JPタワー', [34.70105, 135.4938], 'f_kitte1');
   ent('e_herbis', 'ハービスOSAKA', [34.7003, 135.4944], 'f_dm_w', 'B1');
-  ent('e_sakurabashi', '桜橋（北新地西）', [34.6982, 135.4953], 'y_s_out', 'B1');
+  ent('e_sakurabashi', '桜橋（北新地西）', [34.6982, 135.4953], 'f_ksw_b1', 'B1');
   ent('e_shindo', '梅田新道', [34.6985, 135.4999], 'f_ek4_b1', 'B1');
   ent('e_ohatsu', 'お初天神・曽根崎', [34.7015, 135.5029], 'f_izumi', 'B1');
   ent('e_hep', 'HEP FIVE・東通り', [34.7035, 135.5003], 'f_wh_n', 'B1');

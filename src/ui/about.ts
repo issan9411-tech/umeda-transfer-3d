@@ -8,20 +8,33 @@ import {
   STAIRS_DOWN_VV,
   STAIRS_UP_VV,
 } from '../core/cost';
-import type { Graph } from '../core/graph';
+import { buildCostModel } from '../core/cost';
+import { nodeIdx, transferBans, type Graph } from '../core/graph';
 import { transferMatrix } from '../core/matrix';
+import { shortestPath, sumArcs } from '../core/search';
 import type { DataSet } from '../data/dataset';
 import { escapeHtml, jpDuration, readableOn } from './format';
 
-/** Calibration rows: published transfer times vs. the model under standard, off-peak conditions. */
+/**
+ * Calibration rows: published transfer times vs. the model under standard, off-peak conditions.
+ * Gate-to-gate references are evaluated between their gate nodes; the rest platform to platform
+ * (the matrix "typical" value).
+ */
 export function calibrationRows(g: Graph, data: DataSet) {
-  const m = transferMatrix(g, { ...DEFAULT_OPTIONS, congestion: false, hour: 11 });
+  const options = { ...DEFAULT_OPTIONS, congestion: false, hour: 11 };
+  const model = buildCostModel(g, options);
+  const m = transferMatrix(g, options, model);
   const idx = new Map(m.stations.map((s, i) => [s, i]));
   return data.reference.map((ref) => {
     const cell = m.cells[idx.get(ref.from) ?? -1]?.[idx.get(ref.to) ?? -1];
-    const typicalMin = cell ? cell.typicalS / 60 : NaN;
-    const ok = typicalMin >= ref.range[0] && typicalMin <= ref.range[1];
-    return { ref, cell, typicalMin, ok };
+    let modelMin = cell ? cell.typicalS / 60 : NaN;
+    const gateToGate = !!(ref.fromNode && ref.toNode);
+    if (ref.fromNode && ref.toNode) {
+      const p = shortestPath(g, model, [nodeIdx(g, ref.fromNode)], [nodeIdx(g, ref.toNode)], transferBans(g, ref.from, ref.to));
+      modelMin = p ? sumArcs(model.time, p) / 60 : NaN;
+    }
+    const ok = modelMin >= ref.range[0] && modelMin <= ref.range[1];
+    return { ref, cell, modelMin, gateToGate, ok };
   });
 }
 
@@ -44,10 +57,11 @@ export function renderAbout(g: Graph, data: DataSet): string {
     })
     .join('');
 
+  const label = (id: string) => `${badge(id)}${escapeHtml(st(id)?.short ?? id)}`;
   const calib = calibrationRows(g, data)
     .map(
-      ({ ref, cell, typicalMin, ok }) =>
-        `<tr><td>${badge(ref.from)}→${badge(ref.to)}</td><td>${ref.minutes}分</td><td>${cell ? jpDuration(cell.typicalS) : '—'}<br><span style="opacity:.7">最短 ${cell ? jpDuration(cell.bestS) : '—'}</span></td><td>${ok ? '✓' : `△ (${typicalMin.toFixed(1)}分)`}</td><td style="font-size:11px">${escapeHtml(ref.source)}</td></tr>`,
+      ({ ref, modelMin, gateToGate, ok }) =>
+        `<tr><td>${label(ref.from)}→${label(ref.to)}<br><span style="opacity:.7">${gateToGate ? '改札間' : 'ホーム間'}</span></td><td>${ref.minutes}分</td><td>${jpDuration(modelMin * 60)}</td><td>${ok ? '✓' : '△'}</td><td style="font-size:11px">${escapeHtml(ref.source)}</td></tr>`,
     )
     .join('');
 
@@ -90,7 +104,7 @@ export function renderAbout(g: Graph, data: DataSet): string {
     </table></div>
 
     <h2>公表値との比較</h2>
-    <p>乗換案内サービスや駅の案内で一般に示される乗換時間と、本モデルの「標準」値（平日11時・混雑なし・標準の歩き方）の比較です。</p>
+    <p>案内サイトや鉄道会社が示す乗換時間と、本モデルの値（平日11時・混雑なし・標準の歩き方）の比較です。改札間の値は同じ改札どうしで、ホーム間の値は各ホームの中ほどからの平均で比べています。✓は許容範囲内、△は範囲外です。</p>
     <div class="table-wrap"><table>
       <tr><th>区間</th><th>公表値</th><th>モデル</th><th>判定</th><th>出典</th></tr>
       ${calib}

@@ -99,7 +99,7 @@ const BANK = {
 type BankKey = keyof typeof BANK;
 
 const STOP_NAMES: Record<BankKey, string> = {
-  nishi: '西端（西口・うめきた方面階段付近）',
+  nishi: '西寄り（西口・うめきた方面の階段まで約60m）',
   sakura: '西寄り（桜橋口階段付近）',
   bridge: '中ほど（連絡橋口エスカレーター付近）',
   chuo: '中ほど東寄り（中央口階段付近）',
@@ -113,6 +113,8 @@ function atLon(p: JrPlatform, lon: number): LatLon {
 }
 
 const AXIS = 76; // bearing of the platforms (ENE)
+/** ≈60 m along the platform axis, in degrees of longitude. */
+const NISHI_DOOR_DLON = 0.00064;
 
 export function addJrOsaka(b: NetBuilder): void {
   const st = 'jr';
@@ -134,12 +136,20 @@ export function addJrOsaka(b: NetBuilder): void {
       width: p.width,
       busy: p.busy,
       stops: keys.map((k) => {
-        const q = toXZ(atLon(p, BANK[k]));
+        // Trains stop ≈60 m short of the 西口 stairs at the platform's far west end.
+        const q = toXZ(atLon(p, k === 'nishi' ? BANK.nishi + NISHI_DOOR_DLON : BANK[k]));
         const a = toXZ(p.W);
         const t = Math.hypot(q.x - a.x, q.z - a.z) / len;
         return { key: k, t, name: STOP_NAMES[k] };
       }),
     });
+  }
+
+  // 西口 stair heads at the far west end of each platform (not a boarding position).
+  const nishiTop = (p: JrPlatform) => `jr_nishiTop_${p.id}`;
+  for (const p of JR_PLATFORMS) {
+    b.node(nishiTop(p), 'junction', `${p.nameJa} 西口階段上`, atLon(p, BANK.nishi), '2F', { station: st, paid: true, y: PLAT_Y });
+    b.walk(stops[p.id].nishi, nishiTop(p), { name: `${p.nameJa}（西口階段へ）`, busy: 1, width: p.width * 0.6 });
   }
 
   const islands = JR_PLATFORMS.filter((p) => p.id !== 'jr-11');
@@ -151,7 +161,7 @@ export function addJrOsaka(b: NetBuilder): void {
     for (const p of islands) {
       const id = `jr_${bank}1_${p.id}`;
       b.node(id, 'vertical', `${label}（${p.nameJa}への階段下）`, landing(p, bank, along), '1F', { station: st, paid: true });
-      b.vertical(stops[p.id][bank], id, modes, { busy: p.busy });
+      b.vertical(bank === 'nishi' ? nishiTop(p) : stops[p.id][bank], id, modes, { busy: p.busy });
       ids.push(id);
     }
     b.path(ids, { name: `${label}改札内コンコース`, busy: 2, width: 12 });
@@ -211,9 +221,8 @@ export function addJrOsaka(b: NetBuilder): void {
   // 11番のりば access
   const p11 = JR_PLATFORMS[5];
   b.node('jr_11_nishi', 'vertical', '西口（11番のりばへのES・EV下）', landing(p11, 'nishi', 14), '1F', { station: st, paid: true });
-  b.vertical(stops['jr-11'].nishi, 'jr_11_nishi', ['esc', 'elev']);
+  b.vertical(nishiTop(p11), 'jr_11_nishi', ['esc', 'elev']);
   b.walk(nishi[nishi.length - 1], 'jr_11_nishi', { name: '西口改札内コンコース' });
-  b.stairs(stops['jr-11'].sakura, sak[sak.length - 1]);
   b.node('jr_11_mc', 'vertical', '11番のりば連絡中2階（中央口側）', landing(p11, 'chuo', -12), 'M2', { station: st, paid: true, y: MEZZ_Y });
   b.vertical(chuo[chuo.length - 1], 'jr_11_mc', ['stairs', 'esc', 'elev']);
   b.vertical('jr_11_mc', stops['jr-11'].chuo, ['stairs', 'esc', 'elev']);

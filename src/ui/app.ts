@@ -111,9 +111,28 @@ export class App {
     } catch {
       /* storage unavailable: use defaults */
     }
-    if (!this.parseEndpoint(s.from) || !this.parseEndpoint(s.to)) {
-      s.from = this.data.defaultRoute.from;
-      s.to = this.data.defaultRoute.to;
+    // Anything restored from storage may be stale or hand-edited: validate every field.
+    const d = this.defaults();
+    const oneOf = <T extends string>(v: unknown, xs: readonly T[], def: T): T =>
+      typeof v === 'string' && (xs as readonly string[]).includes(v) ? (v as T) : def;
+    const num = (v: unknown, lo: number, hi: number, def: number) =>
+      typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def;
+    const bool = (v: unknown, def: boolean) => (typeof v === 'boolean' ? v : def);
+    s.profile = oneOf(s.profile, Object.keys(PROFILES) as ProfileId[], d.profile);
+    s.objective = oneOf(s.objective, ['time', 'distance', 'comfort'] as const, d.objective);
+    s.boarding = oneOf(s.boarding, ['best', 'middle'] as const, d.boarding);
+    s.day = oneOf(s.day, ['weekday', 'holiday'] as const, d.day);
+    s.matrixMode = oneOf(s.matrixMode, ['typicalS', 'bestS'] as const, d.matrixMode);
+    s.speed = num(s.speed, 0.7, 2.0, PROFILES[s.profile].speed);
+    s.hour = num(s.hour, 5, 24, d.hour);
+    s.exag = num(s.exag, 1, 8, d.exag);
+    s.rate = [1, 4, 10, 30].includes(s.rate) ? s.rate : d.rate;
+    s.congestion = bool(s.congestion, d.congestion);
+    s.rain = bool(s.rain, d.rain);
+    s.labels = bool(s.labels, d.labels);
+    if (typeof s.from !== 'string' || typeof s.to !== 'string' || !this.parseEndpoint(s.from) || !this.parseEndpoint(s.to)) {
+      s.from = d.from;
+      s.to = d.to;
     }
     return s;
   }
@@ -138,7 +157,7 @@ export class App {
       hour: s.hour,
       day: s.day,
       congestion: s.congestion,
-      liveDensity: s.live && this.crowd ? this.crowd.density : null,
+      liveDensity: s.live && s.crowd && this.crowd ? this.crowd.density : null,
     };
   }
 
@@ -238,7 +257,7 @@ export class App {
     });
     onChange('live', (el) => {
       this.state.live = el.checked;
-      if (el.checked && !this.crowd) {
+      if (el.checked && !this.state.crowd) {
         ($('crowd') as HTMLInputElement).checked = true;
         this.toggleCrowd(true);
       }
@@ -265,7 +284,9 @@ export class App {
     onChange(
       'scrub',
       (el) => {
-        this.t = Number(el.value);
+        const v = Number(el.value);
+        const T = this.current()?.timeS ?? 0;
+        this.t = v >= T - 0.1 ? T : v;
         this.view.setWalkerTime(this.t);
         this.updateClock();
       },
@@ -280,8 +301,10 @@ export class App {
       this.view.setFollow(el.checked);
     });
     document.addEventListener('keydown', (e) => {
-      const tag = (e.target as HTMLElement).tagName;
-      if (e.code === 'Space' && !['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(tag)) {
+      const el = e.target as HTMLElement;
+      const interactive =
+        ['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'SUMMARY', 'A'].includes(el.tagName) || el.isContentEditable || el.getAttribute('role') === 'button';
+      if (e.code === 'Space' && !interactive) {
         e.preventDefault();
         this.setPlaying(!this.playing);
       }
@@ -332,6 +355,7 @@ export class App {
     const planChanged = Object.keys(patch).some((k) => k !== 'selected');
     if (planChanged) this.replan(patch.from !== undefined || patch.to !== undefined);
     if (this.tab === 'matrix') this.renderMatrix();
+    if (patch.hour !== undefined || patch.day !== undefined) this.updateHeat();
   }
 
   // ---------------------------------------------------------------- planning
@@ -343,21 +367,45 @@ export class App {
     const srcs = new Set(endpointSources(this.g, from, 'best'));
     if (endpointTargets(this.g, to).some((t) => srcs.has(t))) {
       this.plan = null;
-      $('results').innerHTML = `<div class="empty">出発と到着に同じホームが含まれています。別のホームか駅を選んでください。</div>`;
-      $('steps').innerHTML = '';
+      this.setPlaying(false);
+      this.t = 0;
+      this.setResultsHtml(`<div class="empty">出発と到着に同じホームが含まれています。別のホームか駅を選んでください。</div>`);
+      this.setStepsHtml('');
       this.view.setRoutes([]);
       this.updateFloorsForRoute();
+      this.updateClock();
       return;
     }
-    const prevSel = this.state.selected;
+    // Keep the user's chosen route by identity (not by index) when the list is recomputed.
+    const prev = refocus ? null : this.current();
+    const prevKey = prev ? prev.path.nodes.join(',') : null;
     this.plan = planRoute(this.g, { from, to, options: this.costOptions(), boarding: this.state.boarding, alternatives: 3 });
-    this.state.selected = Math.min(prevSel, Math.max(0, this.plan.routes.length - 1));
-    this.view.setRoutes(this.plan.routes, this.state.selected);
+    const routes = this.plan.routes;
+    let sel = prevKey ? routes.findIndex((r) => r.path.nodes.join(',') === prevKey) : 0;
+    if (sel < 0 && prev) {
+      // Closest remaining route by shared nodes (Jaccard); the walker restarts on it.
+      const prevNodes = new Set(prev.path.nodes);
+      let best = -1;
+      sel = 0;
+      routes.forEach((r, i) => {
+        const inter = r.path.nodes.filter((n) => prevNodes.has(n)).length;
+        const score = inter / (r.path.nodes.length + prevNodes.size - inter);
+        if (score > best) {
+          best = score;
+          sel = i;
+        }
+      });
+      this.t = 0;
+    }
+    this.state.selected = Math.max(0, Math.min(sel, routes.length - 1));
+    this.view.setRoutes(routes, this.state.selected);
+    if (!this.current()) this.setPlaying(false);
     if (refocus) {
       this.t = 0;
       this.view.focusRoute();
     }
     this.t = Math.min(this.t, this.current()?.timeS ?? 0);
+    this.announce(refocus);
     this.view.setWalkerTime(this.t);
     this.renderResults();
     this.renderSteps();
@@ -382,11 +430,70 @@ export class App {
 
   // ---------------------------------------------------------------- rendering: route panel
 
+  private lastResultsHtml = '';
+  private lastStepsHtml = '';
+  private lastAnnounce = '';
+
+  /** Replaces the route cards unless nothing changed, keeping keyboard focus on the same card. */
+  private setResultsHtml(html: string): void {
+    if (html === this.lastResultsHtml) return;
+    this.lastResultsHtml = html;
+    const el = $('results');
+    const focused = (document.activeElement as HTMLElement | null)?.closest('#results [data-route]')?.getAttribute('data-route') ?? null;
+    el.innerHTML = html;
+    el.querySelectorAll<HTMLButtonElement>('[data-route]').forEach((b) =>
+      b.addEventListener('click', () => this.selectRoute(Number(b.dataset.route))),
+    );
+    if (focused !== null) el.querySelector<HTMLButtonElement>(`[data-route="${focused}"]`)?.focus();
+  }
+
+  private setStepsHtml(html: string): void {
+    if (html === this.lastStepsHtml) return;
+    this.lastStepsHtml = html;
+    const el = $('steps');
+    const focused = (document.activeElement as HTMLElement | null)?.closest('#steps .step')?.getAttribute('data-i') ?? null;
+    el.innerHTML = html;
+    el.querySelectorAll<HTMLLIElement>('.step').forEach((li) => {
+      const activate = () => this.jumpToStep(Number(li.dataset.i), Number(li.dataset.t));
+      li.addEventListener('click', activate);
+      li.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          e.stopPropagation();
+          activate();
+        }
+      });
+    });
+    if (focused !== null) el.querySelector<HTMLLIElement>(`.step[data-i="${focused}"]`)?.focus();
+  }
+
+  private jumpToStep(i: number, t: number): void {
+    const r = this.current();
+    const ins = r?.instructions[i];
+    if (!r || !ins) return;
+    this.t = t;
+    this.view.setWalkerTime(this.t);
+    this.updateClock(i);
+    const [a, b] = ins.steps;
+    const nodes: number[] = [];
+    for (let k = Math.max(0, a); k <= Math.min(b, r.path.steps.length - 1); k++) nodes.push(r.path.steps[k].from, r.path.steps[k].to);
+    if (nodes.length === 0) nodes.push(ins.kind === 'arrive' ? r.path.nodes[r.path.nodes.length - 1] : r.path.nodes[0]);
+    this.view.focusNodes(nodes);
+  }
+
+  /** One-line summary for screen readers, only when the recommendation actually changes. */
+  private announce(force: boolean): void {
+    const r = this.plan?.routes[0];
+    const msg = r ? `推奨ルート ${Math.floor(r.timeS / 60)}分 ${r.tag}` : '';
+    if (!force && msg === this.lastAnnounce) return;
+    this.lastAnnounce = msg;
+    $('resultsStatus').textContent = msg;
+  }
+
   private renderResults(): void {
     const plan = this.plan;
-    const el = $('results');
     if (!plan || plan.routes.length === 0) {
-      el.innerHTML = `<div class="empty">この条件で通れるルートが見つかりません。「段差なし」の場合はエレベーターの無い区間があるかもしれません。条件を変えて試してください。</div>`;
+      this.setResultsHtml(`<div class="empty">この条件で通れるルートが見つかりません。「段差なし」の場合はエレベーターの無い区間があるかもしれません。条件を変えて試してください。</div>`);
       return;
     }
     const net = this.g.net;
@@ -424,26 +531,24 @@ export class App {
         ? `<div class="hint"><span class="hint-icon">乗</span><div>おすすめ乗車位置：<b>${escapeHtml(r0.boardingNode.name)}</b><br><span style="color:var(--ink-3)">この位置で降りると乗換が最短になります</span></div></div>`
         : '';
 
-    el.innerHTML = `<div class="route-head"><span>${escapeHtml(fromSt?.nameJa ?? '')} <span class="lvl">${r0.boardingNode.level}</span> → ${escapeHtml(toSt?.nameJa ?? '')} <span class="lvl">${r0.alightNode.level}</span></span><span>${escapeHtml(r0.levels.map(lvlName).join('→'))}</span></div>${cards}${boardHint}`;
-    el.querySelectorAll<HTMLButtonElement>('[data-route]').forEach((b) =>
-      b.addEventListener('click', () => this.selectRoute(Number(b.dataset.route))),
+    this.setResultsHtml(
+      `<div class="route-head"><span>${escapeHtml(fromSt?.nameJa ?? '')} <span class="lvl">${r0.boardingNode.level}</span> → ${escapeHtml(toSt?.nameJa ?? '')} <span class="lvl">${r0.alightNode.level}</span></span><span>${escapeHtml(r0.levels.map(lvlName).join('→'))}</span></div>${cards}${boardHint}`,
     );
   }
 
   private renderSteps(): void {
     const r = this.current();
-    const el = $('steps');
     if (!r) {
-      el.innerHTML = '';
+      this.setStepsHtml('');
       return;
     }
     let acc = 0;
-    el.innerHTML = r.instructions
+    const html = r.instructions
       .map((ins, i) => {
         const start = acc;
         acc += ins.timeS;
         const time = ins.kind === 'start' ? '0:00' : ins.kind === 'arrive' ? mmss(acc) : `+${jpDuration(ins.timeS)}`;
-        return `<li class="step" data-i="${i}" data-t="${start}" style="--k:${KIND_CSS[ins.kind]}">
+        return `<li class="step" tabindex="0" role="button" data-i="${i}" data-t="${start}" style="--k:${KIND_CSS[ins.kind]}">
           <span class="step-icon">${ICONS[ins.kind]}</span>
           <span class="step-body"><span class="step-text"><span class="lvl">${ins.level}</span>${escapeHtml(ins.text)}</span>
           ${ins.detail ? `<span class="step-detail"><br>${escapeHtml(ins.detail)}</span>` : ''}</span>
@@ -451,19 +556,7 @@ export class App {
         </li>`;
       })
       .join('');
-    el.querySelectorAll<HTMLLIElement>('.step').forEach((li) =>
-      li.addEventListener('click', () => {
-        const ins = r.instructions[Number(li.dataset.i)];
-        this.t = Number(li.dataset.t);
-        this.view.setWalkerTime(this.t);
-        this.updateClock();
-        const [a, b] = ins.steps;
-        const nodes: number[] = [];
-        for (let k = Math.max(0, a); k <= Math.min(b, r.path.steps.length - 1); k++) nodes.push(r.path.steps[k].from, r.path.steps[k].to);
-        if (nodes.length === 0) nodes.push(ins.kind === 'arrive' ? r.path.nodes[r.path.nodes.length - 1] : r.path.nodes[0]);
-        this.view.focusNodes(nodes);
-      }),
-    );
+    this.setStepsHtml(html);
   }
 
   private updateFloorsForRoute(): void {
@@ -563,7 +656,8 @@ export class App {
       this.crowd.hour = this.state.hour;
       this.crowd.day = this.state.day;
       // Warm up so the network is populated immediately.
-      for (let i = 0; i < 90; i++) this.crowd.step(2);
+      // Warm up ≈10 simulated minutes (longer than typical trips) so the network starts near steady state.
+      for (let i = 0; i < 300; i++) this.crowd.step(2);
     }
     if (!on) {
       this.view.setCrowd(null, null, 0);
@@ -593,13 +687,14 @@ export class App {
 
   private setPlaying(on: boolean): void {
     const r = this.current();
-    if (on && r && this.t >= r.timeS) this.t = 0;
+    if (on && r && this.t >= r.timeS - 0.1) this.t = 0;
     this.playing = on && !!r;
     $('playIcon').setAttribute('d', this.playing ? 'M7 5h4v14H7zM13 5h4v14h-4z' : 'M7 5v14l12-7z');
     $('play').setAttribute('aria-label', this.playing ? '一時停止' : '再生');
   }
 
-  private updateClock(): void {
+  /** Updates the clock, scrubber and current-step highlight; `forceIdx` pins the highlighted step. */
+  private updateClock(forceIdx?: number): void {
     const r = this.current();
     const total = r?.timeS ?? 0;
     const scrub = $('scrub') as HTMLInputElement;
@@ -617,7 +712,8 @@ export class App {
       acc += r.instructions[i].timeS;
       if (this.t < acc) break;
     }
-    if (this.t >= total - 1e-6) idx = r.instructions.length - 1;
+    if (this.t >= total - 0.1) idx = r.instructions.length - 1;
+    if (forceIdx !== undefined) idx = forceIdx;
     const ins = r.instructions[idx];
     $('scrubNow').textContent = ins ? `${ins.level}｜${ins.text}` : '';
     document.querySelectorAll('.step').forEach((li, i) => li.classList.toggle('is-now', i === idx));
@@ -649,7 +745,7 @@ export class App {
         const simDt = dt * Math.max(4, this.state.rate);
         const n = Math.ceil(simDt / 1.5);
         for (let i = 0; i < n; i++) this.crowd.step(simDt / n);
-        this.view.setCrowd(this.crowd.positions, this.crowd.colors, this.crowd.count);
+        this.view.setCrowd(this.crowd.positions, this.crowd.colors, this.crowd.count, this.crowd.edgeOf);
         this.heatTimer += dt;
         if (this.heatTimer > 0.5) {
           this.heatTimer = 0;

@@ -1,5 +1,8 @@
 import type { NetEdge, NetNode, Network } from './types';
 
+/** Index of one direction of an edge in per-arc tables: edge * 2 (+1 for b→a). */
+export const arcIndex = (edge: number, dir: 1 | -1): number => edge * 2 + (dir === 1 ? 0 : 1);
+
 /** One traversable direction of an edge. dir = 1 means a→b, -1 means b→a. */
 export interface Arc {
   edge: number;
@@ -103,16 +106,47 @@ export function fareZoneOf(g: Graph, stationId: string): string {
   return g.net.stations.find((s) => s.id === stationId)?.fareZone ?? stationId;
 }
 
+export interface TransferBans {
+  bannedNodes: Set<number>;
+  bannedArcs: Set<number>;
+}
+
 /**
- * Paid-area nodes a passenger may not enter: everything inside the fare gates of stations whose
- * fare zone is not one of the allowed stations' zones. Prevents "shortcuts" through another
- * operator's concourse (e.g. in one 西梅田 gate and out the other).
+ * Search restrictions that keep a walk fare-valid between two stations (either may be
+ * undefined for a street entrance):
+ * - nothing inside the fare gates of any third fare zone (no shortcuts through another
+ *   operator's concourse, e.g. in one 西梅田 gate and out the other);
+ * - the origin's gates may only be passed outwards and the destination's only inwards, so a
+ *   route leaves the paid area at most once and never comes back in mid-walk;
+ * - within one fare zone (JR大阪 ⇄ うめきた) the walk stays inside the gates.
  */
-export function paidAreaBans(g: Graph, allowedStations: (string | undefined)[]): Set<number> {
-  const zones = new Set(allowedStations.filter((s): s is string => !!s).map((s) => fareZoneOf(g, s)));
-  const out = new Set<number>();
+export function transferBans(g: Graph, fromStation?: string, toStation?: string): TransferBans {
+  const zf = fromStation ? fareZoneOf(g, fromStation) : undefined;
+  const zt = toStation ? fareZoneOf(g, toStation) : undefined;
+  const sameZone = zf !== undefined && zf === zt;
+  const bannedNodes = new Set<number>();
   g.nodes.forEach((n, i) => {
-    if (n.paid && n.stationId && !zones.has(fareZoneOf(g, n.stationId))) out.add(i);
+    if (n.paid && n.stationId) {
+      const z = fareZoneOf(g, n.stationId);
+      if (z !== zf && z !== zt) bannedNodes.add(i);
+    } else if (sameZone) {
+      bannedNodes.add(i);
+    }
   });
-  return out;
+  const bannedArcs = new Set<number>();
+  if (!sameZone) {
+    g.edges.forEach((e, i) => {
+      if (e.kind !== 'gate') return;
+      const a = g.nodes[g.nodeIndex.get(e.a) as number];
+      const b = g.nodes[g.nodeIndex.get(e.b) as number];
+      const paidNode = a.paid ? a : b;
+      if (!paidNode.stationId) return;
+      const z = fareZoneOf(g, paidNode.stationId);
+      // dir 1 is a→b; it is the exit direction when a is the paid side.
+      const exitDir: 1 | -1 = a.paid ? 1 : -1;
+      if (z === zf) bannedArcs.add(arcIndex(i, exitDir === 1 ? -1 : 1)); // no re-entry at the origin
+      if (z === zt) bannedArcs.add(arcIndex(i, exitDir)); // no leaving the destination
+    });
+  }
+  return { bannedNodes, bannedArcs };
 }

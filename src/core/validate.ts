@@ -1,5 +1,5 @@
 import { buildCostModel, DEFAULT_OPTIONS } from './cost';
-import { components, fareZoneOf, paidAreaBans, type Graph } from './graph';
+import { components, fareZoneOf, transferBans, type Graph } from './graph';
 import { platformNodes } from './planner';
 import { shortestTree } from './search';
 
@@ -26,6 +26,7 @@ export function validateNetwork(g: Graph): string[] {
     const rise = Math.abs(g.rise[i]);
     const vertical = e.kind === 'stairs' || e.kind === 'escalator' || e.kind === 'elevator';
     if (vertical && rise < 1) out.push(`edge ${e.id}: ${e.kind} with no height change`);
+    if (!vertical && e.kind !== 'gate' && g.hlen[i] < 0.5 && rise < 0.5) out.push(`edge ${e.id}: zero-length ${e.kind}`);
     if (!vertical && rise > 3.5) out.push(`edge ${e.id}: ${e.kind} climbs ${rise.toFixed(1)} m without stairs/escalator/elevator`);
     if (e.kind === 'gate') {
       if (!!a.paid === !!b.paid) out.push(`edge ${e.id}: gate must join paid and unpaid areas`);
@@ -60,7 +61,7 @@ export function validateNetwork(g: Graph): string[] {
       const src = net.platforms.filter((p) => p.stationId === from.id).flatMap((p) => platformNodes(g, p.id));
       for (const p of net.platforms) {
         if (p.stationId === from.id) continue;
-        const tree = shortestTree(g, m, src, { bannedNodes: paidAreaBans(g, [from.id, p.stationId]) });
+        const tree = shortestTree(g, m, src, transferBans(g, from.id, p.stationId));
         if (!platformNodes(g, p.id).some((i) => Number.isFinite(tree.dist[i]))) out.push(`${profile}: ${from.id} cannot reach platform ${p.id}`);
       }
     }

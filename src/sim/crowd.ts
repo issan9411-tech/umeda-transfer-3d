@@ -1,6 +1,15 @@
 import { demandAt, speedFactor, type DayType } from '../core/congestion';
-import { arcIndex, buildCostModel, DEFAULT_OPTIONS, type CostModel } from '../core/cost';
-import { paidAreaBans, type Graph } from '../core/graph';
+import {
+  arcIndex,
+  buildCostModel,
+  CROSSING_WAIT_S,
+  DEFAULT_OPTIONS,
+  ELEVATOR_DWELL_S,
+  ELEVATOR_WAIT_S,
+  ESCALATOR_BOARD_S,
+  type CostModel,
+} from '../core/cost';
+import { transferBans, type Graph } from '../core/graph';
 import { shortestTree, reconstruct, type Tree } from '../core/search';
 
 /**
@@ -76,7 +85,16 @@ export class CrowdSim {
   /** Positions (x, y, z) per live agent, packed; see `count`. */
   readonly positions: Float32Array;
   readonly colors: Uint32Array;
+  /** Current edge index per live agent (same packing as `positions`). */
+  readonly edgeOf: Int32Array;
   count = 0;
+  /** Node indices of each arc's start and end (arc index = edge * 2 + dir). */
+  private arcFrom: Int32Array;
+  private arcTo: Int32Array;
+  /** Fixed wait at the start of each arc (signal, elevator, escalator boarding), seconds. */
+  private hold: Float64Array;
+  /** Arc → all usable parallel arcs between the same two nodes (stairs / escalator / elevator). */
+  private parallel = new Map<number, number[]>();
   hour = 8;
   day: DayType = 'weekday';
   /** Cumulative real pedestrians who completed a trip. */
@@ -100,6 +118,60 @@ export class CrowdSim {
     });
     this.positions = new Float32Array(this.opts.maxAgents * 3);
     this.colors = new Uint32Array(this.opts.maxAgents);
+    this.edgeOf = new Int32Array(this.opts.maxAgents);
+
+    this.arcFrom = new Int32Array(E * 2);
+    this.arcTo = new Int32Array(E * 2);
+    this.hold = new Float64Array(E * 2);
+    g.edges.forEach((e, i) => {
+      const a = g.nodeIndex.get(e.a) as number;
+      const b = g.nodeIndex.get(e.b) as number;
+      this.arcFrom[arcIndex(i, 1)] = a;
+      this.arcTo[arcIndex(i, 1)] = b;
+      this.arcFrom[arcIndex(i, -1)] = b;
+      this.arcTo[arcIndex(i, -1)] = a;
+      let w = 0;
+      if (e.kind === 'crossing') w = e.waitS ?? CROSSING_WAIT_S;
+      else if (e.kind === 'elevator') w = (e.waitS ?? ELEVATOR_WAIT_S) + ELEVATOR_DWELL_S;
+      else if (e.kind === 'escalator') w = ESCALATOR_BOARD_S;
+      for (const k of [arcIndex(i, 1), arcIndex(i, -1)]) {
+        const t = this.free.time[k];
+        this.hold[k] = Number.isFinite(t) ? Math.min(w, t * 0.9) : 0;
+      }
+    });
+    g.adj.forEach((list) => {
+      const byTo = new Map<number, number[]>();
+      for (const a of list) {
+        const k = arcIndex(a.edge, a.dir);
+        if (!Number.isFinite(this.free.time[k])) continue;
+        const ks = byTo.get(a.to) ?? [];
+        ks.push(k);
+        byTo.set(a.to, ks);
+      }
+      for (const ks of byTo.values()) if (ks.length > 1) for (const k of ks) this.parallel.set(k, ks);
+    });
+  }
+
+  /**
+   * Splits flow across parallel stairs / escalators / elevators with a logit choice on
+   * free-flow time plus the current crowd delay, so busy stairs push people onto escalators.
+   */
+  private choose(k: number): number {
+    const alts = this.parallel.get(k);
+    if (!alts) return k;
+    const cost = (a: number) => {
+      const e = a >> 1;
+      const kind = this.g.edges[e].kind;
+      const rho = this.density[e];
+      const t = this.free.time[a];
+      return kind === 'escalator' || kind === 'elevator' ? t + Math.min(60, rho * rho * 6) : t / speedFactor(rho);
+    };
+    const c = alts.map(cost);
+    const m = Math.min(...c);
+    const w = c.map((x) => Math.exp(-(x - m) / 8));
+    let r = this.rand() * w.reduce((s, x) => s + x, 0);
+    for (let i = 0; i < alts.length; i++) if ((r -= w[i]) <= 0) return alts[i];
+    return alts[alts.length - 1];
   }
 
   reset(): void {
@@ -126,28 +198,33 @@ export class CrowdSim {
     let t = this.trees.get(key);
     if (!t) {
       // Pedestrians may only be inside the fare gates of their own origin / destination station.
-      t = shortestTree(this.g, this.free, [src.node], { bannedNodes: paidAreaBans(this.g, [src.stationId, dst.stationId]) });
+      t = shortestTree(this.g, this.free, [src.node], transferBans(this.g, src.stationId, dst.stationId));
       this.trees.set(key, t);
     }
     return t;
   }
 
-  private spawn(): void {
+  /** Spawns one agent; returns false when no valid origin/destination pair was found. */
+  private spawn(): boolean {
     const o = this.pick();
-    let d = this.pick();
-    for (let tries = 0; tries < 6 && (d.node === o.node || (d.stationId && d.stationId === o.stationId)); tries++) d = this.pick();
-    if (d.node === o.node) return;
-    const t = this.tree(o, d);
-    if (!Number.isFinite(t.dist[d.node])) return;
-    const path = reconstruct(t, d.node);
-    if (path.steps.length === 0) return;
-    const arcs = Int32Array.from(path.steps.map((s) => arcIndex(s.edge, s.dir)));
-    const color = this.stationColors.get(d.stationId ?? '') ?? 0x8a96a3;
-    const agent: Agent = { alive: true, arcs, seg: 0, prog: 0, speed: 0.8 + this.rand() * 0.4, color };
-    this.edgeCount[arcs[0] >> 1] += 1;
-    // Spread new agents along their first arc so the network does not pulse.
-    agent.prog = this.rand() * this.free.time[arcs[0]] * 0.5;
-    this.agents.push(agent);
+    for (let tries = 0; tries < 8; tries++) {
+      const d = this.pick();
+      if (d.node === o.node || (d.stationId && d.stationId === o.stationId)) continue;
+      const t = this.tree(o, d);
+      // e.g. a street entrance reachable only through another operator's paid area
+      if (!Number.isFinite(t.dist[d.node])) continue;
+      const path = reconstruct(t, d.node);
+      if (path.steps.length === 0) continue;
+      const arcs = Int32Array.from(path.steps.map((s) => this.choose(arcIndex(s.edge, s.dir))));
+      const color = this.stationColors.get(d.stationId ?? '') ?? 0x8a96a3;
+      const agent: Agent = { alive: true, arcs, seg: 0, prog: 0, speed: 0.8 + this.rand() * 0.4, color };
+      this.edgeCount[arcs[0] >> 1] += 1;
+      // Spread new agents along their first arc so the network does not pulse.
+      agent.prog = this.rand() * this.free.time[arcs[0]] * 0.5;
+      this.agents.push(agent);
+      return true;
+    }
+    return false;
   }
 
   /** Advance the simulation by dt seconds of simulated time. */
@@ -155,10 +232,12 @@ export class CrowdSim {
     const demand = demandAt(this.hour, this.day);
     const inflowAgents = (this.opts.peakInflow * demand) / this.opts.peoplePerAgent;
     this.spawnDebt += inflowAgents * dt;
-    while (this.spawnDebt >= 1) {
+    // `agents` holds live agents only (finished ones are dropped every step), so the cap is exact.
+    while (this.spawnDebt >= 1 && this.agents.length < this.opts.maxAgents) {
       this.spawnDebt -= 1;
-      if (this.agents.length < this.opts.maxAgents) this.spawn();
+      if (!this.spawn()) break;
     }
+    this.spawnDebt = Math.min(this.spawnDebt, 5);
 
     // Density from occupancy, exponentially smoothed.
     const alpha = Math.min(1, dt / 20);
@@ -168,8 +247,8 @@ export class CrowdSim {
       this.density[i] += (rho - this.density[i]) * alpha;
     }
 
-    const g = this.g;
     let w = 0;
+    let keep = 0;
     for (const a of this.agents) {
       if (!a.alive) continue;
       let remaining = dt;
@@ -177,7 +256,7 @@ export class CrowdSim {
         const k = a.arcs[a.seg];
         const e = k >> 1;
         const tFree = Math.max(0.5, this.free.time[k]);
-        const kind = g.edges[e].kind;
+        const kind = this.g.edges[e].kind;
         const slow = kind === 'elevator' || kind === 'escalator' || kind === 'crossing' ? 1 : speedFactor(this.density[e]);
         const rate = a.speed * slow;
         const need = (tFree - a.prog) / rate;
@@ -198,21 +277,23 @@ export class CrowdSim {
         }
       }
       if (!a.alive) continue;
-      // Interpolate position.
+      // Interpolate position; during a fixed wait (signal, elevator) the agent stays at the start.
       const k = a.arcs[a.seg];
-      const e = k >> 1;
-      const fwd = (k & 1) === 0;
-      const na = g.nodes[g.nodeIndex.get(fwd ? g.edges[e].a : g.edges[e].b) as number];
-      const nb = g.nodes[g.nodeIndex.get(fwd ? g.edges[e].b : g.edges[e].a) as number];
-      const f = Math.min(1, a.prog / Math.max(0.5, this.free.time[k]));
+      const na = this.g.nodes[this.arcFrom[k]];
+      const nb = this.g.nodes[this.arcTo[k]];
+      const tF = Math.max(0.5, this.free.time[k]);
+      const h = this.hold[k];
+      const f = Math.min(1, Math.max(0, a.prog - h) / Math.max(0.5, tF - h));
       this.positions[w * 3] = na.x + (nb.x - na.x) * f;
       this.positions[w * 3 + 1] = na.y + (nb.y - na.y) * f;
       this.positions[w * 3 + 2] = na.z + (nb.z - na.z) * f;
       this.colors[w] = a.color;
+      this.edgeOf[w] = k >> 1;
       w++;
+      this.agents[keep++] = a;
     }
+    this.agents.length = keep;
     this.count = w;
-    if (this.agents.length > 2 * w + 64) this.agents = this.agents.filter((a) => a.alive);
   }
 
   /** Real pedestrians currently walking in the network. */

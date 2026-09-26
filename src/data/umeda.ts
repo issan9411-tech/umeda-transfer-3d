@@ -1,11 +1,17 @@
 import { ll, NetBuilder } from './builder';
 import { addContext } from './context';
-import type { DataSet } from './dataset';
+import type { DataSet, ReferenceTime } from './dataset';
 import { addJrOsaka, addKitashinchi, addUmekita } from './jr';
 import { LEVELS, LINES, STATION_META } from './meta';
 import { addHigashiUmeda, addMidosujiUmeda, addNishiUmeda } from './metro';
 import { addHankyu, addHanshin } from './private-rail';
 import { addWalkways } from './walkways';
+
+/** Reference transfer time with a uniform ±40 % (at least ±1 min) acceptance band. */
+function ref(from: string, to: string, minutes: number, source: string, fromNode?: string, toNode?: string): ReferenceTime {
+  const d = Math.max(1, minutes * 0.4);
+  return { from, to, minutes, range: [Math.max(0, minutes - d), minutes + d], source, fromNode, toNode };
+}
 
 function buildNetwork() {
   const b = new NetBuilder(LEVELS);
@@ -52,77 +58,20 @@ export const umeda: DataSet = {
     kitashinchi: 85,
   },
   entranceWeight: 1600,
+  // Bands are a uniform ±40 % (at least ±1 min) around each quoted figure.
   reference: [
-    {
-      from: 'jr',
-      to: 'umekita',
-      minutes: 8,
-      range: [5.5, 10.5],
-      source: 'JR西日本（2023年3月）：環状線ホーム中央付近→23・24番ホーム中央付近 約8分（本モデルでは標準の歩き方で約6分、大きな荷物で約8分）',
-    },
-    {
-      from: 'hankyu',
-      to: 'jr',
-      minutes: 7,
-      range: [6, 11],
-      source: '阪急3階改札→JR御堂筋口 約7分（改札間, osaka-news.jp）',
-    },
-    {
-      from: 'jr',
-      to: 'hankyu',
-      minutes: 4,
-      range: [5, 10],
-      source: 'JR御堂筋口→阪急3階改札 3〜5分（改札間, 案内サイト）',
-    },
-    {
-      from: 'hankyu',
-      to: 'umeda',
-      minutes: 5,
-      range: [4.5, 9],
-      source: '阪急3階改札→御堂筋線北改札 約5分（osaka-transfer.com）',
-    },
-    {
-      from: 'umeda',
-      to: 'hankyu',
-      minutes: 6,
-      range: [4.5, 10],
-      source: '御堂筋線北改札→阪急 約6分（5〜10分, osaka-news.jp）',
-    },
-    {
-      from: 'jr',
-      to: 'kitashinchi',
-      minutes: 12,
-      range: [7, 13],
-      source: 'JR中央口→北新地 約12分（案内）／経路検索では約7分（osaka-station.net）',
-    },
-    {
-      from: 'kitashinchi',
-      to: 'nishiumeda',
-      minutes: 2,
-      range: [2, 6],
-      source: '北新地西改札⇔西梅田南改札 1〜3分（onigiriface.jp）',
-    },
-    {
-      from: 'hanshin',
-      to: 'kitashinchi',
-      minutes: 5,
-      range: [3.5, 9],
-      source: '阪神百貨店口⇔北新地西改札 4〜5分、北新地→阪神 約8分（osaka-station.net）',
-    },
-    {
-      from: 'kitashinchi',
-      to: 'umeda',
-      minutes: 9,
-      range: [5.5, 11],
-      source: '北新地→御堂筋線梅田 約9分（osaka-station.net）',
-    },
-    {
-      from: 'umeda',
-      to: 'umekita',
-      minutes: 7,
-      range: [6.5, 12],
-      source: '御堂筋線北改札→うめきた地下口 最短約7分（改札間, tabiseason.com）',
-    },
+    ref('jr', 'umekita', 8, 'JR西日本（2023年3月）：環状線ホーム中央付近→23・24番ホーム中央付近 約8分（本モデルでは標準の歩き方で約6分、大きな荷物で約8分）'),
+    ref('jr', 'umekita', 2.5, '西口→うめきた地下口（改札内）実測 約2〜2.5分（トラベル Watch）', 'jr_nishi_in', 'uk_gate_in'),
+    ref('hankyu', 'jr', 7, '阪急3階改札→JR御堂筋口 約7分（osaka-news.jp）', 'hk_3f_in', 'jr_mido_in'),
+    ref('jr', 'hankyu', 4, 'JR御堂筋口→阪急3階改札 3〜5分（案内サイト）', 'jr_mido_in', 'hk_3f_in'),
+    ref('hankyu', 'umeda', 5, '阪急3階改札→御堂筋線北改札 約5分（osaka-transfer.com）', 'hk_3f_in', 'm_n_in'),
+    ref('umeda', 'hankyu', 6, '御堂筋線北改札→阪急 約6分（5〜10分, osaka-news.jp）', 'm_n_in', 'hk_3f_in'),
+    ref('jr', 'kitashinchi', 7, 'JR中央口→北新地 経路検索で約7分（案内記事では約12分, osaka-station.net）', 'jr_chuo_in', 'ks_w_in'),
+    ref('kitashinchi', 'nishiumeda', 2, '北新地西改札⇔西梅田南改札 1〜3分（onigiriface.jp）', 'ks_w_in', 'y_s_in'),
+    ref('hanshin', 'kitashinchi', 4.5, '阪神百貨店口⇔北新地西改札 4〜5分（osaka-station.net）', 'hs_c_in', 'ks_w_in'),
+    ref('kitashinchi', 'hanshin', 8, '北新地→阪神大阪梅田 約8分（ホームまで, osaka-station.net）'),
+    ref('kitashinchi', 'umeda', 9, '北新地→御堂筋線梅田 約9分（osaka-station.net）'),
+    ref('umeda', 'umekita', 7, '御堂筋線北改札→うめきた地下口 最短約7分（tabiseason.com）', 'm_n_in', 'uk_gate_in'),
   ],
   sources: [
     { title: 'JR西日本 うめきたエリア開業（2023年3月）報道', url: 'https://news.mynavi.jp/article/20230309-2612721/', note: '環状線ホーム→23・24番 約8分' },

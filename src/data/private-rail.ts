@@ -94,6 +94,7 @@ export function addHankyu(b: NetBuilder): void {
   b.node('hk_chaya_1f', 'entrance', '茶屋町（NU茶屋町・ロフト方面）', [34.707, 135.4997], '1F', { label: true });
   b.stairs('hk_ch_out', 'hk_chaya_1f', { indoor: false });
   b.esc('hk_ch_out', 'hk_chaya_1f', 'both', { indoor: false });
+  b.walk('hk_chaya_1f', 'hk_1f_sanbangai', { name: '茶屋町 地上通路', indoor: false });
 }
 
 // ------------------------------------------------------------------------------------------------

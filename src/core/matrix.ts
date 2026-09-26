@@ -1,5 +1,5 @@
 import { buildCostModel, type CostModel, type CostOptions } from './cost';
-import { paidAreaBans, type Graph } from './graph';
+import { transferBans, type Graph } from './graph';
 import { middleNode, platformNodes } from './planner';
 import { reconstruct, shortestTree, sumArcs } from './search';
 
@@ -40,7 +40,7 @@ export function transferMatrix(g: Graph, options: CostOptions, model?: CostModel
     stations.forEach((to, j) => {
       if (i === j) return;
       // Other operators' paid areas are off-limits, so each pair gets its own search space.
-      const opts = { bannedNodes: paidAreaBans(g, [from, to]) };
+      const opts = transferBans(g, from, to);
       const targets = targetNodes.get(to) ?? [];
       const pick = (tree: ReturnType<typeof shortestTree>) => {
         let bt = -1;

@@ -72,6 +72,12 @@ export function buildInstructions(g: Graph, model: CostModel, path: Path): Instr
       const names: string[] = [];
       while (j < steps.length && (g.edges[steps[j].edge].kind === 'walk' || g.edges[steps[j].edge].kind === 'platform')) {
         const ej = g.edges[steps[j].edge];
+        if (j > i) {
+          // Split where the walk moves between a platform and a named corridor, so each part
+          // keeps its own wording and compass heading.
+          const prev = g.edges[steps[j - 1].edge];
+          if ((prev.kind === 'platform') !== (ej.kind === 'platform') && (prev.name || ej.name)) break;
+        }
         const kj = arcIndex(steps[j].edge, steps[j].dir);
         t += model.time[kj];
         d += model.dist[kj];
@@ -79,14 +85,24 @@ export function buildInstructions(g: Graph, model: CostModel, path: Path): Instr
         if (ej.name && !names.includes(ej.name)) names.push(ej.name);
         j++;
       }
+      const prevIns = out[out.length - 1];
+      if (d < 3 && prevIns.kind !== 'start') {
+        // Negligible hop (e.g. stair landing → gate at the same spot): fold into the previous step.
+        prevIns.timeS += t;
+        prevIns.distM += d;
+        prevIns.steps = [prevIns.steps[0], j - 1];
+        i = j;
+        continue;
+      }
       const to = nodes[steps[j - 1].to];
       const dir = compass(from, to);
       const onPlatform = g.edges[st.edge].kind === 'platform';
+      const shown = d < 10 ? Math.max(1, Math.round(d)) : Math.round(d / 10) * 10;
       const via = names.length ? names.slice(0, 3).join(' → ') : '';
       const head = onPlatform ? 'ホーム上を' : via ? `${via}を` : '';
       out.push({
         kind: 'walk',
-        text: `${head}${dir ? dir + 'へ' : ''}約${Math.max(10, Math.round(d / 10) * 10)}m 歩く`,
+        text: `${head}${dir ? dir + 'へ' : ''}約${shown}m 歩く`,
         detail: `${to.name}${indoor ? '' : '（屋外）'}`,
         timeS: t,
         distM: d,
@@ -112,10 +128,15 @@ export function buildInstructions(g: Graph, model: CostModel, path: Path): Instr
       const to = nodes[steps[j - 1].to];
       const up = to.y > from.y;
       const label = e.kind === 'stairs' ? '階段' : e.kind === 'escalator' ? 'エスカレーター' : 'エレベーター';
+      const rise = Math.round(Math.abs(to.y - from.y));
+      const verb = up ? '上る' : '下りる';
       out.push({
         kind: e.kind as VerticalKind,
-        text: `${label}で${levelName(g, from.level)}から${levelName(g, to.level)}へ${up ? '上る' : '下りる'}`,
-        detail: `${e.name ? e.name + '・' : ''}高低差 約${Math.round(Math.abs(to.y - from.y))}m`,
+        text:
+          from.level === to.level
+            ? `${label}で約${rise}m${verb}`
+            : `${label}で${levelName(g, from.level)}から${levelName(g, to.level)}へ${verb}`,
+        detail: `${e.name ? e.name + '・' : ''}高低差 約${rise}m`,
         timeS: t,
         distM: d,
         steps: [i, j - 1],

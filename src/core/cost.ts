@@ -1,5 +1,5 @@
 import { demandAt, densityFor, speedFactor, type DayType } from './congestion';
-import type { Graph } from './graph';
+import { arcIndex, type Graph } from './graph';
 
 export type ProfileId = 'standard' | 'hurry' | 'luggage' | 'senior' | 'stepfree';
 export type Objective = 'time' | 'distance' | 'comfort';
@@ -76,7 +76,7 @@ export interface CostOptions {
   day: DayType;
   /** Apply time-of-day crowding to walking speed. */
   congestion: boolean;
-  /** Optional per-edge density (persons/m²) measured by the crowd simulation. Overrides the time-of-day model. */
+  /** Optional per-edge density (persons/m²) measured by the crowd simulation. Raises the time-of-day density where the simulation measures more crowding. */
   liveDensity?: Float32Array | null;
 }
 
@@ -117,7 +117,7 @@ export interface CostModel {
   density: Float32Array;
 }
 
-export const arcIndex = (edge: number, dir: 1 | -1): number => edge * 2 + (dir === 1 ? 0 : 1);
+export { arcIndex };
 
 export function buildCostModel(g: Graph, options: CostOptions): CostModel {
   const profile = PROFILES[options.profile];
@@ -134,9 +134,8 @@ export function buildCostModel(g: Graph, options: CostOptions): CostModel {
     const e = g.edges[i];
     const h = g.hlen[i];
     const dy = Math.abs(g.rise[i]);
-    let rho = 0;
-    if (options.liveDensity) rho = options.liveDensity[i] ?? 0;
-    else if (options.congestion) rho = densityFor(e.busy ?? 1, demand);
+    let rho = options.congestion ? densityFor(e.busy ?? 1, demand) : 0;
+    if (options.liveDensity) rho = Math.max(rho, options.liveDensity[i] ?? 0);
     density[i] = rho;
     const crowd = speedFactor(rho);
     const v = v0 * crowd;
@@ -192,7 +191,10 @@ export function buildCostModel(g: Graph, options: CostOptions): CostModel {
       }
       if (c === null) c = t;
       if (options.objective === 'distance') {
-        c = d + t * 1e-3;
+        // Metres, tie-broken by the profile-weighted cost (which carries the stairs-avoid penalty).
+        const weighted = c;
+        c = d + weighted * 1e-3;
+        if (e.kind === 'stairs' && profile.stairs === 'avoid') c += 45 + dy * 10;
       } else if (options.objective === 'comfort') {
         if (e.kind === 'stairs') c += dy * (up ? 12 : 6);
         if (e.kind === 'escalator' || e.kind === 'elevator') c += dy * 1.5;
