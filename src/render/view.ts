@@ -691,7 +691,8 @@ export class UmedaView {
 
   private buildLabels(): void {
     this.clearGroup(this.labelGroup);
-    if (!this.showLabels) return;
+    // While walking, signboards and the HUD guide; station tags would float through the walls.
+    if (!this.showLabels || this.walkView) return;
     for (const s of this.g.net.stations) {
       // A station label follows its platforms' levels (the anchor may sit on another level).
       const platLevels = this.g.net.platforms.filter((p) => p.stationId === s.id).map((p) => p.level);
@@ -706,7 +707,6 @@ export class UmedaView {
       obj.position.set(s.anchor[0], this.Y(s.anchor[1]) + 10, s.anchor[2]);
       this.labelGroup.add(obj);
     }
-    if (this.walkView) return; // signboards take over while walking
     this.g.nodes.forEach((n, i) => {
       if (!n.label || !this.levelVisible(n.level) || this.routeNodes.has(i)) return;
       const el = document.createElement('div');
@@ -1066,6 +1066,11 @@ export class UmedaView {
     const base = walking ? FLOOR_LIFT + this.walkerLift : 0.8;
     this.walker.position.set(p.x + this.walkerOff.x, this.Y(p.y) + base, p.z + this.walkerOff.z);
     this.figure.update(Math.min(dt, 5), speed, this.walkerYaw, climb, walking ? WALK_STAIR_SLOPE : undefined);
+    // A jump (scrubbing, picking a step) cuts to the new spot instead of flying through walls.
+    if (walking && dt > 3 && this.walkView !== 'orbit') {
+      this.heading = this.lookaheadHeading() ?? this.heading;
+      this.snapWalkCamera();
+    }
   }
 
   get walkerPosition(): THREE.Vector3 {
