@@ -255,11 +255,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     floors.disc(P(n).add(new THREE.Vector3(0, 0.07, 0)), w / 2, n.paid ? c.floorPaid : c.floorFree);
   }
 
-  // Tactile paving along both edges of every platform.
-  for (const p of g.net.platforms) {
-    if (!o.levelVisible(p.level)) continue;
-    addTactile(floors, p, Y, c.tactile);
-  }
+  // Platform tactile paving is drawn by station.ts together with the platform slabs.
 
   const floorMesh = floors.mesh(new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
   const zebraMesh = zebra.mesh(new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
@@ -273,17 +269,6 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
   if (wallMesh) wallMesh.renderOrder = 3;
   if (shaftMesh) shaftMesh.renderOrder = 3;
   return group;
-}
-
-function addTactile(soup: Soup, p: Platform, Y: (y: number) => number, color: THREE.Color): void {
-  const a = new THREE.Vector3(p.a[0], Y(p.y) + 0.03, p.a[1]);
-  const b = new THREE.Vector3(p.b[0], Y(p.y) + 0.03, p.b[1]);
-  const { left } = frame(a, b);
-  for (const side of [1, -1]) {
-    const edge = left.clone().multiplyScalar(side * (p.width / 2 - 1.0));
-    const inner = left.clone().multiplyScalar(side * (p.width / 2 - 1.4));
-    soup.quad(a.clone().add(edge), b.clone().add(edge), b.clone().add(inner), a.clone().add(inner), color);
-  }
 }
 
 /**

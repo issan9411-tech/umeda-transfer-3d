@@ -6,7 +6,8 @@ import { sampleKeyframes } from '../core/keyframes';
 import type { Keyframe, RouteSummary } from '../core/planner';
 import type { NetNode, Platform } from '../core/types';
 import { heatColor, KIND_COLORS, readPalette, type ScenePalette } from './palette';
-import { angleDelta, buildGuideLine, buildTrain, buildWalkway, headingBetween } from './walkway';
+import { buildStations, buildTrainModel } from './station';
+import { angleDelta, buildGuideLine, buildWalkway, headingBetween } from './walkway';
 
 export interface ViewEvents {
   /** x, y are relative to the view container. */
@@ -195,13 +196,27 @@ export class UmedaView {
     this.clearGroup(this.trainGroup);
     this.clearGroup(this.signGroup);
     const r = this.routes[this.selected];
+    // Station architecture and parked trains; the route-end trains below keep their tracks free.
+    const ends = r ? [r.boardingNode, r.alightNode] : [];
+    const occupied = ends.flatMap((n, i) => (n.platformId ? [{ platformId: n.platformId, side: (i === 0 ? 1 : -1) as 1 | -1 }] : []));
+    this.walkGroup.add(
+      buildStations(this.g.net, {
+        Y: (y) => this.Y(y),
+        ex: this.exaggeration,
+        dark: this.palette.dark,
+        levelVisible: (l) => this.levelVisible(l),
+        walk: true,
+        occupied,
+        focus: occupied.map((x) => x.platformId),
+      }),
+    );
     if (!r) return;
-    const ends = [r.boardingNode, r.alightNode];
     ends.forEach((n, i) => {
       const p = this.g.net.platforms.find((x) => x.id === n.platformId);
       if (!p || !this.levelVisible(p.level)) return;
       const line = this.g.net.lines.find((l) => l.id === p.lineIds[0]);
-      this.trainGroup.add(buildTrain(p, line?.color ?? '#888', (y) => this.Y(y), this.exaggeration, i === 0 ? 1 : -1));
+      if (!line) return;
+      this.trainGroup.add(buildTrainModel(p, line, { Y: (y) => this.Y(y), ex: this.exaggeration, dark: this.palette.dark, side: i === 0 ? 1 : -1 }));
     });
 
     // Signboards where each instruction begins (station-sign style, see styles.css).
@@ -495,25 +510,23 @@ export class UmedaView {
       mesh.position.set((ax + bx) / 2, this.Y(pl.y) - 0.6, (az + bz) / 2);
       mesh.rotation.y = -Math.atan2(bz - az, bx - ax);
       mesh.userData = { platformId: pl.id, baseEmissive: 0.15 };
+      // While walking, station.ts draws the real platform slabs.
+      mesh.visible = !this.walkView;
       this.staticGroup.add(mesh);
       this.platformMeshes.push(mesh);
+    }
 
-      const dx = (bx - ax) / len;
-      const dz = (bz - az) / len;
-      const ext = 140;
-      const trackPts = [
-        new THREE.Vector3(ax - dx * ext, this.Y(pl.y) - 1.2, az - dz * ext),
-        new THREE.Vector3(bx + dx * ext, this.Y(pl.y) - 1.2, bz + dz * ext),
-      ];
-      for (const off of [-1, 1]) {
-        const ox = -dz * off * (pl.width / 2 + 1.6);
-        const oz = dx * off * (pl.width / 2 + 1.6);
-        const track = new THREE.Line(
-          new THREE.BufferGeometry().setFromPoints(trackPts.map((q) => q.clone().add(new THREE.Vector3(ox, 0, oz)))),
-          new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.55 }),
-        );
-        this.staticGroup.add(track);
-      }
+    // Tracks, trains, roofs and station boxes (overview detail level).
+    if (!this.walkView) {
+      this.staticGroup.add(
+        buildStations(this.g.net, {
+          Y: (y) => this.Y(y),
+          ex: this.exaggeration,
+          dark: p.dark,
+          levelVisible: (l) => this.levelVisible(l),
+          walk: false,
+        }),
+      );
     }
   }
 
