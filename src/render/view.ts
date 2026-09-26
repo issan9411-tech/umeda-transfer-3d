@@ -5,6 +5,7 @@ import type { Graph } from '../core/graph';
 import { sampleKeyframes } from '../core/keyframes';
 import type { Keyframe, RouteSummary } from '../core/planner';
 import type { EdgeKind, NetNode, Platform } from '../core/types';
+import { applyLook, createEnvironment, Lighting, setupRenderer } from './look';
 import { heatColor, KIND_COLORS, readPalette, type ScenePalette } from './palette';
 import { PeopleCrowd, createWalkerFigure, type PeopleOptions, type WalkerFigure } from './people';
 import { buildStations, buildTrainModel } from './station';
@@ -130,6 +131,12 @@ export class UmedaView {
   private miniFrame: HTMLDivElement;
   private walkCut: WalkCut = { eye: new THREE.Vector3(), target: new THREE.Vector3() };
 
+  // Look: sun/sky rig driven by the hour slider, PMREM reflections.
+  private lighting = new Lighting();
+  /** PMREM reflections, created on first entry to walk mode (the overview has no PBR). */
+  private env: { dispose: () => void } | null = null;
+  private hour = 8.5;
+
   constructor(container: HTMLElement, g: Graph, events: ViewEvents = {}) {
     this.container = container;
     this.g = g;
@@ -139,6 +146,7 @@ export class UmedaView {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.domElement.className = 'scene-canvas';
+    setupRenderer(this.renderer);
     container.appendChild(this.renderer.domElement);
 
     this.labelRenderer = new CSS2DRenderer();
@@ -154,10 +162,8 @@ export class UmedaView {
     this.controls.maxDistance = 4000;
     this.controls.screenSpacePanning = false;
 
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.6));
-    const sun = new THREE.DirectionalLight(0xffffff, 1.4);
-    sun.position.set(-400, 900, 300);
-    this.scene.add(sun);
+    this.scene.add(this.lighting.object);
+    this.lighting.setTime(this.hour, this.palette.dark);
 
     this.scene.add(this.staticGroup, this.networkGroup, this.routeGroup, this.labelGroup, this.highlightNodes, this.trainGroup, this.signGroup);
 
@@ -233,12 +239,28 @@ export class UmedaView {
     this.buildLabels();
     this.buildRoutes();
     if (this.walkView) this.buildWalkScene();
+    this.applyLook();
+  }
+
+  /** Re-applies look.ts materials/shadows after any rebuild (idempotent, cheap). */
+  private applyLook(): void {
+    this.lighting.setUndergroundY(this.Y(-2), this.Y(16));
+    this.lighting.setShadows(this.walkView !== null);
+    applyLook(this.scene, { shadows: this.walkView !== null, walk: this.walkView !== null });
+  }
+
+  /** Hour of day (5–24) for sun, sky and night lighting. */
+  setTimeOfDay(hour: number): void {
+    this.hour = hour;
+    this.lighting.setTime(hour, this.palette.dark);
+    if (this.scene.fog) (this.scene.fog as THREE.Fog).color.copy(this.lighting.haze);
   }
 
   // ---------------------------------------------------------------- walk-through
 
   /** Floors, walls, stairs, gates (walkway.ts), trains at both ends and signboards. */
   private buildWalkScene(): void {
+    this.env ??= createEnvironment(this.renderer);
     if (this.walkGroup) {
       this.scene.remove(this.walkGroup);
       disposeWalkway(this.walkGroup);
@@ -248,7 +270,8 @@ export class UmedaView {
     this.walkGroup = buildWalkway(this.g, {
       Y: (y) => this.Y(y),
       ex: this.exaggeration,
-      dark: this.palette.dark,
+      // Real surface colours: the time-of-day lighting (look.ts) now makes the dark theme dusk.
+      dark: false,
       levelVisible: (l) => this.levelVisible(l),
       routeEdges,
     });
@@ -259,7 +282,7 @@ export class UmedaView {
     this.clearGroup(this.trainGroup);
     this.clearGroup(this.signGroup);
     const r = this.routes[this.selected];
-    // Station architecture and parked trains; the route-end trains below keep their tracks free.
+    // Station architecture and parked trains; the route-end trains keep their tracks free.
     const ends = r ? [r.boardingNode, r.alightNode] : [];
     const occupied = ends.flatMap((n, i) => (n.platformId ? [{ platformId: n.platformId, side: (i === 0 ? 1 : -1) as 1 | -1 }] : []));
     this.walkGroup.add(
@@ -274,7 +297,13 @@ export class UmedaView {
         routeEdges,
       }),
     );
-    if (!r) return;
+    if (r) this.buildWalkExtras(r);
+    this.applyLook();
+  }
+
+  /** Trains at both ends of the route and signboards at each instruction. */
+  private buildWalkExtras(r: RouteSummary): void {
+    const ends = [r.boardingNode, r.alightNode];
     ends.forEach((n, i) => {
       const p = this.g.net.platforms.find((x) => x.id === n.platformId);
       if (!p || !this.levelVisible(p.level)) return;
@@ -310,7 +339,8 @@ export class UmedaView {
     if (first) {
       this.savedEx = this.exaggeration;
       this.exaggeration = WALK_EX;
-      this.scene.fog = new THREE.Fog(this.palette.bg, 90, 520);
+      // Urban haze: far enough that the station reads crisply, blending into the sky horizon.
+      this.scene.fog = new THREE.Fog(this.lighting.haze, 160, 900);
       this.rebuildAll();
       this.camAnim = null;
       this.camera.near = 0.3;
@@ -454,7 +484,10 @@ export class UmedaView {
     this.renderer.setScissorTest(true);
     this.renderer.setScissor(x, bottom, size, size);
     this.renderer.setViewport(x, bottom, size, size);
+    // The shadow map was just rendered for the main camera; no need to redo it.
+    this.renderer.shadowMap.autoUpdate = false;
     this.renderer.render(this.scene, this.miniCam);
+    this.renderer.shadowMap.autoUpdate = true;
     this.renderer.setScissorTest(false);
     if (people) people.visible = true;
     this.figure.object.visible = true;
@@ -492,6 +525,7 @@ export class UmedaView {
     ground.rotation.x = -Math.PI / 2;
     ground.position.set(this.center.x, -0.2, this.center.z);
     ground.renderOrder = -2;
+    ground.name = 'ground';
     this.staticGroup.add(ground);
     const grid = new THREE.GridHelper(size, Math.round(size / 50), p.grid, p.grid);
     (grid.material as THREE.Material).transparent = true;
@@ -519,6 +553,7 @@ export class UmedaView {
       const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: p.road, side: THREE.DoubleSide, transparent: true, opacity: 0.9, depthWrite: false }));
       mesh.position.y = 0.05;
       mesh.renderOrder = -1;
+      mesh.name = 'road';
       this.staticGroup.add(mesh);
     }
 
@@ -874,6 +909,7 @@ export class UmedaView {
     this.routeNodes = new Set(routes[this.selected]?.path.nodes ?? []);
     this.buildLabels();
     this.buildRoutes();
+    this.applyLook();
     this.walkerTrack = routes[this.selected]?.keyframes ?? [];
     this.buildWalkerSegments(routes[this.selected]);
     this.walker.visible = this.walkerTrack.length > 0 && this.walkView !== 'first';
@@ -967,6 +1003,7 @@ export class UmedaView {
     this.buildNetwork();
     this.buildLabels();
     if (this.walkView) this.buildWalkScene();
+    this.applyLook();
   }
 
   isLevelVisible(level: string): boolean {
@@ -1051,6 +1088,7 @@ export class UmedaView {
       }
       this.people = new PeopleCrowd(cap, { detail: 'low' });
       this.scene.add(this.people.object);
+      this.applyLook();
     }
     this.crowdFrame = frame;
     const n = frame.count;
@@ -1101,7 +1139,7 @@ export class UmedaView {
 
   refreshTheme(): void {
     this.palette = readPalette();
-    if (this.scene.fog) (this.scene.fog as THREE.Fog).color.copy(this.palette.bg);
+    this.setTimeOfDay(this.hour);
     this.rebuildAll();
   }
 
@@ -1215,6 +1253,8 @@ export class UmedaView {
       halo.scale.set(s, s, s);
     }
     if (!this.walkView || this.walkView === 'orbit') this.controls.update();
+    if (this.walkView) this.lighting.setShadowFocus(this.walker.position, 110);
+    else this.lighting.setShadowFocus(this.controls.target, this.radius);
     this.renderer.render(this.scene, this.camera);
     this.labelRenderer.render(this.scene, this.camera);
     if (this.walkView) this.renderMinimap();
