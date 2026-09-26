@@ -674,7 +674,7 @@ export class App {
       for (let i = 0; i < 300; i++) this.crowd.step(2);
     }
     if (!on) {
-      this.view.setCrowd(null, null, 0);
+      this.view.setCrowd(null);
       if (this.state.live) {
         this.state.live = false;
         ($('live') as HTMLInputElement).checked = false;
@@ -825,7 +825,7 @@ export class App {
         const simDt = dt * Math.max(4, this.state.rate);
         const n = Math.ceil(simDt / 1.5);
         for (let i = 0; i < n; i++) this.crowd.step(simDt / n);
-        this.view.setCrowd(this.crowd.positions, this.crowd.colors, this.crowd.count, this.crowd.edgeOf);
+        this.view.setCrowd(this.crowd, simDt);
         this.heatTimer += dt;
         if (this.heatTimer > 0.5) {
           this.heatTimer = 0;

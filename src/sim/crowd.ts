@@ -37,6 +37,12 @@ interface Agent {
   prog: number;
   speed: number;
   color: number;
+  /** Stable id (renderers key appearance and animation state on it). */
+  id: number;
+  /** Preferred lane across walkways, −1 (left) … 1 (right) of the direction of travel. */
+  lane: number;
+  /** Last horizontal heading, kept while moving vertically (elevators). */
+  heading: number;
 }
 
 export interface CrowdOptions {
@@ -87,7 +93,16 @@ export class CrowdSim {
   readonly colors: Uint32Array;
   /** Current edge index per live agent (same packing as `positions`). */
   readonly edgeOf: Int32Array;
+  /** Per live agent: heading (yaw, 0 = +z), walking speed in m/s (0 while waiting or riding an
+   * escalator / elevator), stable id, stairs direction (+1 up, −1 down, 0) and lateral offset in
+   * metres to the right of the direction of travel (people spread across corridors). */
+  readonly headings: Float32Array;
+  readonly speeds: Float32Array;
+  readonly ids: Uint32Array;
+  readonly climbs: Int8Array;
+  readonly lateral: Float32Array;
   count = 0;
+  private nextId = 1;
   /** Node indices of each arc's start and end (arc index = edge * 2 + dir). */
   private arcFrom: Int32Array;
   private arcTo: Int32Array;
@@ -119,6 +134,11 @@ export class CrowdSim {
     this.positions = new Float32Array(this.opts.maxAgents * 3);
     this.colors = new Uint32Array(this.opts.maxAgents);
     this.edgeOf = new Int32Array(this.opts.maxAgents);
+    this.headings = new Float32Array(this.opts.maxAgents);
+    this.speeds = new Float32Array(this.opts.maxAgents);
+    this.ids = new Uint32Array(this.opts.maxAgents);
+    this.climbs = new Int8Array(this.opts.maxAgents);
+    this.lateral = new Float32Array(this.opts.maxAgents);
 
     this.arcFrom = new Int32Array(E * 2);
     this.arcTo = new Int32Array(E * 2);
@@ -179,6 +199,7 @@ export class CrowdSim {
     this.count = 0;
     this.completed = 0;
     this.spawnDebt = 0;
+    this.nextId = 1;
     this.edgeCount.fill(0);
     this.density.fill(0);
     this.rand = mulberry32(this.opts.seed);
@@ -217,7 +238,10 @@ export class CrowdSim {
       if (path.steps.length === 0) continue;
       const arcs = Int32Array.from(path.steps.map((s) => this.choose(arcIndex(s.edge, s.dir))));
       const color = this.stationColors.get(d.stationId ?? '') ?? 0x8a96a3;
-      const agent: Agent = { alive: true, arcs, seg: 0, prog: 0, speed: 0.8 + this.rand() * 0.4, color };
+      const id = this.nextId++;
+      // Lane from the id (not the shared PRNG, so trips stay as before), biased to keep right.
+      const lane = Math.max(-0.95, Math.min(0.95, hashUnit(id) * 1.8 - 0.9 + 0.2));
+      const agent: Agent = { alive: true, arcs, seg: 0, prog: 0, speed: 0.8 + this.rand() * 0.4, color, id, lane, heading: 0 };
       this.edgeCount[arcs[0] >> 1] += 1;
       // Spread new agents along their first arc so the network does not pulse.
       agent.prog = this.rand() * this.free.time[arcs[0]] * 0.5;
@@ -289,6 +313,19 @@ export class CrowdSim {
       this.positions[w * 3 + 2] = na.z + (nb.z - na.z) * f;
       this.colors[w] = a.color;
       this.edgeOf[w] = k >> 1;
+      // Motion for animated figures: displacement rate of the interpolation above.
+      const edge = this.g.edges[k >> 1];
+      const run = Math.hypot(nb.x - na.x, nb.z - na.z);
+      if (run > 0.3) a.heading = Math.atan2(nb.x - na.x, nb.z - na.z);
+      const riding = edge.kind === 'escalator' || edge.kind === 'elevator';
+      const moving = a.prog > h && f < 1 && !riding;
+      const rate = a.speed * (edge.kind === 'crossing' ? 1 : speedFactor(this.density[k >> 1]));
+      this.headings[w] = a.heading;
+      this.speeds[w] = moving ? (run * rate) / Math.max(0.5, tF - h) : 0;
+      this.ids[w] = a.id;
+      this.climbs[w] = edge.kind === 'stairs' ? Math.sign(nb.y - na.y) : 0;
+      const room = lateralRoom(edge.kind, edge.width);
+      this.lateral[w] = room > 0 ? a.lane * room : 0;
       w++;
       this.agents[keep++] = a;
     }
@@ -299,6 +336,32 @@ export class CrowdSim {
   /** Real pedestrians currently walking in the network. */
   get people(): number {
     return this.count * this.opts.peoplePerAgent;
+  }
+}
+
+/** Uniform [0, 1) hash of an integer (lanes and other per-agent traits). */
+export function hashUnit(n: number): number {
+  let h = Math.imul(n ^ 0x5bd1e995, 0x9e3779b1);
+  h ^= h >>> 15;
+  h = Math.imul(h, 0x85ebca77);
+  h ^= h >>> 13;
+  return (h >>> 0) / 4294967296;
+}
+
+/** How far from the centre line people may walk on an edge (metres; 0 on stairs and lifts). */
+export function lateralRoom(kind: string, width: number | undefined): number {
+  const w = Math.min(16, Math.max(3, width ?? defaultWidth(kind)));
+  switch (kind) {
+    case 'walk':
+      return Math.max(0, w / 2 - 0.7);
+    case 'crossing':
+      return Math.max(0, Math.min(w, 8) / 2 - 0.7);
+    case 'platform':
+      return Math.max(0, w / 2 - 1.6); // stay behind the tactile strip
+    case 'gate':
+      return Math.max(0, Math.min(w / 1.4, 14) / 2 - 0.6);
+    default:
+      return 0;
   }
 }
 

@@ -1404,3 +1404,36 @@ export function headingBetween(a: { x: number; z: number }, b: { x: number; z: n
   if (Math.hypot(dx, dz) < 0.4) return null;
   return Math.atan2(dx, dz);
 }
+
+/**
+ * Sideways placement of stairs, escalators and elevators, matching buildWalkway's layout: the
+ * flights between the same two landings are spread apart with the route's own flight (if any)
+ * kept on the node line. Per edge, the world (x, z) offset of the drawn flight from the straight
+ * line between its nodes (0 for other kinds) — pedestrians use it to stay on the steps.
+ */
+export function verticalLaneOffsets(g: Graph, routeEdges: ReadonlySet<string> = new Set()): Float32Array {
+  const out = new Float32Array(g.edges.length * 2);
+  const laneWidth = (e: NetEdge) => (e.kind === 'stairs' ? Math.min(8, Math.max(2.4, e.width ?? 3.2)) : e.kind === 'escalator' ? 1.7 : 2.6);
+  const byPair = new Map<string, number[]>();
+  g.edges.forEach((e, i) => {
+    if (e.kind !== 'stairs' && e.kind !== 'escalator' && e.kind !== 'elevator') return;
+    const key = e.a < e.b ? `${e.a}|${e.b}` : `${e.b}|${e.a}`;
+    const list = byPair.get(key) ?? [];
+    list.push(i);
+    byPair.set(key, list);
+  });
+  for (const idx of byPair.values()) {
+    const es = idx.map((i) => g.edges[i]);
+    const center = Math.max(0, es.findIndex((e) => routeEdges.has(e.id)));
+    const offs = laneOffsets(es.map(laneWidth), center);
+    const na = g.nodes[g.nodeIndex.get(es[0].a) as number];
+    const nb = g.nodes[g.nodeIndex.get(es[0].b) as number];
+    const [lo, hi] = na.y <= nb.y ? [na, nb] : [nb, na];
+    const { left } = frame(new THREE.Vector3(lo.x, 0, lo.z), new THREE.Vector3(hi.x, 0, hi.z));
+    idx.forEach((i, k) => {
+      out[i * 2] = left.x * offs[k];
+      out[i * 2 + 1] = left.z * offs[k];
+    });
+  }
+  return out;
+}

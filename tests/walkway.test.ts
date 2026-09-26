@@ -2,7 +2,17 @@ import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
 import { buildGraph } from '../src/core/graph';
 import { umeda } from '../src/data/umeda';
-import { angleDelta, buildGuideLine, buildTrain, buildWalkway, disposeWalkway, headingBetween, updateWalkway, walkwayStats } from '../src/render/walkway';
+import {
+  angleDelta,
+  buildGuideLine,
+  buildTrain,
+  buildWalkway,
+  disposeWalkway,
+  headingBetween,
+  updateWalkway,
+  verticalLaneOffsets,
+  walkwayStats,
+} from '../src/render/walkway';
 
 const g = buildGraph(umeda.network);
 
@@ -148,5 +158,32 @@ describe('walk-through interiors', () => {
     for (let i = 0; i < arr.length; i++) expect(Number.isFinite(arr[i])).toBe(true);
     disposeWalkway(group);
     expect(group.userData.walkway).toBeUndefined();
+  });
+});
+
+describe('vertical lane offsets', () => {
+  it('spreads parallel flights apart and leaves walkways on their line', () => {
+    const lanes = verticalLaneOffsets(g);
+    const byPair = new Map<string, number[]>();
+    g.edges.forEach((e, i) => {
+      const len = Math.hypot(lanes[i * 2], lanes[i * 2 + 1]);
+      if (e.kind === 'stairs' || e.kind === 'escalator' || e.kind === 'elevator') {
+        expect(Number.isFinite(len)).toBe(true);
+        const key = e.a < e.b ? `${e.a}|${e.b}` : `${e.b}|${e.a}`;
+        byPair.set(key, [...(byPair.get(key) ?? []), i]);
+      } else {
+        expect(len).toBe(0);
+      }
+    });
+    for (const idx of byPair.values()) {
+      const keys = new Set(idx.map((i) => `${lanes[i * 2].toFixed(3)},${lanes[i * 2 + 1].toFixed(3)}`));
+      expect(keys.size).toBe(idx.length);
+    }
+  });
+
+  it("keeps the route's own flight on the node line the walker follows", () => {
+    const i = g.edges.findIndex((e) => e.kind === 'escalator');
+    const lanes = verticalLaneOffsets(g, new Set([g.edges[i].id]));
+    expect(Math.hypot(lanes[i * 2], lanes[i * 2 + 1])).toBeCloseTo(0);
   });
 });
