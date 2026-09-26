@@ -68,6 +68,7 @@ export class App {
     this.applyStateToControls();
     this.view.setExaggeration(this.state.exag);
     this.view.setLabels(this.state.labels);
+    this.view.setTimeOfDay(this.state.hour);
     this.replan(true);
     this.renderStats();
     this.renderLegend();
@@ -370,6 +371,7 @@ export class App {
     if (planChanged) this.replan(patch.from !== undefined || patch.to !== undefined);
     if (this.tab === 'matrix') this.renderMatrix();
     if (patch.hour !== undefined || patch.day !== undefined) this.updateHeat();
+    if (patch.hour !== undefined) this.view.setTimeOfDay(this.state.hour);
   }
 
   // ---------------------------------------------------------------- planning

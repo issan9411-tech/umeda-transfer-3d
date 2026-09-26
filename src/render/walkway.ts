@@ -269,7 +269,20 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
   const lightMesh = lights.mesh(new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
   const boxMesh = boxes.mesh(new THREE.MeshLambertMaterial());
   const shaftMesh = shafts.mesh(new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.1, depthWrite: false }));
-  for (const m of [floorMesh, zebraMesh, wallMesh, lightMesh, boxMesh, shaftMesh]) if (m) group.add(m);
+  // Names are material roles for look.ts (applyLook swaps in textured PBR materials).
+  const named: [THREE.Mesh | null, string][] = [
+    [floorMesh, 'floor'],
+    [zebraMesh, 'crossing'],
+    [wallMesh, 'walls'],
+    [lightMesh, 'lights'],
+    [boxMesh, 'fixtures'],
+    [shaftMesh, 'shafts'],
+  ];
+  for (const [m, name] of named) {
+    if (!m) continue;
+    m.name = name;
+    group.add(m);
+  }
   if (wallMesh) wallMesh.renderOrder = 3;
   if (shaftMesh) shaftMesh.renderOrder = 3;
   return group;
@@ -318,8 +331,8 @@ export function buildTrain(p: Platform, color: string, Y: (y: number) => number,
   }
   const m1 = body.mesh(new THREE.MeshLambertMaterial());
   const m2 = band.mesh(new THREE.MeshLambertMaterial());
-  if (m1) group.add(m1);
-  if (m2) group.add(m2);
+  if (m1) group.add(Object.assign(m1, { name: 'trainBody' }));
+  if (m2) group.add(Object.assign(m2, { name: 'trainGlass' }));
   return group;
 }
 
@@ -353,7 +366,9 @@ export function buildGuideLine(points: THREE.Vector3[], color: THREE.Color): THR
     }
     carry = (carry + seg) % 7;
   }
-  return band.mesh(new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  const mesh = band.mesh(new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  if (mesh) mesh.name = 'guide';
+  return mesh;
 }
 
 /** Heading (yaw, radians; 0 = +z/south) from a to b, or null for (nearly) vertical moves. */
