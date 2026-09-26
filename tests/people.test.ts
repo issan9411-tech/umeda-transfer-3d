@@ -1,3 +1,4 @@
+import { Vector3 } from 'three';
 import { describe, expect, it } from 'vitest';
 import {
   affine,
@@ -14,6 +15,7 @@ import {
   setRoot,
   type GaitState,
 } from '../src/render/people-rig';
+import { nearSightLine } from '../src/render/people';
 
 /** Forward kinematics of leg i: ankle position in person space from the pose's angles. */
 function ankleFK(p: Pose, i: number): [number, number, number] {
@@ -247,5 +249,16 @@ describe('PeopleCrowd', () => {
     });
     expect(n).toBeGreaterThan(12);
     hero.dispose();
+  });
+});
+
+describe('sight line', () => {
+  it('flags figures between the camera and the walker only', () => {
+    const cam = new Vector3(0, 4, 0);
+    const walker = new Vector3(0, 1, 10);
+    expect(nearSightLine(cam, walker, 0.3, 2.5, 5, 1)).toBe(true); // right in the way
+    expect(nearSightLine(cam, walker, 2, 2.5, 5, 1)).toBe(false); // beside the line
+    expect(nearSightLine(cam, walker, 0, 1, 10.5, 1)).toBe(false); // at / beyond the walker
+    expect(nearSightLine(cam, walker, 0, 4, -1, 1)).toBe(false); // behind the camera
   });
 });

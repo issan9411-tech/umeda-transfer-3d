@@ -214,7 +214,7 @@ function patchFade(mat: THREE.Material, uFade: { value: Float32Array }, pass: 's
  * Street surfaces get a circular cut-out (with a dark rim) at `uReveal.xy` with radius
  * `uReveal.z`, so a walker below street level stays visible to a camera above it.
  */
-function patchReveal(mat: THREE.Material, uReveal: { value: THREE.Vector4 }): void {
+function patchReveal(mat: THREE.Material, uReveal: { value: THREE.Vector4 }, soffit = false): void {
   mat.onBeforeCompile = (sh) => {
     sh.uniforms.uReveal = uReveal;
     sh.vertexShader = sh.vertexShader
@@ -231,10 +231,16 @@ function patchReveal(mat: THREE.Material, uReveal: { value: THREE.Vector4 }): vo
       '#include <opaque_fragment>',
       `#include <opaque_fragment>
   // Dark rim around the cut, like the edge of a section drawing.
-  if (uReveal.z > 0.1 && distance(vRevealXZ, uReveal.xy) < uReveal.z + 0.8) gl_FragColor.rgb *= 0.45;`,
+  if (uReveal.z > 0.1 && distance(vRevealXZ, uReveal.xy) < uReveal.z + 0.8) gl_FragColor.rgb *= 0.45;${
+    soffit
+      ? `
+  // Seen from below (a camera in the underground mall) the street is a concrete slab, not sky.
+  if (!gl_FrontFacing) gl_FragColor.rgb = vec3(0.10, 0.098, 0.094);`
+      : ''
+  }`,
     );
   };
-  mat.customProgramCacheKey = () => 'city-reveal';
+  mat.customProgramCacheKey = () => (soffit ? 'city-reveal-soffit' : 'city-reveal');
 }
 
 // ---------------------------------------------------------------- build
@@ -747,9 +753,16 @@ export function buildCity(net: Network, opts: CityOptions): City {
       ground.quad(q, [0, 1, 0], gc, 0, q.map((v) => [v[0] / 3.2, -v[2] / 3.2]));
     }
     const groundMat = own(
-      new THREE.MeshLambertMaterial({ color: dark ? 0xa39a8c : 0xd9cfc0, map: textures.paving, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 }),
+      new THREE.MeshLambertMaterial({
+        color: dark ? 0xa39a8c : 0xd9cfc0,
+        map: textures.paving,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: 2,
+        polygonOffsetUnits: 2,
+      }),
     );
-    patchReveal(groundMat, uReveal);
+    patchReveal(groundMat, uReveal, true);
     groundMesh = new THREE.Mesh(own(ground.build(true)), groundMat);
     groundMesh.name = 'city-ground';
     groundMesh.renderOrder = -2;

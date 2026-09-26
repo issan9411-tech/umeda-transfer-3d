@@ -59,6 +59,9 @@ export interface PeopleOptions {
   camera?: THREE.Camera;
   maxDistance?: number;
   minDistance?: number;
+  /** Keep the sight line from `camera` to `to` clear: skip figures within `radius` of it
+   * (a chase camera would otherwise lose the walker behind a passer-by). */
+  clearLine?: { to: THREE.Vector3; radius: number };
   /** Per-agent sRGB colours (0xrrggbb) blended into the clothes by `tintAmount` — keeps flows
    * colour-coded (e.g. by destination) in the overview. */
   tints?: Uint32Array;
@@ -427,6 +430,7 @@ export class PeopleCrowd {
         if (!frustum.intersectsSphere(sphere)) continue;
         d2 = (x - camPos.x) ** 2 + (y - camPos.y) ** 2 + (z - camPos.z) ** 2;
         if (d2 > maxD2 || d2 < minD2) continue;
+        if (o.clearLine && nearSightLine(camPos, o.clearLine.to, x, y + 0.9 * h, z, o.clearLine.radius)) continue;
       }
       if (limit >= this.capacity) {
         this.drawPerson(i, id, s, x, y, z, climb, o);
@@ -730,4 +734,19 @@ export class WalkerFigure {
 /** Creates the hero walker figure (see WalkerFigure). */
 export function createWalkerFigure(): WalkerFigure {
   return new WalkerFigure();
+}
+
+/** True when (x, y, z) lies within `r` of segment a→b, strictly between its ends. */
+export function nearSightLine(a: THREE.Vector3, b: THREE.Vector3, x: number, y: number, z: number, r: number): boolean {
+  const abx = b.x - a.x;
+  const aby = b.y - a.y;
+  const abz = b.z - a.z;
+  const len2 = abx * abx + aby * aby + abz * abz;
+  if (len2 < 1e-6) return false;
+  const t = ((x - a.x) * abx + (y - a.y) * aby + (z - a.z) * abz) / len2;
+  if (t <= 0 || t >= 0.9) return false;
+  const dx = a.x + abx * t - x;
+  const dy = a.y + aby * t - y;
+  const dz = a.z + abz * t - z;
+  return dx * dx + dy * dy + dz * dz < r * r;
 }

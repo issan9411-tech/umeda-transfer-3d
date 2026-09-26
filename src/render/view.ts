@@ -94,6 +94,8 @@ export class UmedaView {
   private peopleOpts: PeopleOptions;
   /** Sideways shift of each drawn stair / escalator / elevator flight (x, z per edge). */
   private laneOffsets: Float32Array;
+  /** Camera → walker sight line kept free of passers-by (chase / orbit views). */
+  private sightLine = { to: new THREE.Vector3(), radius: 1.1 };
   /** Levels at both ends of each edge (crowd visibility without per-agent map lookups). */
   private edgeLevels: [string, string][];
   private walker: THREE.Group;
@@ -1121,6 +1123,8 @@ export class UmedaView {
       o.camera = this.camera;
       o.maxDistance = 260;
       o.minDistance = this.walkView === 'first' ? 2 : 2.5;
+      this.sightLine.to.copy(this.walker.position).y += 1.0;
+      o.clearLine = this.walkView === 'first' ? undefined : this.sightLine;
       o.maxDrawn = 350;
       o.tints = undefined;
       o.detail = 'high';
@@ -1134,6 +1138,7 @@ export class UmedaView {
       o.camera = undefined;
       o.maxDistance = undefined;
       o.minDistance = undefined;
+      o.clearLine = undefined;
       o.maxDrawn = undefined;
       o.tints = frame.colors;
       o.tintAmount = 0.6;
