@@ -5,6 +5,7 @@ import type { Graph } from '../core/graph';
 import { sampleKeyframes } from '../core/keyframes';
 import type { Keyframe, RouteSummary } from '../core/planner';
 import type { EdgeKind, NetNode, Platform } from '../core/types';
+import { buildCity, CITY_LAYER, type City } from './city';
 import { applyLook, createEnvironment, Lighting, setupRenderer } from './look';
 import { heatColor, KIND_COLORS, readPalette, type ScenePalette } from './palette';
 import { PeopleCrowd, createWalkerFigure, type PeopleOptions, type WalkerFigure } from './people';
@@ -116,6 +117,9 @@ export class UmedaView {
   /** Node indices of the selected route (their labels are always shown). */
   private routeNodes = new Set<number>();
   private radius = 600;
+  /** Buildings, streets and traffic (city.ts); rebuilt when exaggeration, mode or theme change. */
+  private city: City | null = null;
+  private cityKey = '';
 
   // Walk-through state
   private walkView: WalkView | null = null;
@@ -161,6 +165,7 @@ export class UmedaView {
     this.controls.minDistance = 40;
     this.controls.maxDistance = 4000;
     this.controls.screenSpacePanning = false;
+    this.camera.layers.enable(CITY_LAYER);
 
     this.scene.add(this.lighting.object);
     this.lighting.setTime(this.hour, this.palette.dark);
@@ -254,6 +259,12 @@ export class UmedaView {
     this.hour = hour;
     this.lighting.setTime(hour, this.palette.dark);
     if (this.scene.fog) (this.scene.fog as THREE.Fog).color.copy(this.lighting.haze);
+    this.city?.setNight(this.isNight());
+  }
+
+  /** Lit windows, street lamps and car lights once the sun is down (or at dusk in the dark theme). */
+  private isNight(): boolean {
+    return this.lighting.state.night > 0.5;
   }
 
   // ---------------------------------------------------------------- walk-through
@@ -532,46 +543,34 @@ export class UmedaView {
     (grid.material as THREE.Material).opacity = 0.35;
     grid.position.set(this.center.x, -0.1, this.center.z);
     this.staticGroup.add(grid);
+    // While walking the city lays a solid paved street level instead.
+    ground.visible = grid.visible = !this.walkView;
 
-    // Roads as flat ribbons.
-    for (const road of this.g.net.roads) {
-      const pts = road.points;
-      const verts: number[] = [];
-      for (let i = 0; i < pts.length - 1; i++) {
-        const [x1, z1] = pts[i];
-        const [x2, z2] = pts[i + 1];
-        const dx = x2 - x1;
-        const dz = z2 - z1;
-        const len = Math.hypot(dx, dz) || 1;
-        const nx = (-dz / len) * (road.width / 2);
-        const nz = (dx / len) * (road.width / 2);
-        verts.push(x1 + nx, 0, z1 + nz, x1 - nx, 0, z1 - nz, x2 + nx, 0, z2 + nz);
-        verts.push(x2 + nx, 0, z2 + nz, x1 - nx, 0, z1 - nz, x2 - nx, 0, z2 - nz);
-      }
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
-      const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: p.road, side: THREE.DoubleSide, transparent: true, opacity: 0.9, depthWrite: false }));
-      mesh.position.y = 0.05;
-      mesh.renderOrder = -1;
-      mesh.name = 'road';
-      this.staticGroup.add(mesh);
+    // City context: buildings at real height, streets, trees and traffic.
+    const key = `${this.exaggeration}|${!!this.walkView}|${p.dark}`;
+    if (key !== this.cityKey || !this.city) {
+      this.city?.dispose();
+      this.city = buildCity(this.g.net, { dark: p.dark, night: this.isNight(), ex: this.exaggeration, walk: !!this.walkView });
+      this.scene.add(this.city.object);
+      this.cityKey = key;
     }
+    this.city.object.visible = this.levelVisible('1F');
 
-    // Building / station footprints: low translucent plinths (context only, not exaggerated),
-    // underground malls as flat plates at their level, the JR roof as a thin canopy.
+    // Buildings are massed by the city; here only station-coloured ground plates (overview),
+    // underground malls as flat plates at their level and the JR roof as a thin canopy.
     for (const f of this.g.net.footprints) {
+      if (f.kind === 'building' || (f.kind === 'station' && this.walkView)) continue;
       const shape = new THREE.Shape(f.poly.map(([x, z]) => new THREE.Vector2(x, -z)));
-      const flat = f.kind === 'building' || f.kind === 'station';
-      const base = flat ? 0 : this.Y(f.y0);
-      const depth = flat ? (f.kind === 'station' ? 3 : 1.6) : Math.max(0.4, f.kind === 'deck' ? 0.6 : 0.8);
+      const plate = f.kind === 'station';
+      const depth = plate ? 0.4 : f.kind === 'deck' ? 0.6 : 0.8;
       const geo = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false });
       geo.rotateX(-Math.PI / 2);
       const station = this.g.net.stations.find((s) => s.id === f.id.split(':')[0]);
-      const color = f.kind === 'station' && station ? new THREE.Color(station.color) : p.building;
-      const opacity = f.kind === 'deck' ? 0.06 : f.kind === 'mall' ? 0.1 : f.kind === 'station' ? 0.16 : p.dark ? 0.22 : 0.3;
+      const color = plate && station ? new THREE.Color(station.color) : p.building;
+      const opacity = f.kind === 'deck' ? 0.06 : f.kind === 'mall' ? 0.1 : 0.22;
       const mat = new THREE.MeshLambertMaterial({ color, transparent: true, opacity, depthWrite: false, side: THREE.DoubleSide });
       const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.y = f.kind === 'deck' ? this.Y(f.y0) : base;
+      mesh.position.y = plate ? 0.2 : this.Y(f.y0);
       mesh.renderOrder = 1;
       this.staticGroup.add(mesh);
       const edges = new THREE.LineSegments(
@@ -752,10 +751,13 @@ export class UmedaView {
       const guide = buildGuideLine(pts, this.palette.accent);
       if (guide) this.routeGroup.add(guide);
       if (this.edgeLines) (this.edgeLines.material as THREE.LineBasicMaterial).opacity = 0.25;
+      this.city?.setRoute(null);
       return;
     }
     if (this.edgeLines) (this.edgeLines.material as THREE.LineBasicMaterial).opacity = this.routes.length ? 0.5 : 0.9;
     const p = this.palette;
+    const sel = this.routes[this.selected];
+    this.city?.setRoute(sel ? sel.path.nodes.map((ni) => this.v(this.g.nodes[ni])) : null);
     this.routes.forEach((r, idx) => {
       const isSel = idx === this.selected;
       const pts = r.path.nodes.map((ni) => this.v(this.g.nodes[ni]).add(new THREE.Vector3(0, isSel ? 1.4 : 0.9, 0)));
@@ -1255,6 +1257,7 @@ export class UmedaView {
     if (!this.walkView || this.walkView === 'orbit') this.controls.update();
     if (this.walkView) this.lighting.setShadowFocus(this.walker.position, 110);
     else this.lighting.setShadowFocus(this.controls.target, this.radius);
+    this.city?.update(this.camera, this.walkView ? this.walker.position : this.controls.target, dt);
     this.renderer.render(this.scene, this.camera);
     this.labelRenderer.render(this.scene, this.camera);
     if (this.walkView) this.renderMinimap();
