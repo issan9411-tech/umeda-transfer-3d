@@ -362,7 +362,10 @@ export class App {
 
   private set(patch: Partial<State>): void {
     Object.assign(this.state, patch);
-    if (patch.from !== undefined || patch.to !== undefined) this.state.selected = 0;
+    if (patch.from !== undefined || patch.to !== undefined) {
+      this.state.selected = 0;
+      this.userPicked = false;
+    }
     this.applyStateToControls();
     this.saveState();
     this.matrixDirty = true;
@@ -383,7 +386,10 @@ export class App {
       this.plan = null;
       this.setPlaying(false);
       this.t = 0;
-      this.setResultsHtml(`<div class="empty">出発と到着に同じホームが含まれています。別のホームか駅を選んでください。</div>`);
+      const msg = '出発と到着に同じホームが含まれています。別のホームか駅を選んでください。';
+      this.setResultsHtml(`<div class="empty">${msg}</div>`);
+      this.lastAnnounce = msg;
+      $('resultsStatus').textContent = msg;
       this.setStepsHtml('');
       this.view.setRoutes([]);
       this.syncWalkUi();
@@ -391,25 +397,16 @@ export class App {
       this.updateClock();
       return;
     }
-    // Keep the user's chosen route by identity (not by index) when the list is recomputed.
-    const prev = refocus ? null : this.current();
+    // Keep a route the user explicitly picked (by identity, not index) across recomputation;
+    // otherwise always show the new recommendation.
+    const prev = refocus || !this.userPicked ? null : this.current();
     const prevKey = prev ? prev.path.nodes.join(',') : null;
     this.plan = planRoute(this.g, { from, to, options: this.costOptions(), boarding: this.state.boarding, alternatives: 3 });
     const routes = this.plan.routes;
     let sel = prevKey ? routes.findIndex((r) => r.path.nodes.join(',') === prevKey) : 0;
-    if (sel < 0 && prev) {
-      // Closest remaining route by shared nodes (Jaccard); the walker restarts on it.
-      const prevNodes = new Set(prev.path.nodes);
-      let best = -1;
+    if (sel < 0) {
       sel = 0;
-      routes.forEach((r, i) => {
-        const inter = r.path.nodes.filter((n) => prevNodes.has(n)).length;
-        const score = inter / (r.path.nodes.length + prevNodes.size - inter);
-        if (score > best) {
-          best = score;
-          sel = i;
-        }
-      });
+      this.userPicked = false;
       this.t = 0;
     }
     this.state.selected = Math.max(0, Math.min(sel, routes.length - 1));
@@ -435,6 +432,7 @@ export class App {
 
   private selectRoute(i: number): void {
     this.state.selected = i;
+    this.userPicked = i !== 0;
     this.view.selectRoute(i);
     this.t = 0;
     this.view.setWalkerTime(0);
@@ -450,6 +448,8 @@ export class App {
   // ---------------------------------------------------------------- rendering: route panel
 
   private lastResultsHtml = '';
+  /** True once the viewer picked an alternative card; only then is it kept across replans. */
+  private userPicked = false;
   private lastStepsHtml = '';
   private lastAnnounce = '';
 
@@ -464,27 +464,19 @@ export class App {
       b.addEventListener('click', () => this.selectRoute(Number(b.dataset.route))),
     );
     el.querySelector<HTMLButtonElement>('[data-walk]')?.addEventListener('click', () => this.startWalk());
-    if (focused !== null) el.querySelector<HTMLButtonElement>(`[data-route="${focused}"]`)?.focus();
+    if (focused !== null) el.querySelector<HTMLButtonElement>(`[data-route="${focused}"]`)?.focus({ preventScroll: true });
   }
 
   private setStepsHtml(html: string): void {
     if (html === this.lastStepsHtml) return;
     this.lastStepsHtml = html;
     const el = $('steps');
-    const focused = (document.activeElement as HTMLElement | null)?.closest('#steps .step')?.getAttribute('data-i') ?? null;
+    const focused = (document.activeElement as HTMLElement | null)?.closest('#steps .step-btn')?.getAttribute('data-i') ?? null;
     el.innerHTML = html;
-    el.querySelectorAll<HTMLLIElement>('.step').forEach((li) => {
-      const activate = () => this.jumpToStep(Number(li.dataset.i), Number(li.dataset.t));
-      li.addEventListener('click', activate);
-      li.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          e.stopPropagation();
-          activate();
-        }
-      });
-    });
-    if (focused !== null) el.querySelector<HTMLLIElement>(`.step[data-i="${focused}"]`)?.focus();
+    el.querySelectorAll<HTMLButtonElement>('.step-btn').forEach((btn) =>
+      btn.addEventListener('click', () => this.jumpToStep(Number(btn.dataset.i), Number(btn.dataset.t))),
+    );
+    if (focused !== null) el.querySelector<HTMLButtonElement>(`.step-btn[data-i="${focused}"]`)?.focus({ preventScroll: true });
   }
 
   private jumpToStep(i: number, t: number): void {
@@ -504,7 +496,8 @@ export class App {
   /** One-line summary for screen readers, only when the recommendation actually changes. */
   private announce(force: boolean): void {
     const r = this.plan?.routes[0];
-    const msg = r ? `推奨ルート ${Math.floor(r.timeS / 60)}分 ${r.tag}` : '';
+    const s = r ? Math.round(r.timeS) : 0;
+    const msg = r ? `推奨ルート ${Math.floor(s / 60)}分${String(s % 60).padStart(2, '0')}秒 ${r.tag}` : 'この条件で通れるルートが見つかりません';
     if (!force && msg === this.lastAnnounce) return;
     this.lastAnnounce = msg;
     $('resultsStatus').textContent = msg;
@@ -569,12 +562,12 @@ export class App {
         const start = acc;
         acc += ins.timeS;
         const time = ins.kind === 'start' ? '0:00' : ins.kind === 'arrive' ? mmss(acc) : `+${jpDuration(ins.timeS)}`;
-        return `<li class="step" tabindex="0" role="button" data-i="${i}" data-t="${start}" style="--k:${KIND_CSS[ins.kind]}">
+        return `<li class="step" data-i="${i}" style="--k:${KIND_CSS[ins.kind]}"><button type="button" class="step-btn" data-i="${i}" data-t="${start}">
           <span class="step-icon">${ICONS[ins.kind]}</span>
           <span class="step-body"><span class="step-text"><span class="lvl">${ins.level}</span>${escapeHtml(ins.text)}</span>
           ${ins.detail ? `<span class="step-detail"><br>${escapeHtml(ins.detail)}</span>` : ''}</span>
           <span class="step-time">${time}</span>
-        </li>`;
+        </button></li>`;
       })
       .join('');
     this.setStepsHtml(html);

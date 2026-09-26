@@ -157,6 +157,17 @@ describe('review regressions', () => {
     expect(count('distance')).toBeLessThanOrEqual(count('time') + 3);
   });
 
+  it('vertical instructions never merge a down-and-up into a 0 m move', () => {
+    for (const profile of ['standard', 'stepfree'] as const) {
+      for (const p of umeda.network.platforms.filter((x) => x.stationId === 'jr')) {
+        for (const q of umeda.network.platforms.filter((x) => x.stationId === 'jr' && x.id !== p.id)) {
+          const plan = planRoute(g, { from: { stationId: 'jr', platformId: p.id }, to: { stationId: 'jr', platformId: q.id }, options: { ...opts, profile }, boarding: 'middle', alternatives: 3 });
+          for (const r of plan.routes) for (const ins of r.instructions) expect(ins.text, `${p.id}->${q.id}`).not.toMatch(/約0m/);
+        }
+      }
+    }
+  });
+
   it('alternatives do not repeat the same corridors with a parallel stairs/escalator swap', () => {
     const plan = planRoute(g, { from: { stationId: 'jr', platformId: 'jr-9-10' }, to: { stationId: 'umekita', platformId: 'uk-21-22' }, options: opts, boarding: 'best', alternatives: 3 });
     const keys = plan.routes.map((r) => r.path.nodes.join(','));

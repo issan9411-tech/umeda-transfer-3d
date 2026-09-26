@@ -149,7 +149,7 @@ export function addJrOsaka(b: NetBuilder): void {
   const nishiTop = (p: JrPlatform) => `jr_nishiTop_${p.id}`;
   for (const p of JR_PLATFORMS) {
     b.node(nishiTop(p), 'junction', `${p.nameJa} 西口階段上`, atLon(p, BANK.nishi), '2F', { station: st, paid: true, y: PLAT_Y });
-    b.walk(stops[p.id].nishi, nishiTop(p), { name: `${p.nameJa}（西口階段へ）`, busy: 1, width: p.width * 0.6 });
+    b.platformWalk(stops[p.id].nishi, nishiTop(p), { busy: p.busy, width: p.width * 0.6 });
   }
 
   const islands = JR_PLATFORMS.filter((p) => p.id !== 'jr-11');

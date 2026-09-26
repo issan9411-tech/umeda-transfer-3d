@@ -615,13 +615,23 @@ input[type="radio"] {
 }
 
 .step {
+  position: relative;
+  border-radius: 8px;
+}
+
+.step-btn {
+  all: unset;
+  box-sizing: border-box;
   display: grid;
   grid-template-columns: 30px 1fr auto;
   gap: 10px;
+  width: 100%;
   padding: 7px 4px;
   border-radius: 8px;
   cursor: pointer;
-  position: relative;
+  text-align: left;
+  font: inherit;
+  color: inherit;
 }
 
 .step::before {
@@ -646,7 +656,7 @@ input[type="radio"] {
   background: var(--surface-2);
 }
 
-.step:focus-visible {
+.step-btn:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 1px;
 }

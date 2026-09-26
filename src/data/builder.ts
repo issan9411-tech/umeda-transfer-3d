@@ -156,6 +156,12 @@ export class NetBuilder {
     return id;
   }
 
+  /** Walking along a platform between two points on it (not a boarding position). */
+  platformWalk(a: string, b: string, o: EdgeOpts = {}): this {
+    this.edge('platform', a, b, o);
+    return this;
+  }
+
   walk(a: string, b: string, o: EdgeOpts = {}): this {
     this.edge('walk', a, b, o);
     return this;

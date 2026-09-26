@@ -70,6 +70,7 @@ export function buildInstructions(g: Graph, model: CostModel, path: Path): Instr
       let d = 0;
       let indoor = true;
       const names: string[] = [];
+      let platformM = 0;
       while (j < steps.length && (g.edges[steps[j].edge].kind === 'walk' || g.edges[steps[j].edge].kind === 'platform')) {
         const ej = g.edges[steps[j].edge];
         if (j > i) {
@@ -82,6 +83,7 @@ export function buildInstructions(g: Graph, model: CostModel, path: Path): Instr
         t += model.time[kj];
         d += model.dist[kj];
         indoor = indoor && ej.indoor;
+        if (ej.kind === 'platform') platformM += model.dist[kj];
         if (ej.name && !names.includes(ej.name)) names.push(ej.name);
         j++;
       }
@@ -96,7 +98,8 @@ export function buildInstructions(g: Graph, model: CostModel, path: Path): Instr
       }
       const to = nodes[steps[j - 1].to];
       const dir = compass(from, to);
-      const onPlatform = g.edges[st.edge].kind === 'platform';
+      // "ホーム上を…" only when most of the walk really is on the platform.
+      const onPlatform = platformM >= d * 0.6;
       const shown = d < 10 ? Math.max(1, Math.round(d)) : Math.round(d / 10) * 10;
       const via = names.length ? names.slice(0, 3).join(' → ') : '';
       const head = onPlatform ? 'ホーム上を' : via ? `${via}を` : '';
@@ -119,7 +122,11 @@ export function buildInstructions(g: Graph, model: CostModel, path: Path): Instr
       let j = i;
       let t = 0;
       let d = 0;
+      // Only merge a monotonic move; every elevator ride is its own step (own wait).
+      const sign0 = Math.sign(nodes[steps[i].to].y - nodes[steps[i].from].y);
       while (j < steps.length && g.edges[steps[j].edge].kind === e.kind) {
+        const sj = Math.sign(nodes[steps[j].to].y - nodes[steps[j].from].y);
+        if (j > i && (e.kind === 'elevator' || (sj !== 0 && sj !== sign0))) break;
         const kj = arcIndex(steps[j].edge, steps[j].dir);
         t += model.time[kj];
         d += model.dist[kj];
