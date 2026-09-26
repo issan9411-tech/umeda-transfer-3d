@@ -379,7 +379,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     geo[kind].quad(a, b, cc, d, gridUV(a, b, cc, d, floorScale[kind]), UP);
 
   // ------------------------------------------------------------------ vertical bundles (laid out first: their wells open the floors above)
-  const laneWidth = (e: NetEdge) => (e.kind === 'stairs' ? Math.min(8, Math.max(2.4, e.width ?? 3.2)) : e.kind === 'escalator' ? 1.7 : 2.6);
+  const laneWidth = verticalLaneWidth;
   const byPair = new Map<string, NetEdge[]>();
   for (const e of g.edges) {
     if (!isVertical(e) || !visible(e)) continue;
@@ -909,42 +909,14 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     signs.push({ at, normal: normal.clone().setY(0).normalize(), width, bottom, ceil: ceilH, faceA: faces.length - 2, faceB: faces.length - 1 });
   }
 
-  // ------------------------------------------------------------------ platforms
-  for (const p of g.net.platforms) {
-    if (!o.levelVisible(p.level)) continue;
-    addPlatform(p);
-  }
+  // Platform slabs (tiles, coping, white line, tactile strip, stair-well parapets) are drawn by
+  // station.ts, which cuts its wells with the same lane table (verticalLaneOffsets).
 
   /**
    * Platform slab: tiled top with the stair wells cut out, white edge lines and yellow tactile
    * strips, concrete faces towards the tracks (the view's coloured platform boxes are for the
    * overview).
    */
-  function addPlatform(p: Platform): void {
-    const A = V(p.a[0], Y(p.y), p.a[1]);
-    const B = V(p.b[0], Y(p.y), p.b[1]);
-    const { dir, left, run } = frame(A, B);
-    const at = (s: number, lat: number, h: number) => V(A.x + dir.x * s + left.x * lat, A.y + h, A.z + dir.z * s + left.z * lat);
-    const hw = p.width / 2;
-    floorPoly('tile', [at(0, hw, 0.02), at(run, hw, 0.02), at(run, -hw, 0.02), at(0, -hw, 0.02)]);
-    const k = TX.TACTILE_M;
-    const local = (q: THREE.Vector3): [number, number] => [((q.x - A.x) * dir.x + (q.z - A.z) * dir.z) / k, ((q.x - A.x) * left.x + (q.z - A.z) * left.z) / k];
-    const flat = (): [number, number] => [0, 0];
-    const depth = 1.1 * ex;
-    for (const side of [1, -1]) {
-      const e0 = side * (hw - 0.05);
-      const e1 = side * (hw - 0.17);
-      polyFloor(geo.marks, [at(0, e0, 0.04), at(run, e0, 0.04), at(run, e1, 0.04), at(0, e1, 0.04)], flat, null, c.platEdge);
-      const t0 = side * (hw - 0.8);
-      const t1 = side * (hw - 1.2);
-      polyFloor(geo.tactile, [at(0, t0, 0.05), at(run, t0, 0.05), at(run, t1, 0.05), at(0, t1, 0.05)], local);
-      geo.stair.quad(at(0, side * hw, -depth), at(run, side * hw, -depth), at(run, side * hw, 0.02), at(0, side * hw, 0.02), [0, 0, run / 4, 0, run / 4, 0.25, 0, 0.25], left.clone().multiplyScalar(side));
-    }
-    for (const [s, want] of [[0, dir.clone().negate()], [run, dir]] as const) {
-      geo.stair.quad(at(s, -hw, -depth), at(s, hw, -depth), at(s, hw, 0.02), at(s, -hw, 0.02), [0, 0, 1, 0, 1, 0.25, 0, 0.25], want);
-    }
-  }
-
   // ------------------------------------------------------------------ stairs, escalators, elevators
   for (const b of bundles) {
     const { es, offs, na, nb, lo, dir, left, run, rise, line, lmin, lmax, indoor } = b;
@@ -1405,15 +1377,22 @@ export function headingBetween(a: { x: number; z: number }, b: { x: number; z: n
   return Math.atan2(dx, dz);
 }
 
+/** Drawn width of a stair flight, escalator or elevator lane (m). */
+export const verticalLaneWidth = (e: NetEdge): number =>
+  e.kind === 'stairs' ? Math.min(8, Math.max(2.4, e.width ?? 3.2)) : e.kind === 'escalator' ? 1.7 : 2.6;
+
 /**
  * Sideways placement of stairs, escalators and elevators, matching buildWalkway's layout: the
  * flights between the same two landings are spread apart with the route's own flight (if any)
  * kept on the node line. Per edge, the world (x, z) offset of the drawn flight from the straight
  * line between its nodes (0 for other kinds) — pedestrians use it to stay on the steps.
  */
-export function verticalLaneOffsets(g: Graph, routeEdges: ReadonlySet<string> = new Set()): Float32Array {
+export function verticalLaneOffsets(
+  g: { edges: NetEdge[]; nodes: NetNode[]; nodeIndex?: Map<string, number> },
+  routeEdges: ReadonlySet<string> = new Set(),
+): Float32Array {
+  const nodeIndex = g.nodeIndex ?? new Map(g.nodes.map((n, i) => [n.id, i]));
   const out = new Float32Array(g.edges.length * 2);
-  const laneWidth = (e: NetEdge) => (e.kind === 'stairs' ? Math.min(8, Math.max(2.4, e.width ?? 3.2)) : e.kind === 'escalator' ? 1.7 : 2.6);
   const byPair = new Map<string, number[]>();
   g.edges.forEach((e, i) => {
     if (e.kind !== 'stairs' && e.kind !== 'escalator' && e.kind !== 'elevator') return;
@@ -1425,9 +1404,9 @@ export function verticalLaneOffsets(g: Graph, routeEdges: ReadonlySet<string> = 
   for (const idx of byPair.values()) {
     const es = idx.map((i) => g.edges[i]);
     const center = Math.max(0, es.findIndex((e) => routeEdges.has(e.id)));
-    const offs = laneOffsets(es.map(laneWidth), center);
-    const na = g.nodes[g.nodeIndex.get(es[0].a) as number];
-    const nb = g.nodes[g.nodeIndex.get(es[0].b) as number];
+    const offs = laneOffsets(es.map(verticalLaneWidth), center);
+    const na = g.nodes[nodeIndex.get(es[0].a) as number];
+    const nb = g.nodes[nodeIndex.get(es[0].b) as number];
     const [lo, hi] = na.y <= nb.y ? [na, nb] : [nb, na];
     const { left } = frame(new THREE.Vector3(lo.x, 0, lo.z), new THREE.Vector3(hi.x, 0, hi.z));
     idx.forEach((i, k) => {
