@@ -226,6 +226,11 @@ input {
   gap: 14px;
 }
 
+/* Scrollable children (tables) must not shrink to zero inside the scrolling flex column. */
+.tabpane > * {
+  flex-shrink: 0;
+}
+
 .pane-lead {
   margin: 0;
   color: var(--ink-2);
@@ -835,6 +840,10 @@ input[type="radio"] {
   padding: 4px 6px;
   text-align: left;
   vertical-align: top;
+}
+
+.about th {
+  white-space: nowrap;
 }
 
 .about code {
