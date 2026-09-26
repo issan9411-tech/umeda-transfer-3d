@@ -64,8 +64,6 @@ export class App {
       onHoverPlatform: (id, x, y) => this.showPlatformTip(id, x, y),
       onEmptyClick: () => this.hideTip(),
     });
-    // Dev-only handle for scripted screenshots.
-    if (import.meta.env.DEV) (window as unknown as { __app?: App }).__app = this;
     this.buildControls();
     this.applyStateToControls();
     this.view.setExaggeration(this.state.exag);
