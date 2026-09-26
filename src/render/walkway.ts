@@ -1,12 +1,26 @@
 import * as THREE from 'three';
 import type { Graph } from '../core/graph';
 import type { NetEdge, NetNode, Platform } from '../core/types';
+import * as TX from './walkway-tex';
+import { arrowFor, cabinCycle, destinationsVia, dominantAngle, hash01, isMallEdge, isVertical, laneOffsets, mouthTrims, subtractConvex, type P2, type SignTarget } from './walkway-util';
+
+export { angleDelta } from './walkway-util';
 
 /**
- * Walk-through geometry: the pedestrian network rendered as a place you can walk through —
- * floors with real widths, corridor walls and ceiling lights underground, stair steps,
- * escalators, glass elevator shafts, fare-gate rows and platform tactile strips.
- * Built once per exaggeration/theme; everything is merged into a handful of draw calls.
+ * Walk-through geometry: the pedestrian network rendered as the place you walk through.
+ *
+ * - Floors with procedural textures laid on one grid in metres (station tiles in paid areas,
+ *   terrazzo in malls, pavers outside, asphalt and zebra stripes at crossings).
+ * - Covered corridors get walls and ceilings that are single-sided and face INTO the corridor,
+ *   so the chase camera (above ceiling height) looks straight in while the first-person view is
+ *   enclosed. Junctions are closed into polygons so corridor mouths meet cleanly.
+ * - Ceiling lights, pillar rows in wide concourses, lit shopfronts along the underground malls,
+ *   wall adverts, hanging black wayfinding signs at junctions and above fare gates.
+ * - Stairs (tread atlas, side walls, handrails), escalators (scrolling treads, glass balustrades,
+ *   black handrails), glass elevator shafts with doors and moving cabins, detailed fare gates.
+ *
+ * Everything is merged per material (≈17 draw calls). Occluders between the chase camera and
+ * the walker are cut away in the fragment shader (see `updateWalkway`).
  */
 
 export interface WalkwayOptions {
@@ -16,64 +30,153 @@ export interface WalkwayOptions {
   ex: number;
   dark: boolean;
   levelVisible: (level: string) => boolean;
+  /**
+   * Edge ids of the route being walked. Its stairs / escalator / elevator is laid on the
+   * node-to-node line the walker follows (the other modes of the bundle move aside) and its
+   * junction signs get priority.
+   */
+  routeEdges?: ReadonlySet<string>;
 }
 
-const tmpQ = new THREE.Quaternion();
-const tmpS = new THREE.Vector3();
-const tmpP = new THREE.Vector3();
+/** Occlusion cut-away for the chase camera: fragments near the eye→target segment are dropped. */
+export interface WalkCut {
+  eye: THREE.Vector3;
+  target: THREE.Vector3;
+}
 
-/** Growable triangle soup with per-vertex colours. */
-class Soup {
+const UP = new THREE.Vector3(0, 1, 0);
+const DOWN = new THREE.Vector3(0, -1, 0);
+const WHITE = new THREE.Color(1, 1, 1);
+/** Vertex tint of floor edges along walls (baked contact shadow). */
+const AO = 0.74;
+const CUT_RADIUS = 1.7;
+
+const _a = new THREE.Vector3();
+const _b = new THREE.Vector3();
+const _n = new THREE.Vector3();
+const _q = new THREE.Quaternion();
+const _e = new THREE.Euler();
+const _s = new THREE.Vector3();
+const _p = new THREE.Vector3();
+const _m = new THREE.Matrix4();
+
+type UV4 = [number, number, number, number, number, number, number, number];
+
+/** Growable non-indexed triangle list with flat normals, UVs and vertex colours. */
+class Geo {
   pos: number[] = [];
+  nor: number[] = [];
+  uv: number[] = [];
   col: number[] = [];
 
-  quad(a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, d: THREE.Vector3, color: THREE.Color): void {
-    for (const p of [a, b, c, a, c, d]) {
-      this.pos.push(p.x, p.y, p.z);
-      this.col.push(color.r, color.g, color.b);
-    }
+  private push(p: THREE.Vector3, u: number, v: number, n: THREE.Vector3, c: THREE.Color): void {
+    this.pos.push(p.x, p.y, p.z);
+    this.nor.push(n.x, n.y, n.z);
+    this.uv.push(u, v);
+    this.col.push(c.r, c.g, c.b);
   }
 
-  disc(center: THREE.Vector3, r: number, color: THREE.Color, segs = 14): void {
-    for (let i = 0; i < segs; i++) {
-      const a0 = (i / segs) * Math.PI * 2;
-      const a1 = ((i + 1) / segs) * Math.PI * 2;
-      this.pos.push(center.x, center.y, center.z);
-      this.pos.push(center.x + Math.cos(a1) * r, center.y, center.z + Math.sin(a1) * r);
-      this.pos.push(center.x + Math.cos(a0) * r, center.y, center.z + Math.sin(a0) * r);
-      for (let k = 0; k < 3; k++) this.col.push(color.r, color.g, color.b);
+  /** Quad a→b→c→d (around its outline) made visible from the side `want` points to. */
+  /**
+   * Quad a→b→c→d (around its outline) made visible from the side `want` points to. `color` is
+   * one colour or one per corner (used for baked contact shadows along walls).
+   */
+  quad(a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, d: THREE.Vector3, uv: UV4, want: THREE.Vector3, color: THREE.Color | readonly THREE.Color[] = WHITE): void {
+    // Diagonal cross product: robust for any planar quad, even one with a collapsed edge.
+    _n.crossVectors(_a.subVectors(c, a), _b.subVectors(d, b));
+    const len = _n.length();
+    if (len < 1e-9) return;
+    _n.divideScalar(len);
+    const k = (i: number) => (Array.isArray(color) ? color[i] : (color as THREE.Color));
+    if (_n.dot(want) < 0) {
+      _n.negate();
+      this.push(a, uv[0], uv[1], _n, k(0));
+      this.push(c, uv[4], uv[5], _n, k(2));
+      this.push(b, uv[2], uv[3], _n, k(1));
+      this.push(a, uv[0], uv[1], _n, k(0));
+      this.push(d, uv[6], uv[7], _n, k(3));
+      this.push(c, uv[4], uv[5], _n, k(2));
+      return;
     }
+    this.push(a, uv[0], uv[1], _n, k(0));
+    this.push(b, uv[2], uv[3], _n, k(1));
+    this.push(c, uv[4], uv[5], _n, k(2));
+    this.push(a, uv[0], uv[1], _n, k(0));
+    this.push(c, uv[4], uv[5], _n, k(2));
+    this.push(d, uv[6], uv[7], _n, k(3));
   }
 
-  mesh(material: THREE.Material): THREE.Mesh | null {
+  tri(a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, uv: [number, number, number, number, number, number], want: THREE.Vector3, color: THREE.Color | readonly THREE.Color[] = WHITE): void {
+    _n.crossVectors(_a.subVectors(b, a), _b.subVectors(c, a));
+    const len = _n.length();
+    if (len < 1e-9) return;
+    _n.divideScalar(len);
+    const k = (i: number) => (Array.isArray(color) ? color[i] : (color as THREE.Color));
+    if (_n.dot(want) < 0) {
+      _n.negate();
+      this.push(a, uv[0], uv[1], _n, k(0));
+      this.push(c, uv[4], uv[5], _n, k(2));
+      this.push(b, uv[2], uv[3], _n, k(1));
+      return;
+    }
+    this.push(a, uv[0], uv[1], _n, k(0));
+    this.push(b, uv[2], uv[3], _n, k(1));
+    this.push(c, uv[4], uv[5], _n, k(2));
+  }
+
+  get triangles(): number {
+    return this.pos.length / 9;
+  }
+
+  mesh(material: THREE.Material, name: string): THREE.Mesh | null {
     if (this.pos.length === 0) return null;
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(this.nor, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
     geo.setAttribute('color', new THREE.Float32BufferAttribute(this.col, 3));
-    geo.computeVertexNormals();
-    return new THREE.Mesh(geo, material);
+    const m = new THREE.Mesh(geo, material);
+    m.name = name;
+    return m;
   }
 }
 
 /** Collects box instances and turns them into one InstancedMesh. */
 class Boxes {
-  mats: THREE.Matrix4[] = [];
-  cols: THREE.Color[] = [];
+  mats: number[] = [];
+  cols: number[] = [];
 
   add(center: THREE.Vector3, size: THREE.Vector3, yaw: number, color: THREE.Color, pitch = 0): void {
-    tmpQ.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
-    this.mats.push(new THREE.Matrix4().compose(center, tmpQ, size));
-    this.cols.push(color.clone());
+    _q.setFromEuler(_e.set(pitch, yaw, 0, 'YXZ'));
+    _m.compose(center, _q, size);
+    for (const v of _m.elements) this.mats.push(v);
+    this.cols.push(color.r, color.g, color.b);
   }
 
-  mesh(material: THREE.Material): THREE.InstancedMesh | null {
-    if (this.mats.length === 0) return null;
-    const m = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), material, this.mats.length);
-    this.mats.forEach((mat, i) => {
-      m.setMatrixAt(i, mat);
-      m.setColorAt(i, this.cols[i]);
-    });
+  /** Box of cross-section w×h spanning p0→p1 (handrails, beams). */
+  beam(p0: THREE.Vector3, p1: THREE.Vector3, w: number, h: number, color: THREE.Color): void {
+    const dx = p1.x - p0.x;
+    const dy = p1.y - p0.y;
+    const dz = p1.z - p0.z;
+    const run = Math.hypot(dx, dz);
+    const len = Math.hypot(run, dy);
+    if (len < 1e-3) return;
+    _p.set((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, (p0.z + p1.z) / 2);
+    this.add(_p, _s.set(w, h, len), Math.atan2(dx, dz), color, -Math.atan2(dy, Math.max(run, 1e-4)));
+  }
+
+  get count(): number {
+    return this.cols.length / 3;
+  }
+
+  mesh(material: THREE.Material, name: string): THREE.InstancedMesh | null {
+    const n = this.count;
+    if (n === 0) return null;
+    const m = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), material, n);
+    (m.instanceMatrix.array as Float32Array).set(this.mats);
     m.instanceMatrix.needsUpdate = true;
+    m.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(this.cols), 3);
+    m.name = name;
     return m;
   }
 }
@@ -90,200 +193,1136 @@ function frame(a: THREE.Vector3, b: THREE.Vector3): { dir: THREE.Vector3; left: 
 
 const yawOf = (dir: THREE.Vector3) => Math.atan2(dir.x, dir.z);
 
+const uvRect = (u0: number, v0: number, u1: number, v1: number): UV4 => [u0, v0, u1, v0, u1, v1, u0, v1];
+const V = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z);
+
+/** Ceiling height (real metres) for a corridor of a given width: wide concourses are taller. */
+export function ceilingHeight(width: number): number {
+  return width >= 20 ? 4.6 : width >= 12 ? 3.8 : 3.0;
+}
+
+const widthOf = (e: NetEdge) => Math.min(26, Math.max(3, e.width ?? (e.kind === 'crossing' ? 8 : e.kind === 'gate' ? 10 : 6)));
+
+interface ArmRec {
+  e: NetEdge;
+  idx: number;
+  other: number;
+  angle: number;
+  width: number;
+  run: number;
+  indoor: boolean;
+  trim: number;
+  H: number;
+}
+
+interface SignSpec {
+  at: THREE.Vector3;
+  normal: THREE.Vector3;
+  width: number;
+  bottom: number;
+  ceil: number | null;
+  faceA: number;
+  faceB: number;
+}
+
+interface CutUniforms {
+  uCutA: { value: THREE.Vector3 };
+  uCutB: { value: THREE.Vector3 };
+  uCutR: { value: number };
+}
+
+/** Walk state kept on the group for `updateWalkway` / `disposeWalkway`. */
+interface WalkState {
+  time: number;
+  esc: THREE.Texture | null;
+  cabins: THREE.InstancedMesh | null;
+  /** Per cabin: x, z, yaw, y0, y1, height, phase, travel, dwell. */
+  cabinData: Float32Array;
+  cut: CutUniforms;
+  textures: THREE.Texture[];
+}
+
+const CABIN_STRIDE = 9;
+
+/**
+ * Cut-away state shared by every walk-mode material (only one walk scene exists at a time), so
+ * meshes built elsewhere, such as the guide line, can take part through `withWalkCut`.
+ */
+const sharedCut: CutUniforms = { uCutA: { value: new THREE.Vector3() }, uCutB: { value: new THREE.Vector3() }, uCutR: { value: 0 } };
+
+/** Makes a material drop fragments between the chase camera and the walker (see `updateWalkway`). */
+export function withWalkCut<T extends THREE.Material>(mat: T): T {
+  return withCut(mat, sharedCut);
+}
+
+/** Adds the chase-camera cut-away to a material (shared program across all walkway materials). */
+function withCut<T extends THREE.Material>(mat: T, cut: CutUniforms): T {
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uCutA = cut.uCutA;
+    shader.uniforms.uCutB = cut.uCutB;
+    shader.uniforms.uCutR = cut.uCutR;
+    shader.vertexShader = `varying vec3 vCutPos;\n${shader.vertexShader}`.replace(
+      '#include <project_vertex>',
+      `#include <project_vertex>
+      {
+        vec4 cutW = vec4( transformed, 1.0 );
+        #ifdef USE_INSTANCING
+          cutW = instanceMatrix * cutW;
+        #endif
+        vCutPos = ( modelMatrix * cutW ).xyz;
+      }`,
+    );
+    shader.fragmentShader = `uniform vec3 uCutA;\nuniform vec3 uCutB;\nuniform float uCutR;\nvarying vec3 vCutPos;\n${shader.fragmentShader}`.replace(
+      '#include <clipping_planes_fragment>',
+      `#include <clipping_planes_fragment>
+      if ( uCutR > 0.0 ) {
+        vec3 cutAB = uCutB - uCutA;
+        float cutT = dot( vCutPos - uCutA, cutAB ) / max( dot( cutAB, cutAB ), 1e-4 );
+        // Nothing right in front of the lens, and no ceilings / upper floors / sign boards
+        // above head height on the camera's side of the walker (a cutaway, like a dollhouse).
+        if ( cutT < 1.0 && distance( vCutPos, uCutA ) < 2.5 ) discard;
+        if ( cutT > 0.0 && cutT < 1.0 && vCutPos.y > uCutB.y + 2.2 ) discard;
+        // A cylinder around the sight line, tapering to nothing just before the walker.
+        float cutC = clamp( cutT, 0.0, 1.0 );
+        float cutR = uCutR * clamp( ( 1.0 - cutC ) / 0.2, 0.0, 1.0 );
+        if ( distance( vCutPos, uCutA + cutAB * cutC ) < cutR ) discard;
+      }`,
+    );
+  };
+  mat.customProgramCacheKey = () => 'walkway-cut';
+  return mat;
+}
+
 export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
   const group = new THREE.Group();
   group.name = 'walkway';
   const { Y, ex } = o;
+  const route = o.routeEdges ?? new Set<string>();
   const nodeOf = (id: string) => g.nodes[g.nodeIndex.get(id) as number];
+  const idxOf = (id: string) => g.nodeIndex.get(id) as number;
   const P = (n: NetNode) => new THREE.Vector3(n.x, Y(n.y), n.z);
+  const visible = (e: NetEdge) => o.levelVisible(nodeOf(e.a).level) || o.levelVisible(nodeOf(e.b).level);
+  const dim = o.dark ? 0.74 : 1;
+  const col = (hex: string, k = 1) => new THREE.Color(hex).multiplyScalar(k);
 
   const c = {
-    floorPaid: new THREE.Color(o.dark ? '#4a4540' : '#d8cfc2'),
-    floorFree: new THREE.Color(o.dark ? '#3c4046' : '#c9c4bc'),
-    floorOut: new THREE.Color(o.dark ? '#2e3338' : '#9aa1a8'),
-    zebraDark: new THREE.Color(o.dark ? '#22262a' : '#50565c'),
-    zebraWhite: new THREE.Color('#f4f4f0'),
-    step: new THREE.Color(o.dark ? '#6e6a64' : '#b9ad9c'),
-    nosing: new THREE.Color('#f2b200'),
-    escBed: new THREE.Color('#3b4046'),
-    escRail: new THREE.Color('#1c1f22'),
-    gateBody: new THREE.Color(o.dark ? '#8d99a5' : '#dfe4e8'),
-    gateTop: new THREE.Color('#2c7be5'),
-    tactile: new THREE.Color('#f2c200'),
-    light: new THREE.Color('#fff4d6'),
-    wall: new THREE.Color(o.dark ? '#5d6b78' : '#e4e8ec'),
-    shaft: new THREE.Color('#5fcf86'),
+    wallStation: col('#ffffff', dim),
+    wallMall: col('#f3e6d2', dim),
+    wallPaid: col('#e9eef3', dim),
+    zebraDark: col('#4c4f53', dim),
+    zebraWhite: col('#f2f2ee', dim),
+    platEdge: col('#f4f4f0', dim),
+    pillar: col('#e7e3db', dim),
+    pillarBase: col('#4f5459', dim),
+    gateBody: col('#dfe3e7', dim),
+    gateTop: col('#3a4047', dim),
+    gateFlap: col('#e4632e', dim),
+    rail: col('#1c1f22'),
+    railLight: col('#9aa1a8', dim),
+    escTruss: col('#7c8288', dim),
+    escDeck: col('#c3c8cd', dim),
+    steel: col('#b9bfc5', dim),
+    frame: col('#40464d', dim),
+    icBlue: col('#2f8dff'),
+    lampGreen: col('#2bd46b'),
+    lampRed: col('#ff3b30'),
+    callPanel: col('#8fd6ff'),
+    signRod: col('#2a2d31', dim),
   };
+  const adGlow = ['#fff4dc', '#e4f3ff', '#ffe6ea', '#e9ffe6'].map((h) => col(h, o.dark ? 0.9 : 1));
 
-  const floors = new Soup();
-  const walls = new Soup();
-  const lights = new Soup();
-  const zebra = new Soup();
+  // One tile grid for all floors, aligned with the dominant street direction, so overlapping
+  // floor pieces sample identical texels (no visible z-fighting) and joints run along corridors.
+  const alpha = dominantAngle(
+    g.edges
+      .filter((e) => e.kind === 'walk')
+      .map((e) => {
+        const a = nodeOf(e.a);
+        const b = nodeOf(e.b);
+        return { dx: b.x - a.x, dz: b.z - a.z };
+      }),
+  );
+  const ca = Math.cos(alpha);
+  const sa = Math.sin(alpha);
+  const gu = (p: THREE.Vector3, s: number) => (p.x * ca + p.z * sa) / s;
+  const gv = (p: THREE.Vector3, s: number) => (-p.x * sa + p.z * ca) / s;
+  const gridUV = (a: THREE.Vector3, b: THREE.Vector3, cc: THREE.Vector3, d: THREE.Vector3, s: number): UV4 => [
+    gu(a, s), gv(a, s), gu(b, s), gv(b, s), gu(cc, s), gv(cc, s), gu(d, s), gv(d, s),
+  ];
+
+  const geo = {
+    tile: new Geo(),
+    stone: new Geo(),
+    paver: new Geo(),
+    asphalt: new Geo(),
+    marks: new Geo(),
+    tactile: new Geo(),
+    wall: new Geo(),
+    ceil: new Geo(),
+    light: new Geo(),
+    shop: new Geo(),
+    sign: new Geo(),
+    stair: new Geo(),
+    esc: new Geo(),
+    glass: new Geo(),
+  };
+  const floorScale = { tile: TX.TILE_M, stone: TX.STONE_M, paver: TX.PAVER_M, asphalt: TX.ASPHALT_M };
+  type FloorKind = keyof typeof floorScale;
   const boxes = new Boxes();
-  const shafts = new Boxes();
+  const glow = new Boxes();
+  const cabins = new Boxes();
+  const cabinData: number[] = [];
+  const signs: SignSpec[] = [];
+  const faces: TX.SignEntry[][] = [];
 
-  const visible = (e: NetEdge) => o.levelVisible(nodeOf(e.a).level) || o.levelVisible(nodeOf(e.b).level);
-  const widthOf = (e: NetEdge) => Math.min(16, Math.max(3, e.width ?? (e.kind === 'crossing' ? 8 : 6)));
+  const floorQuad = (kind: FloorKind, a: THREE.Vector3, b: THREE.Vector3, cc: THREE.Vector3, d: THREE.Vector3) =>
+    geo[kind].quad(a, b, cc, d, gridUV(a, b, cc, d, floorScale[kind]), UP);
 
-  // Parallel vertical edges (stairs + escalator + elevator between the same landings) are
-  // spread sideways so they do not overlap.
-  const lane = new Map<string, number>();
-  const laneOf = (e: NetEdge) => {
+  // ------------------------------------------------------------------ vertical bundles (laid out first: their wells open the floors above)
+  const laneWidth = (e: NetEdge) => (e.kind === 'stairs' ? Math.min(8, Math.max(2.4, e.width ?? 3.2)) : e.kind === 'escalator' ? 1.7 : 2.6);
+  const byPair = new Map<string, NetEdge[]>();
+  for (const e of g.edges) {
+    if (!isVertical(e) || !visible(e)) continue;
     const key = e.a < e.b ? `${e.a}|${e.b}` : `${e.b}|${e.a}`;
-    const n = lane.get(key) ?? 0;
-    lane.set(key, n + 1);
-    return n;
+    const list = byPair.get(key) ?? [];
+    list.push(e);
+    byPair.set(key, list);
+  }
+  const bundles = [...byPair.values()].map((es) => {
+    const center = Math.max(0, es.findIndex((e) => route.has(e.id)));
+    const offs = laneOffsets(es.map(laneWidth), center);
+    const na = nodeOf(es[0].a);
+    const nb = nodeOf(es[0].b);
+    const [lo, hi] = na.y <= nb.y ? [P(na), P(nb)] : [P(nb), P(na)];
+    const { dir, left, run } = frame(lo, hi);
+    const rise = hi.y - lo.y;
+    const line = (s: number, lat: number, h = 0) =>
+      V(lo.x + dir.x * s + left.x * lat, lo.y + rise * (run > 1e-3 ? s / run : 0) + h, lo.z + dir.z * s + left.z * lat);
+    const lanes = es.map((e, k) => ({ e, k })).filter(({ e }) => e.kind !== 'elevator');
+    const lmin = lanes.length ? Math.min(...lanes.map(({ e, k }) => offs[k] - laneWidth(e) / 2)) - 0.15 : 0;
+    const lmax = lanes.length ? Math.max(...lanes.map(({ e, k }) => offs[k] + laneWidth(e) / 2)) + 0.15 : 0;
+    return { es, offs, na, nb, lo, hi, dir, left, run, rise, line, lmin, lmax, hasLanes: lanes.length > 0, indoor: es.every((e) => e.indoor) };
+  });
+
+  /** Openings in the upper floor over each flight (and around elevator shafts). */
+  const wells: { poly: P2[]; y: number; box: [number, number, number, number] }[] = [];
+  const addWell = (pts: THREE.Vector3[], y: number) => {
+    const poly = pts.map((p) => [p.x, p.z] as P2);
+    const xs = poly.map((p) => p[0]);
+    const zs = poly.map((p) => p[1]);
+    wells.push({ poly, y, box: [Math.min(...xs), Math.max(...xs), Math.min(...zs), Math.max(...zs)] });
+  };
+  for (const b of bundles) {
+    if (b.run < 0.5 || b.rise < 1) continue;
+    if (b.hasLanes) addWell([b.line(0, b.lmin), b.line(b.run, b.lmin), b.line(b.run, b.lmax), b.line(0, b.lmax)], b.hi.y);
+    b.es.forEach((e, k) => {
+      if (e.kind !== 'elevator') return;
+      const S = b.line(b.run / 2, b.offs[k]);
+      const d = b.dir.clone().multiplyScalar(1.25);
+      const l = b.left.clone().multiplyScalar(1.25);
+      addWell([S.clone().sub(d).sub(l), S.clone().add(d).sub(l), S.clone().add(d).add(l), S.clone().sub(d).add(l)], b.hi.y);
+    });
+  }
+
+  /** Solves value = a·x + b·z + c over a planar polygon from three of its corners. */
+  const affine = (pts: THREE.Vector3[], vals: number[]) => {
+    for (const [i, j, k] of [[0, 1, 2], [0, 2, 3], [0, 1, 3]]) {
+      if (k >= pts.length) continue;
+      const x1 = pts[j].x - pts[i].x;
+      const z1 = pts[j].z - pts[i].z;
+      const x2 = pts[k].x - pts[i].x;
+      const z2 = pts[k].z - pts[i].z;
+      const det = x1 * z2 - x2 * z1;
+      if (Math.abs(det) < 1e-9) continue;
+      const f1 = vals[j] - vals[i];
+      const f2 = vals[k] - vals[i];
+      const a = (f1 * z2 - f2 * z1) / det;
+      const bb = (x1 * f2 - x2 * f1) / det;
+      const x0 = pts[i].x;
+      const z0 = pts[i].z;
+      const v0 = vals[i];
+      return (x: number, z: number) => v0 + a * (x - x0) + bb * (z - z0);
+    }
+    const v0 = vals[0];
+    return () => v0;
   };
 
-  // Node joints: fill the gaps where corridors meet.
-  const jointWidth = new Map<string, number>();
+  /**
+   * Emits a convex, (nearly) horizontal surface piece facing up, with stair-well openings cut
+   * out of it. `shade` darkens corners (contact shadow); `uvOf` maps a point to texture UV.
+   */
+  const polyFloor = (target: Geo, pts: THREE.Vector3[], uvOf: (p: THREE.Vector3) => [number, number], shade: number[] | null = null, color: THREE.Color = WHITE) => {
+    let y0 = Infinity;
+    let y1 = -Infinity;
+    let bx0 = Infinity;
+    let bx1 = -Infinity;
+    let bz0 = Infinity;
+    let bz1 = -Infinity;
+    for (const p of pts) {
+      y0 = Math.min(y0, p.y);
+      y1 = Math.max(y1, p.y);
+      bx0 = Math.min(bx0, p.x);
+      bx1 = Math.max(bx1, p.x);
+      bz0 = Math.min(bz0, p.z);
+      bz1 = Math.max(bz1, p.z);
+    }
+    let pieces: P2[][] | null = null;
+    if (y1 - y0 < 0.9) {
+      for (const w of wells) {
+        if (Math.abs(w.y - y0) > 0.9 || w.box[1] < bx0 || w.box[0] > bx1 || w.box[3] < bz0 || w.box[2] > bz1) continue;
+        pieces = (pieces ?? [pts.map((p) => [p.x, p.z] as P2)]).flatMap((pc) => subtractConvex(pc, w.poly));
+      }
+    }
+    const tint = (k: number) => (k === 1 ? color : color.clone().multiplyScalar(k));
+    const fan = (vs: THREE.Vector3[], ks: number[]) => {
+      for (let i = 1; i + 1 < vs.length; i++) {
+        const a = uvOf(vs[0]);
+        const b = uvOf(vs[i]);
+        const cc = uvOf(vs[i + 1]);
+        target.tri(vs[0], vs[i], vs[i + 1], [a[0], a[1], b[0], b[1], cc[0], cc[1]], UP, [tint(ks[0]), tint(ks[i]), tint(ks[i + 1])]);
+      }
+    };
+    const ks = shade ?? pts.map(() => 1);
+    if (!pieces) {
+      fan(pts, ks);
+      return;
+    }
+    const fy = affine(pts, pts.map((p) => p.y));
+    const fk = affine(pts, ks);
+    for (const pc of pieces) {
+      const vs = pc.map(([x, z]) => V(x, fy(x, z), z));
+      fan(vs, vs.map((v) => fk(v.x, v.z)));
+    }
+  };
+  const gridOf = (kind: FloorKind) => (p: THREE.Vector3): [number, number] => [gu(p, floorScale[kind]), gv(p, floorScale[kind])];
+  const floorPoly = (kind: FloorKind, pts: THREE.Vector3[], shade: number[] | null = null) => polyFloor(geo[kind], pts, gridOf(kind), shade);
 
-  for (const e of g.edges) {
-    if (!visible(e)) continue;
+  // ------------------------------------------------------------------ junction arms
+  const platformOf = new Map(g.net.platforms.map((p) => [p.id, p]));
+  /** Walkways running along a platform stay open to the tracks (no walls or ceiling). */
+  const alongPlatform = (e: NetEdge) => {
+    const a = nodeOf(e.a);
+    const b = nodeOf(e.b);
+    if (e.kind === 'platform') return true;
+    if (a.platformId && a.platformId === b.platformId) return true;
+    const ex_ = b.x - a.x;
+    const ez = b.z - a.z;
+    const len = Math.hypot(ex_, ez) || 1;
+    for (const n of [a, b]) {
+      const p = n.platformId ? platformOf.get(n.platformId) : undefined;
+      if (!p) continue;
+      const px = p.b[0] - p.a[0];
+      const pz = p.b[1] - p.a[1];
+      const pl = Math.hypot(px, pz) || 1;
+      if (Math.abs((ex_ * px + ez * pz) / (len * pl)) > 0.8) return true;
+    }
+    return false;
+  };
+  const enclosedEdge = (e: NetEdge) => e.indoor && (e.kind === 'walk' || e.kind === 'gate') && !alongPlatform(e);
+
+  const arms = new Map<string, ArmRec[]>();
+  g.edges.forEach((e, idx) => {
+    // Platform edges only shape junction mouths (the platform itself is drawn by the view).
+    if (!(e.kind === 'walk' || e.kind === 'crossing' || e.kind === 'gate' || e.kind === 'platform') || !visible(e)) return;
+    const a = nodeOf(e.a);
+    const b = nodeOf(e.b);
+    const run = Math.hypot(b.x - a.x, b.z - a.z);
+    if (run < 0.5) return;
+    const w = widthOf(e);
+    const indoor = enclosedEdge(e);
+    const H = ceilingHeight(w);
+    const push = (from: NetNode, to: NetNode) => {
+      const list = arms.get(from.id) ?? [];
+      list.push({ e, idx, other: idxOf(to.id), angle: Math.atan2(to.z - from.z, to.x - from.x), width: w, run, indoor, trim: 0, H });
+      arms.set(from.id, list);
+    };
+    push(a, b);
+    push(b, a);
+  });
+  for (const list of arms.values()) {
+    list.sort((p, q) => p.angle - q.angle);
+    const t = mouthTrims(list, 24);
+    list.forEach((arm, k) => (arm.trim = Math.min(t[k], arm.run * 0.45)));
+  }
+  const trimAt = (nodeId: string, idx: number) => arms.get(nodeId)?.find((x) => x.idx === idx)?.trim ?? 0;
+  const onPlatform = (n: NetNode) => n.kind === 'platform' || !!n.platformId;
+  const hasVertical = new Set<string>();
+  for (const e of g.edges) if (isVertical(e) || e.kind === 'platform') hasVertical.add(e.a), hasVertical.add(e.b);
+
+  // ------------------------------------------------------------------ corridors
+  g.edges.forEach((e, ei) => {
+    if (!(e.kind === 'walk' || e.kind === 'crossing' || e.kind === 'gate') || !visible(e)) return;
     const na = nodeOf(e.a);
     const nb = nodeOf(e.b);
-    const a = P(na);
-    const b = P(nb);
-
-    if (e.kind === 'walk' || e.kind === 'crossing') {
-      const w = widthOf(e);
-      const { left, run } = frame(a, b);
-      if (run < 0.5) continue;
-      const h = left.clone().multiplyScalar(w / 2);
-      const lift = new THREE.Vector3(0, 0.08, 0);
-      const color = !e.indoor ? c.floorOut : na.paid && nb.paid ? c.floorPaid : c.floorFree;
-      if (e.kind === 'crossing') {
-        // Asphalt with zebra stripes across the direction of travel.
-        zebra.quad(a.clone().add(h).add(lift), b.clone().add(h).add(lift), b.clone().sub(h).add(lift), a.clone().sub(h).add(lift), c.zebraDark);
-        const stripes = Math.floor(run / 1.2);
-        for (let i = 1; i < stripes; i += 2) {
-          const t0 = i / stripes;
-          const t1 = (i + 0.6) / stripes;
-          const p0 = a.clone().lerp(b, t0).add(new THREE.Vector3(0, 0.12, 0));
-          const p1 = a.clone().lerp(b, t1).add(new THREE.Vector3(0, 0.12, 0));
-          const hs = left.clone().multiplyScalar(w * 0.42);
-          zebra.quad(p0.clone().add(hs), p1.clone().add(hs), p1.clone().sub(hs), p0.clone().sub(hs), c.zebraWhite);
-        }
-      } else {
-        floors.quad(a.clone().add(h).add(lift), b.clone().add(h).add(lift), b.clone().sub(h).add(lift), a.clone().sub(h).add(lift), color);
-        for (const id of [e.a, e.b]) jointWidth.set(id, Math.max(jointWidth.get(id) ?? 0, w));
+    const A = P(na);
+    const B = P(nb);
+    const { dir, left, run } = frame(A, B);
+    if (run < 0.5) return;
+    const w = widthOf(e);
+    const hw = w / 2;
+    const s0 = trimAt(na.id, ei);
+    const s1 = run - trimAt(nb.id, ei);
+    if (s1 - s0 < 0.2) return;
+    const lift = 0.08;
+    /** Point at distance s along the corridor, lateral offset `lat` (left +), height h above floor. */
+    const at = (s: number, lat: number, h = 0) =>
+      V(A.x + dir.x * s + left.x * lat, A.y + (B.y - A.y) * (s / run) + h, A.z + dir.z * s + left.z * lat);
+    const enclosed = enclosedEdge(e);
+    // Indoor floors darken towards the walls (baked contact shadow) in three strips.
+    const floor = (kind: FloorKind, f0: number, f1: number) => {
+      if (!enclosed) {
+        floorPoly(kind, [at(f0, hw, lift), at(f1, hw, lift), at(f1, -hw, lift), at(f0, -hw, lift)]);
+        return;
       }
-
-      // Corridor walls and ceiling light strips for covered walkways.
-      if (e.indoor && e.kind === 'walk' && run > 4) {
-        const wallH = 3.2 * ex;
-        const up = new THREE.Vector3(0, wallH, 0);
-        for (const side of [1, -1]) {
-          const off = left.clone().multiplyScalar((side * w) / 2);
-          const a0 = a.clone().add(off);
-          const b0 = b.clone().add(off);
-          walls.quad(a0, b0, b0.clone().add(up), a0.clone().add(up), c.wall);
-        }
-        if (Math.min(na.y, nb.y) < -0.5) {
-          const hl = left.clone().multiplyScalar(0.35);
-          const lh = new THREE.Vector3(0, wallH * 0.92, 0);
-          lights.quad(a.clone().add(hl).add(lh), b.clone().add(hl).add(lh), b.clone().sub(hl).add(lh), a.clone().sub(hl).add(lh), c.light);
-        }
+      const m = Math.min(0.9, hw * 0.3);
+      const ks = [hw, hw - m, -(hw - m), -hw];
+      for (let i = 0; i < 3; i++) {
+        const kl = i === 0 ? AO : 1;
+        const kr = i === 2 ? AO : 1;
+        floorPoly(kind, [at(f0, ks[i], lift), at(f1, ks[i], lift), at(f1, ks[i + 1], lift), at(f0, ks[i + 1], lift)], [kl, kl, kr, kr]);
       }
-      continue;
+    };
+
+    if (e.kind === 'crossing') {
+      floorPoly('asphalt', [at(s0, hw, 0.1), at(s1, hw, 0.1), at(s1, -hw, 0.1), at(s0, -hw, 0.1)]);
+      // Zebra bars: 45 cm wide every 90 cm, long axis across the walking direction.
+      for (let s = s0 + 0.6; s + 0.45 < s1 - 0.3; s += 0.9) {
+        const lat = hw * 0.9;
+        geo.marks.quad(at(s, lat, 0.13), at(s + 0.45, lat, 0.13), at(s + 0.45, -lat, 0.13), at(s, -lat, 0.13), uvRect(0, 0, 1, 1), UP, c.zebraWhite);
+      }
+      return;
     }
 
-    if (e.kind === 'stairs' || e.kind === 'escalator' || e.kind === 'elevator') {
-      const [lo, hi] = a.y <= b.y ? [a, b] : [b, a];
-      const { dir, left, run } = frame(lo, hi);
-      const k = laneOf(e);
-      const shift = left.clone().multiplyScalar((k === 0 ? -1 : k === 1 ? 1 : 3) * 2.2);
-      const l0 = lo.clone().add(shift);
-      const h0 = hi.clone().add(shift);
-      const rise = h0.y - l0.y;
-      const yaw = yawOf(dir);
-
-      if (e.kind === 'stairs') {
-        const realRise = Math.abs(nb.y - na.y);
-        const n = Math.min(40, Math.max(4, Math.round(realRise / 0.18)));
-        const depth = Math.max(0.35, run / n);
-        const w = 3.2;
-        for (let i = 0; i < n; i++) {
-          const f = (i + 0.5) / n;
-          tmpP.set(l0.x + (h0.x - l0.x) * f, l0.y + rise * f, l0.z + (h0.z - l0.z) * f);
-          boxes.add(tmpP.clone(), tmpS.set(w, rise / n, depth).clone(), yaw, i % 4 === 3 ? c.nosing : c.step);
-        }
-      } else if (e.kind === 'escalator') {
-        // Inclined bed with two balustrades.
-        const len = Math.hypot(run, rise);
-        const pitch = -Math.atan2(rise, Math.max(run, 0.01));
-        const mid = l0.clone().lerp(h0, 0.5);
-        boxes.add(mid.clone().add(new THREE.Vector3(0, 0.2, 0)), new THREE.Vector3(1.4, 0.3, len), yaw, c.escBed, pitch);
-        for (const side of [1, -1]) {
-          const off = left.clone().multiplyScalar(side * 0.85);
-          boxes.add(mid.clone().add(off).add(new THREE.Vector3(0, 0.9, 0)), new THREE.Vector3(0.12, 1.1, len), yaw, c.escRail, pitch);
-        }
-      } else {
-        // Glass shaft from the lower to the upper landing: faint panes plus solid corner posts.
-        const mid = l0.clone().lerp(h0, 0.5);
-        const height = rise + 3 * ex;
-        mid.y = (l0.y + h0.y) / 2 + 1.5 * ex;
-        shafts.add(mid, new THREE.Vector3(2.6, height, 2.6), yaw, c.shaft);
-        for (const [sx, sz] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
-          const post = mid.clone().add(left.clone().multiplyScalar(sx * 1.3)).add(dir.clone().multiplyScalar(sz * 1.3));
-          boxes.add(post, new THREE.Vector3(0.14, height, 0.14), yaw, c.shaft);
-        }
-      }
-      continue;
-    }
-
+    const paidA = !!na.paid;
+    const paidB = !!nb.paid;
+    let gateS = -1;
     if (e.kind === 'gate') {
-      // A row of gate machines across the direction of travel, at the paid-side gate node.
-      const gateNode = na.kind === 'gate' ? na : nb;
-      const other = gateNode === na ? nb : na;
-      const at = P(gateNode);
-      const { dir, left } = frame(at, P(other));
-      const count = Math.min(14, Math.max(4, Math.round((e.width ?? 8) / 1.4)));
-      const yaw = yawOf(dir);
-      for (let i = 0; i < count; i++) {
-        const off = left.clone().multiplyScalar((i - (count - 1) / 2) * 1.0);
-        const base = at.clone().add(off);
-        boxes.add(base.clone().add(new THREE.Vector3(0, 0.5 * ex, 0)), new THREE.Vector3(0.28, 1.0 * ex, 1.4), yaw, c.gateBody);
-        boxes.add(base.clone().add(new THREE.Vector3(0, 1.0 * ex + 0.06, 0)), new THREE.Vector3(0.3, 0.12, 1.4), yaw, c.gateTop);
+      // Gate line just inside the corridor on the paid side (builder: gate(paidSide, freeSide)).
+      gateS = Math.min(s0 + 1.8, (s0 + s1) / 2);
+      const paidFirst = paidA || !paidB;
+      floor(paidFirst ? 'tile' : 'stone', s0, gateS);
+      floor(paidFirst ? 'stone' : 'tile', gateS, s1);
+      addGateRow(e, at, gateS, w, dir);
+    } else {
+      floor(!e.indoor ? 'paver' : paidA && paidB ? 'tile' : 'stone', s0, s1);
+    }
+
+    if (enclosed) {
+      const H = ceilingHeight(w) * ex;
+      const mall = isMallEdge(e, na, nb);
+      const tint = mall ? c.wallMall : paidA && paidB ? c.wallPaid : c.wallStation;
+      const low = tint.clone().multiplyScalar(0.8);
+      for (const side of [1, -1]) {
+        const lat = side * hw;
+        const inward = left.clone().multiplyScalar(-side);
+        geo.wall.quad(at(s0, lat), at(s1, lat), at(s1, lat, H), at(s0, lat, H), uvRect(s0 / TX.WALL_M, 0, s1 / TX.WALL_M, 1), inward, [low, low, tint, tint]);
+        if (mall) addShops(e, at, s0, s1, side, hw, H, inward);
+        else if (e.kind === 'walk') addAds(e, at, s0, s1, side, hw, inward);
+      }
+      const q = [at(s0, hw, H), at(s1, hw, H), at(s1, -hw, H), at(s0, -hw, H)] as const;
+      geo.ceil.quad(q[0], q[1], q[2], q[3], gridUV(q[0], q[1], q[2], q[3], TX.CEIL_M), DOWN);
+      addLights(at, s0, s1, w, H);
+      if (e.name?.includes('動く歩道')) addMovingWalkway(at, s0, s1, w, dir);
+      else if (w >= 10 && e.kind === 'walk') addPillars(e, at, s0, s1, w, H);
+    } else if (!e.indoor && Math.min(na.y, nb.y) >= 2) {
+      // Elevated outdoor deck / pedestrian bridge: glass parapets with a steel top rail.
+      for (const side of [1, -1]) {
+        const lat = side * (hw - 0.05);
+        const h = 1.1 * ex;
+        geo.glass.quad(at(s0, lat, lift), at(s1, lat, lift), at(s1, lat, h), at(s0, lat, h), uvRect(0, 0, 1, 1), left.clone().multiplyScalar(-side));
+        boxes.beam(at(s0, lat, h), at(s1, lat, h), 0.12, 0.1, c.railLight);
+      }
+    }
+  });
+
+  function addGateRow(e: NetEdge, at: (s: number, lat: number, h?: number) => THREE.Vector3, s: number, w: number, dir: THREE.Vector3): void {
+    const yaw = yawOf(dir);
+    let n = Math.round((w * 0.75) / 0.9);
+    n += n % 2; // even count: an aisle, not a machine, sits on the centreline the walker follows
+    n = Math.min(24, Math.max(4, n));
+    const pitch = 0.9;
+    const bodyH = 0.95 * ex;
+    for (let i = 0; i < n; i++) {
+      const lat = (i - (n - 1) / 2) * pitch;
+      boxes.add(at(s, lat, bodyH / 2), _s.set(0.22, bodyH, 1.5), yaw, c.gateBody);
+      boxes.add(at(s, lat, bodyH + 0.03), _s.set(0.27, 0.06, 1.54), yaw, c.gateTop);
+      for (const end of [-1, 1]) {
+        // IC card reader (blue) on the top plate at both ends, and a direction lamp on the end face.
+        glow.add(at(s + end * 0.52, lat, bodyH + 0.07), _s.set(0.2, 0.03, 0.26), yaw, c.icBlue);
+        glow.add(at(s + end * 0.77, lat, bodyH * 0.86), _s.set(0.07, 0.05, 0.02), yaw, (i + (end > 0 ? 1 : 0)) % 2 ? c.lampGreen : c.lampRed);
+      }
+      // Closed flaps in a few aisles (never in the central one).
+      if (i < n - 1 && i !== n / 2 - 1 && hash01(e.id, i) < 0.3) {
+        const mid = lat + pitch / 2;
+        for (const side of [-1, 1]) boxes.add(at(s, mid + side * 0.22, bodyH * 0.6), _s.set(0.24, bodyH * 0.35, 0.05), yaw, c.gateFlap);
+      }
+    }
+    // Glass fences from the row ends to the corridor walls.
+    const rowHalf = (n / 2) * pitch;
+    const h = 1.1 * ex;
+    for (const side of [-1, 1]) {
+      const l0 = side * (rowHalf - 0.3);
+      const l1 = side * (w / 2 - 0.05);
+      if (Math.abs(l1) - Math.abs(l0) < 0.3) continue;
+      geo.glass.quad(at(s, l0, 0.05), at(s, l1, 0.05), at(s, l1, h), at(s, l0, h), uvRect(0, 0, 1, 1), dir);
+      boxes.beam(at(s, l0, h), at(s, l1, h), 0.08, 0.08, c.railLight);
+    }
+    // 「改札」 sign above the row, both faces.
+    const st = g.net.stations.find((x) => x.id === nodeOf(e.a).stationId || x.id === nodeOf(e.b).stationId);
+    const label = (e.name ?? '改札').replace(/^\S+\s+/, '');
+    const face: TX.SignEntry[] = [
+      { arrow: null, badge: st?.badge ?? '改札', badgeColor: st?.color ?? '#444', badgeInk: '#fff', text: label.includes('改札') ? label : `${label} 改札` },
+    ];
+    const H = ceilingHeight(w) * ex;
+    addSign(at(s, 0), dir, Math.min(4.2, w * 0.4), H, face, face);
+  }
+
+  function addShops(e: NetEdge, at: (s: number, lat: number, h?: number) => THREE.Vector3, s0: number, s1: number, side: number, hw: number, H: number, inward: THREE.Vector3): void {
+    const lat = side * (hw - 0.04);
+    const top = Math.min(2.8 * ex, H * 0.94);
+    let s = s0 + 0.6;
+    let k = 0;
+    while (s1 - 0.6 - s >= 3) {
+      const r = hash01(e.id, k * 2 + (side > 0 ? 0 : 1));
+      let L = 5 + r * 4;
+      if (s + L > s1 - 0.6) L = s1 - 0.6 - s;
+      if (L < 3) break;
+      const cell = Math.floor(hash01(e.id, 100 + k * 2 + (side > 0 ? 0 : 1)) * TX.SHOP_CELLS);
+      const [u0, v0, u1, v1] = TX.cellUV(cell, TX.SHOP_COLS, TX.SHOP_ROWS);
+      // Text reads left→right from inside: along +dir on the left wall, -dir on the right wall.
+      const uv: UV4 = side > 0 ? [u0, v0, u1, v0, u1, v1, u0, v1] : [u1, v0, u0, v0, u0, v1, u1, v1];
+      geo.shop.quad(at(s, lat), at(s + L, lat), at(s + L, lat, top), at(s, lat, top), uv, inward);
+      s += L + 0.45;
+      k++;
+    }
+  }
+
+  function addAds(e: NetEdge, at: (s: number, lat: number, h?: number) => THREE.Vector3, s0: number, s1: number, side: number, hw: number, inward: THREE.Vector3): void {
+    const lat = side * (hw - 0.05);
+    let k = 0;
+    for (let s = s0 + 4; s + 3 < s1 - 3; s += 16, k++) {
+      if (hash01(e.id, 300 + k * 2 + (side > 0 ? 0 : 1)) > 0.55) continue;
+      const cell = TX.AD_CELLS[Math.floor(hash01(e.id, 400 + k) * TX.AD_CELLS.length)];
+      const [u0, v0, u1, v1] = TX.cellUV(cell, TX.SHOP_COLS, TX.SHOP_ROWS);
+      const uv: UV4 = side > 0 ? [u0, v0, u1, v0, u1, v1, u0, v1] : [u1, v0, u0, v0, u0, v1, u1, v1];
+      geo.shop.quad(at(s, lat, 0.9 * ex), at(s + 2.8, lat, 0.9 * ex), at(s + 2.8, lat, 2.3 * ex), at(s, lat, 2.3 * ex), uv, inward);
+    }
+  }
+
+  function addLights(at: (s: number, lat: number, h?: number) => THREE.Vector3, s0: number, s1: number, w: number, H: number): void {
+    const h = H - 0.03;
+    if (w < 12) {
+      // Recessed line lights in segments along the corridor.
+      const lats = w >= 7 ? [-w / 4, w / 4] : [0];
+      for (const lat of lats) {
+        for (let s = s0 + 0.6; s + 2.4 <= s1 - 0.4; s += 3.4) {
+          geo.light.quad(at(s, lat - 0.13, h), at(s + 2.4, lat - 0.13, h), at(s + 2.4, lat + 0.13, h), at(s, lat + 0.13, h), uvRect(0, 0, 1, 1), DOWN);
+        }
+      }
+      return;
+    }
+    // Square panels on a 4.8 m grid in wide concourses.
+    const across = Math.max(1, Math.floor((w - 3) / 4.8));
+    for (let s = s0 + 2.4; s + 0.6 <= s1 - 0.6; s += 4.8) {
+      for (let i = 0; i < across; i++) {
+        const lat = (i - (across - 1) / 2) * 4.8;
+        geo.light.quad(at(s - 0.6, lat - 0.6, h), at(s + 0.6, lat - 0.6, h), at(s + 0.6, lat + 0.6, h), at(s - 0.6, lat + 0.6, h), uvRect(0, 0, 1, 1), DOWN);
       }
     }
   }
 
-  for (const [id, w] of jointWidth) {
+  /** Travelators either side of the centre (the Hankyu one, Japan's first, runs both ways). */
+  function addMovingWalkway(at: (s: number, lat: number, h?: number) => THREE.Vector3, s0: number, s1: number, w: number, dir: THREE.Vector3): void {
+    const a = s0 + 3;
+    const b = s1 - 3;
+    if (b - a < 10) return;
+    const yaw = yawOf(dir);
+    const h = 0.95 * ex;
+    for (const side of [1, -1]) {
+      const lat = side * w * 0.27;
+      const tw = 0.55;
+      const q = [at(a, lat + tw, 0.14), at(b, lat + tw, 0.14), at(b, lat - tw, 0.14), at(a, lat - tw, 0.14)] as const;
+      const vLen = (b - a) / TX.ESC_STEP;
+      // Opposite directions on the two sides (treads move towards decreasing V).
+      const uv: UV4 = side > 0 ? [1, vLen, 1, 0, 0, 0, 0, vLen] : [1, 0, 1, vLen, 0, vLen, 0, 0];
+      geo.esc.quad(q[0], q[1], q[2], q[3], uv, UP);
+      for (const edge of [-1, 1]) {
+        const l = lat + edge * 0.68;
+        boxes.beam(at(a, l, 0.12), at(b, l, 0.12), 0.3, 0.24, c.escDeck);
+        geo.glass.quad(at(a, l, 0.24), at(b, l, 0.24), at(b, l, h), at(a, l, h), uvRect(0, 0, 1, 1), UP);
+        boxes.beam(at(a - 0.5, l, h + 0.05), at(b + 0.5, l, h + 0.05), 0.09, 0.1, c.rail);
+      }
+      for (const s of [a - 0.7, b + 0.7]) boxes.add(at(s, lat, 0.1), _s.set(1.5, 0.05, 1.4), yaw, c.escDeck);
+    }
+  }
+
+  function addPillars(e: NetEdge, at: (s: number, lat: number, h?: number) => THREE.Vector3, s0: number, s1: number, w: number, H: number): void {
+    if (s1 - s0 < 8) return;
+    const lats = [-w * 0.3, w * 0.3];
+    const yaw = yawOf(at(1, 0).sub(at(0, 0)));
+    let k = 0;
+    for (let s = s0 + 4; s <= s1 - 4; s += 9, k++) {
+      for (const lat of lats) {
+        boxes.add(at(s, lat, H / 2), _s.set(0.8, H, 0.8), yaw, c.pillar);
+        boxes.add(at(s, lat, 0.08 * ex), _s.set(0.86, 0.16 * ex, 0.86), yaw, c.pillarBase);
+        // Every other pillar carries an illuminated advert wrap.
+        if (hash01(e.id, 500 + k * 2 + (lat > 0 ? 1 : 0)) < 0.5) {
+          glow.add(at(s, lat, 1.55 * ex), _s.set(0.86, 1.3 * ex, 0.86), yaw, adGlow[Math.floor(hash01(e.id, 600 + k) * adGlow.length)]);
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ junction rooms
+  const stationById = new Map(g.net.stations.map((s) => [s.id, s]));
+  const toEntry = (t: SignTarget, arrow: TX.SignEntry['arrow']): TX.SignEntry =>
+    t.kind === 'station'
+      ? { arrow, badge: stationById.get(t.id)?.badge ?? '', badgeColor: stationById.get(t.id)?.color ?? '#555', badgeInk: '#ffffff', text: t.text }
+      : { arrow, badge: '出口', badgeColor: '#f5c400', badgeInk: '#141414', text: t.text };
+
+  const signCandidates: { prio: number; make: () => void }[] = [];
+
+  for (const [id, list] of arms) {
     const n = nodeOf(id);
     if (!o.levelVisible(n.level)) continue;
-    floors.disc(P(n).add(new THREE.Vector3(0, 0.07, 0)), w / 2, n.paid ? c.floorPaid : c.floorFree);
+    const C = P(n);
+    const lift = 0.08;
+    const solid = list.filter((a) => a.e.kind !== 'platform');
+    if (solid.length === 0) continue;
+    // Roofed when every corridor meeting here is enclosed (platform mouths stay open).
+    const roofed = solid.every((a) => a.indoor);
+    const Hn = Math.max(...solid.map((a) => a.H)) * ex;
+    const dirOf = (a: ArmRec) => V(Math.cos(a.angle), 0, Math.sin(a.angle));
+    const perpOf = (a: ArmRec) => V(-Math.sin(a.angle), 0, Math.cos(a.angle));
+
+    if (list.length === 1) {
+      // Dead end of an indoor corridor with nothing beyond it: close it (with doors at entrances).
+      const a = list[0];
+      if (!a.indoor || hasVertical.has(id) || onPlatform(n)) continue;
+      const d = dirOf(a);
+      const p = perpOf(a).multiplyScalar(a.width / 2);
+      const H = a.H * ex;
+      const lo = C.clone().sub(p);
+      const hi = C.clone().add(p);
+      geo.wall.quad(lo, hi, hi.clone().setY(C.y + H), lo.clone().setY(C.y + H), uvRect(0, 0, a.width / TX.WALL_M, 1), d, c.wallStation);
+      if (n.kind === 'entrance') {
+        const dw = Math.min(a.width * 0.8, 7);
+        const q = perpOf(a).multiplyScalar(dw / 2);
+        const off = d.clone().multiplyScalar(0.05);
+        const top = Math.min(3 * ex, H * 0.95);
+        const [u0, v0, u1, v1] = TX.cellUV(TX.DOOR_CELL, TX.SHOP_COLS, TX.SHOP_ROWS);
+        // Seen from inside (facing -d) the reader's right is +perp.
+        geo.shop.quad(C.clone().sub(q).add(off), C.clone().add(q).add(off), C.clone().add(q).add(off).setY(C.y + top), C.clone().sub(q).add(off).setY(C.y + top), [u0, v0, u1, v0, u1, v1, u0, v1], d);
+      }
+      continue;
+    }
+
+    // Mouth corners, counter-clockwise by arm angle.
+    const poly: THREE.Vector3[] = [];
+    const mouths = list.map((a) => {
+      const m = C.clone().add(dirOf(a).multiplyScalar(a.trim));
+      const p = perpOf(a).multiplyScalar(a.width / 2);
+      const lo = m.clone().sub(p);
+      const hi = m.clone().add(p);
+      poly.push(lo, hi);
+      return { lo, hi };
+    });
+    const kind: FloorKind = n.paid ? 'tile' : list.some((a) => a.indoor) ? 'stone' : 'paver';
+    const liftV = V(0, lift, 0);
+    // Corners on enclosed corridors' walls get the same contact shadow as the corridor floors.
+    const shade = list.flatMap((a) => (a.indoor ? [AO, AO] : [1, 1]));
+    for (let i = 0; i < poly.length; i++) {
+      const j = (i + 1) % poly.length;
+      floorPoly(kind, [C.clone().add(liftV), poly[i].clone().add(liftV), poly[j].clone().add(liftV)], [1, shade[i], shade[j]]);
+    }
+    if (!roofed) continue;
+
+    const hv = V(0, Hn, 0);
+    for (let i = 0; i < poly.length; i++) {
+      const p0 = poly[i].clone().add(hv);
+      const p1 = poly[(i + 1) % poly.length].clone().add(hv);
+      const cc = C.clone().add(hv);
+      geo.ceil.tri(cc, p0, p1, [gu(cc, TX.CEIL_M), gv(cc, TX.CEIL_M), gu(p0, TX.CEIL_M), gv(p0, TX.CEIL_M), gu(p1, TX.CEIL_M), gv(p1, TX.CEIL_M)], DOWN);
+    }
+    const lp = 0.8;
+    geo.light.quad(C.clone().add(V(-lp, Hn - 0.03, -lp)), C.clone().add(V(lp, Hn - 0.03, -lp)), C.clone().add(V(lp, Hn - 0.03, lp)), C.clone().add(V(-lp, Hn - 0.03, lp)), uvRect(0, 0, 1, 1), DOWN);
+    for (let k = 0; k < list.length; k++) {
+      const next = (k + 1) % list.length;
+      const p0 = mouths[k].hi;
+      const p1 = mouths[next].lo;
+      const len = p0.distanceTo(p1);
+      if (len > 0.05 && list[k].indoor && list[next].indoor) {
+        const mid = p0.clone().add(p1).multiplyScalar(0.5);
+        const inward = C.clone().sub(mid).setY(0);
+        if (inward.lengthSq() < 1e-6) inward.copy(dirOf(list[k]));
+        geo.wall.quad(p0, p1, p1.clone().add(hv), p0.clone().add(hv), uvRect(0, 0, len / TX.WALL_M, 1), inward, c.wallStation);
+      }
+      // Bulkhead above a lower corridor opening into a taller junction.
+      const a = list[k];
+      const Ha = a.H * ex;
+      if (a.indoor && Ha < Hn - 0.05) {
+        const { lo, hi } = mouths[k];
+        geo.wall.quad(lo.clone().setY(C.y + Ha), hi.clone().setY(C.y + Ha), hi.clone().setY(C.y + Hn), lo.clone().setY(C.y + Hn), uvRect(0, 0.9, a.width / TX.WALL_M, 1), dirOf(a).negate(), c.wallStation);
+      }
+    }
+
+    // Hanging wayfinding signs across each long corridor leaving a real junction.
+    if (list.length < 3) continue;
+    const ni = idxOf(id);
+    list.forEach((arm, k) => {
+      if (arm.e.kind !== 'walk' || arm.run < 12) return;
+      const onRoute = route.has(arm.e.id);
+      signCandidates.push({
+        prio: (onRoute ? 10 : 0) + (arm.e.busy ?? 1),
+        make: () => {
+          const d = dirOf(arm);
+          const sAt = Math.min(arm.trim + 3, arm.run * 0.4);
+          const pos = C.clone().add(d.clone().multiplyScalar(sAt));
+          // Face A looks back into the corridor: read by people walking towards the junction.
+          const heading = arm.angle + Math.PI;
+          const faceA: TX.SignEntry[] = [];
+          const used = new Set<string>();
+          const others = list.filter((_, j) => j !== k).map((x) => ({ x, t: destinationsVia(g, ni, x.other, x.run)[0] }));
+          others.sort((p, q) => (p.t?.dist ?? 1e9) - (q.t?.dist ?? 1e9));
+          for (const { x, t } of others) {
+            if (!t || used.has(t.text) || faceA.length >= 2) continue;
+            used.add(t.text);
+            faceA.push(toEntry(t, arrowFor(heading, x.angle)));
+          }
+          // Face B looks at the junction: what lies ahead down this corridor.
+          const faceB = destinationsVia(g, ni, arm.other, arm.run)
+            .slice(0, 2)
+            .map((t) => toEntry(t, 0));
+          if (faceA.length === 0 && faceB.length === 0) return;
+          const filler = (): TX.SignEntry[] => [{ arrow: null, badge: n.level, badgeColor: '#5b636c', badgeInk: '#fff', text: arm.e.name ?? n.name }];
+          addSign(pos, d, Math.min(3.6, arm.width * 0.55), arm.H * ex, faceA.length ? faceA : filler(), faceB.length ? faceB : filler());
+        },
+      });
+    });
+  }
+  signCandidates.sort((p, q) => q.prio - p.prio);
+  for (const s of signCandidates.slice(0, 44)) s.make();
+
+  function addSign(at: THREE.Vector3, normal: THREE.Vector3, width: number, ceilH: number | null, a: TX.SignEntry[], b: TX.SignEntry[]): void {
+    faces.push(a, b);
+    const bottom = Math.min(2.4 * ex, (ceilH ?? 99) - 0.55 * ex);
+    signs.push({ at, normal: normal.clone().setY(0).normalize(), width, bottom, ceil: ceilH, faceA: faces.length - 2, faceB: faces.length - 1 });
   }
 
-  // Tactile paving along both edges of every platform.
+  // ------------------------------------------------------------------ platforms
   for (const p of g.net.platforms) {
     if (!o.levelVisible(p.level)) continue;
-    addTactile(floors, p, Y, c.tactile);
+    addPlatform(p);
   }
 
-  const floorMesh = floors.mesh(new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
-  const zebraMesh = zebra.mesh(new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
-  const wallMesh = walls.mesh(
-    new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: o.dark ? 0.22 : 0.3, depthWrite: false }),
-  );
-  const lightMesh = lights.mesh(new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
-  const boxMesh = boxes.mesh(new THREE.MeshLambertMaterial());
-  const shaftMesh = shafts.mesh(new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.1, depthWrite: false }));
-  for (const m of [floorMesh, zebraMesh, wallMesh, lightMesh, boxMesh, shaftMesh]) if (m) group.add(m);
-  if (wallMesh) wallMesh.renderOrder = 3;
-  if (shaftMesh) shaftMesh.renderOrder = 3;
+  /**
+   * Platform slab: tiled top with the stair wells cut out, white edge lines and yellow tactile
+   * strips, concrete faces towards the tracks (the view's coloured platform boxes are for the
+   * overview).
+   */
+  function addPlatform(p: Platform): void {
+    const A = V(p.a[0], Y(p.y), p.a[1]);
+    const B = V(p.b[0], Y(p.y), p.b[1]);
+    const { dir, left, run } = frame(A, B);
+    const at = (s: number, lat: number, h: number) => V(A.x + dir.x * s + left.x * lat, A.y + h, A.z + dir.z * s + left.z * lat);
+    const hw = p.width / 2;
+    floorPoly('tile', [at(0, hw, 0.02), at(run, hw, 0.02), at(run, -hw, 0.02), at(0, -hw, 0.02)]);
+    const k = TX.TACTILE_M;
+    const local = (q: THREE.Vector3): [number, number] => [((q.x - A.x) * dir.x + (q.z - A.z) * dir.z) / k, ((q.x - A.x) * left.x + (q.z - A.z) * left.z) / k];
+    const flat = (): [number, number] => [0, 0];
+    const depth = 1.1 * ex;
+    for (const side of [1, -1]) {
+      const e0 = side * (hw - 0.05);
+      const e1 = side * (hw - 0.17);
+      polyFloor(geo.marks, [at(0, e0, 0.04), at(run, e0, 0.04), at(run, e1, 0.04), at(0, e1, 0.04)], flat, null, c.platEdge);
+      const t0 = side * (hw - 0.8);
+      const t1 = side * (hw - 1.2);
+      polyFloor(geo.tactile, [at(0, t0, 0.05), at(run, t0, 0.05), at(run, t1, 0.05), at(0, t1, 0.05)], local);
+      geo.stair.quad(at(0, side * hw, -depth), at(run, side * hw, -depth), at(run, side * hw, 0.02), at(0, side * hw, 0.02), [0, 0, run / 4, 0, run / 4, 0.25, 0, 0.25], left.clone().multiplyScalar(side));
+    }
+    for (const [s, want] of [[0, dir.clone().negate()], [run, dir]] as const) {
+      geo.stair.quad(at(s, -hw, -depth), at(s, hw, -depth), at(s, hw, 0.02), at(s, -hw, 0.02), [0, 0, 1, 0, 1, 0.25, 0, 0.25], want);
+    }
+  }
+
+  // ------------------------------------------------------------------ stairs, escalators, elevators
+  for (const b of bundles) {
+    const { es, offs, na, nb, lo, dir, left, run, rise, line, lmin, lmax, indoor } = b;
+    const realRise = Math.abs(nb.y - na.y);
+    es.forEach((e, k) => {
+      const off = offs[k];
+      if (e.kind === 'stairs') addStairs(line, off, laneWidth(e), run, rise, realRise, dir, left, indoor);
+      else if (e.kind === 'escalator') addEscalator(e, line, off, run, rise, dir, na, nb);
+      else addElevator(e, line, off, run, b.lo, b.hi, dir, left);
+    });
+
+    // The upper landing is under a roof (a corridor or concourse) or open (a platform / deck).
+    const hiNode = na.y <= nb.y ? nb : na;
+    const upperRoofed = !onPlatform(hiNode) && (arms.get(hiNode.id) ?? []).every((a) => a.indoor || a.e.kind === 'platform');
+    const rh = 1.1 * ex;
+
+    // Balustrade around the opening in the upper floor (open at the top of the flight): glass
+    // in concourses, solid panels on platforms.
+    if (b.hasLanes && run >= 0.5 && rise >= 1) {
+      const edge = (s: number, lat: number) => line(s, lat).setY(b.hi.y);
+      const sides: [THREE.Vector3, THREE.Vector3, THREE.Vector3][] = [
+        [edge(0, lmin - 0.08), edge(run, lmin - 0.08), left.clone().negate()],
+        [edge(0, lmax + 0.08), edge(run, lmax + 0.08), left],
+        [edge(0, lmin - 0.08), edge(0, lmax + 0.08), dir.clone().negate()],
+      ];
+      for (const [p0, p1, out] of sides) {
+        const t0 = p0.clone().setY(p0.y + rh);
+        const t1 = p1.clone().setY(p1.y + rh);
+        if (upperRoofed || !indoor) geo.glass.quad(p0, p1, t1, t0, uvRect(0, 0, 1, 1), UP);
+        else geo.wall.quad(p0, p1, t1, t0, uvRect(0, 0, p0.distanceTo(p1) / TX.WALL_M, 0.3), out, c.wallStation);
+        boxes.beam(t0, t1, 0.08, 0.08, c.railLight);
+      }
+    }
+
+    // One enclosure around the stairs and escalators of the bundle: a double-height well with a
+    // flat ceiling at the upper level's ceiling height (parapet height under an open platform)
+    // and a bulkhead over the lower opening. A ceiling parallel to the flight would hang right in
+    // front of the eye: with the vertical exaggeration the flights are much steeper than real.
+    if (!indoor || run < 1 || !b.hasLanes) continue;
+    const H = 3.0 * ex;
+    const top = rise + (upperRoofed ? H : rh); // above lo
+    const below = -1.4 * ex;
+    const flat = (s: number, lat: number, h: number) => line(s, lat).setY(lo.y + h);
+    const tint = c.wallStation;
+    const low = tint.clone().multiplyScalar(0.8);
+    // Side walls stop at the lower level's ceiling: around the foot of the flight the lower
+    // concourse stays open (people walk past it there).
+    const sx = Math.min(run, Math.max(0, ((H - below) / Math.max(rise, 1e-3)) * run));
+    for (const [lat, want] of [[lmin, left], [lmax, left.clone().negate()]] as const) {
+      if (sx > 0.05) {
+        const v0 = H / top;
+        geo.wall.quad(flat(0, lat, H), flat(sx, lat, H), flat(sx, lat, top), flat(0, lat, top), [0, v0, sx / TX.WALL_M, v0, sx / TX.WALL_M, 1, 0, 1], want, tint);
+      }
+      if (sx < run - 0.05) {
+        geo.wall.quad(line(sx, lat, below), line(run, lat, below), flat(run, lat, top), flat(sx, lat, top), uvRect(sx / TX.WALL_M, 0, run / TX.WALL_M, 1), want, [low, low, tint, tint]);
+      }
+    }
+    const bulkTop = upperRoofed ? top : rise;
+    if (bulkTop > H + 0.1) {
+      geo.wall.quad(flat(0, lmin, H), flat(0, lmax, H), flat(0, lmax, bulkTop), flat(0, lmin, bulkTop), uvRect(0, 0.85, (lmax - lmin) / TX.WALL_M, 1), dir, tint);
+    }
+    if (!upperRoofed) continue;
+    const q = [flat(0, lmin, top), flat(run, lmin, top), flat(run, lmax, top), flat(0, lmax, top)] as const;
+    geo.ceil.quad(q[0], q[1], q[2], q[3], gridUV(q[0], q[1], q[2], q[3], TX.CEIL_M), DOWN);
+    const mid = (lmin + lmax) / 2;
+    for (let s = 0.8; s + 2.4 <= run - 0.4; s += 3.4) {
+      geo.light.quad(flat(s, mid - 0.13, top - 0.03), flat(s + 2.4, mid - 0.13, top - 0.03), flat(s + 2.4, mid + 0.13, top - 0.03), flat(s, mid + 0.13, top - 0.03), uvRect(0, 0, 1, 1), DOWN);
+    }
+  }
+
+  function addStairs(
+    line: (s: number, lat: number, h?: number) => THREE.Vector3,
+    off: number,
+    sw: number,
+    run: number,
+    rise: number,
+    realRise: number,
+    dir: THREE.Vector3,
+    left: THREE.Vector3,
+    indoor: boolean,
+  ): void {
+    const n = Math.min(80, Math.max(3, Math.round(realRise / 0.17)));
+    const d = run / n;
+    const r = rise / n;
+    const hw = sw / 2;
+    const L0 = off - hw;
+    const L1 = off + hw;
+    const back = dir.clone().negate();
+    if (d > 1.1 || run < 0.5) {
+      // Too shallow for steps (or no run at all): a sloped passage in terrazzo.
+      const q = [line(0, L1, 0.06), line(run, L1, 0.06), line(run, L0, 0.06), line(0, L0, 0.06)] as const;
+      if (run >= 0.5) floorQuad('stone', q[0], q[1], q[2], q[3]);
+    } else {
+      const th = 0.25;
+      for (let i = 0; i < n; i++) {
+        const sA = i * d;
+        const sB = (i + 1) * d;
+        // The step top sits on the walking line at the step's middle.
+        const topAbs = line(0, 0).y + (i + 0.5) * r;
+        const bot = topAbs - Math.abs(r) - th;
+        const p = (s: number, lat: number, y: number) => {
+          const q = line(s, lat);
+          q.y = y;
+          return q;
+        };
+        // Tread (top half of the atlas, nosing at the front edge = V 1).
+        geo.stair.quad(p(sA, L0, topAbs), p(sB, L0, topAbs), p(sB, L1, topAbs), p(sA, L1, topAbs), [0, 1, 0, 0.5, 1, 0.5, 1, 1], UP);
+        // Riser facing the lower end.
+        geo.stair.quad(p(sA, L0, bot), p(sA, L1, bot), p(sA, L1, topAbs), p(sA, L0, topAbs), [0, 0.25, 1, 0.25, 1, 0.5, 0, 0.5], back);
+        // Stringer sides.
+        geo.stair.quad(p(sA, L0, bot), p(sB, L0, bot), p(sB, L0, topAbs), p(sA, L0, topAbs), [0, 0, 1, 0, 1, 0.25, 0, 0.25], left.clone().negate());
+        geo.stair.quad(p(sA, L1, bot), p(sB, L1, bot), p(sB, L1, topAbs), p(sA, L1, topAbs), [0, 0, 1, 0, 1, 0.25, 0, 0.25], left);
+      }
+      // Soffit under the flight.
+      const u = [line(0, L0, -Math.abs(r) - 0.25), line(run, L0, -Math.abs(r) - 0.25), line(run, L1, -Math.abs(r) - 0.25), line(0, L1, -Math.abs(r) - 0.25)] as const;
+      geo.stair.quad(u[0], u[1], u[2], u[3], [0, 0, 1, 0, 1, 0.25, 0, 0.25], DOWN);
+    }
+    // Handrails on both sides (on posts outdoors, where there are no walls to carry them).
+    const hr = 0.85 * ex;
+    for (const lat of [L0 + 0.12, L1 - 0.12]) {
+      boxes.beam(line(0, lat, hr), line(run, lat, hr), 0.06, 0.07, indoor ? c.steel : c.railLight);
+      if (!indoor) {
+        const posts = Math.max(2, Math.round(run / 2.5));
+        for (let i = 0; i <= posts; i++) {
+          const s = (i / posts) * run;
+          boxes.add(line(s, lat, hr / 2), _s.set(0.05, hr, 0.05), yawOf(dir), c.railLight);
+        }
+      }
+    }
+    if (!indoor) {
+      // Low glass parapets on outdoor flights (pedestrian-bridge stairs).
+      for (const lat of [L0 - 0.05, L1 + 0.05]) {
+        geo.glass.quad(line(0, lat, 0), line(run, lat, 0), line(run, lat, 1.05 * ex), line(0, lat, 1.05 * ex), uvRect(0, 0, 1, 1), left);
+      }
+    }
+  }
+
+  function addEscalator(
+    e: NetEdge,
+    line: (s: number, lat: number, h?: number) => THREE.Vector3,
+    off: number,
+    run: number,
+    rise: number,
+    dir: THREE.Vector3,
+    na: NetNode,
+    nb: NetNode,
+  ): void {
+    const len = Math.hypot(run, rise);
+    const pitch = -Math.atan2(rise, Math.max(run, 0.01));
+    const yaw = yawOf(dir);
+    const mid = line(run / 2, off);
+    // Truss below the steps, stainless decks and black handrails on glass balustrades.
+    boxes.add(mid.clone().add(V(0, -0.55, 0)), _s.set(1.6, 1.0, len), yaw, c.escTruss, pitch);
+    const tw = 0.5;
+    const t = [line(0, off - tw, 0.04), line(run, off - tw, 0.04), line(run, off + tw, 0.04), line(0, off + tw, 0.04)] as const;
+    // Treads scroll towards decreasing V (the texture offset grows), so V must grow against the
+    // direction of travel: 'up' travels lo→hi; 'down' hi→lo; 'both' follows the edge a→b.
+    const upward = e.dir === 'up' ? true : e.dir === 'down' ? false : nb.y > na.y;
+    const vLen = len / TX.ESC_STEP;
+    const uv: UV4 = upward ? [0, vLen, 0, 0, 1, 0, 1, vLen] : [0, 0, 0, vLen, 1, vLen, 1, 0];
+    geo.esc.quad(t[0], t[1], t[2], t[3], uv, UP);
+    const h = 0.95 * ex;
+    for (const side of [-1, 1]) {
+      const lat = off + side * 0.62;
+      boxes.beam(line(0, off + side * 0.72, 0.12), line(run, off + side * 0.72, 0.12), 0.26, 0.2, c.escDeck);
+      geo.glass.quad(line(0, lat, 0.2), line(run, lat, 0.2), line(run, lat, h), line(0, lat, h), uvRect(0, 0, 1, 1), UP);
+      boxes.beam(line(-0.6, lat, h + 0.05), line(run + 0.6, lat, h + 0.05), 0.09, 0.1, c.rail);
+    }
+    // Landing plates at both ends.
+    const endA = line(0, off).sub(dir.clone().multiplyScalar(0.7));
+    const endB = line(run, off).add(dir.clone().multiplyScalar(0.7));
+    boxes.add(endA.add(V(0, 0.04, 0)), _s.set(1.3, 0.05, 1.4), yaw, c.escDeck);
+    boxes.add(endB.add(V(0, 0.04, 0)), _s.set(1.3, 0.05, 1.4), yaw, c.escDeck);
+  }
+
+  function addElevator(
+    e: NetEdge,
+    line: (s: number, lat: number, h?: number) => THREE.Vector3,
+    off: number,
+    run: number,
+    lo: THREE.Vector3,
+    hi: THREE.Vector3,
+    dir: THREE.Vector3,
+    left: THREE.Vector3,
+  ): void {
+    const S = line(run / 2, off);
+    const y0 = lo.y;
+    const y1 = hi.y;
+    const top = y1 + 3.0 * ex;
+    const hs = 1.2;
+    const yaw = yawOf(dir);
+    const corner = (i: number, j: number, y: number) => S.clone().add(dir.clone().multiplyScalar(i * hs)).add(left.clone().multiplyScalar(j * hs)).setY(y);
+    const sides: [number, number, number, number][] = [
+      [1, 1, 1, -1],
+      [1, -1, -1, -1],
+      [-1, -1, -1, 1],
+      [-1, 1, 1, 1],
+    ];
+    for (const [i0, j0, i1, j1] of sides) {
+      geo.glass.quad(corner(i0, j0, y0 - 0.2), corner(i1, j1, y0 - 0.2), corner(i1, j1, top), corner(i0, j0, top), uvRect(0, 0, 1, 1), UP);
+      boxes.add(corner(i0, j0, (y0 + top) / 2), _s.set(0.14, top - y0 + 0.2, 0.14), yaw, c.frame);
+    }
+    boxes.add(S.clone().setY(top + 0.12), _s.set(2.6, 0.24, 2.6), yaw, c.frame);
+    // Doors at each landing, on the shaft face towards the landing node.
+    for (const [land, y] of [[lo, y0], [hi, y1]] as const) {
+      const f = land.clone().sub(S).setY(0);
+      if (f.lengthSq() < 0.25) f.copy(land === lo ? dir.clone().negate() : dir);
+      f.normalize();
+      const side = V(f.z, 0, -f.x);
+      const fyaw = yawOf(f);
+      const dc = S.clone().add(f.clone().multiplyScalar(hs + 0.02));
+      boxes.add(dc.clone().setY(y + 1.15 * ex), _s.set(1.5, 2.3 * ex, 0.12), fyaw, c.frame);
+      for (const sgn of [-1, 1]) {
+        boxes.add(dc.clone().add(f.clone().multiplyScalar(0.07)).add(side.clone().multiplyScalar(sgn * 0.31)).setY(y + 1.05 * ex), _s.set(0.6, 2.1 * ex, 0.04), fyaw, c.steel);
+      }
+      glow.add(dc.clone().add(f.clone().multiplyScalar(0.08)).add(side.clone().multiplyScalar(0.95)).setY(y + 1.0 * ex), _s.set(0.12, 0.25 * ex, 0.03), fyaw, c.callPanel);
+    }
+    // Moving cabin (animated in updateWalkway).
+    const ch = 2.4 * ex;
+    cabins.add(S.clone().setY(y0 + ch / 2), _s.set(2.1, ch, 2.1), yaw, c.steel);
+    cabinData.push(S.x, S.z, yaw, y0 + 0.02, y1 + 0.02, ch, hash01(e.id) * 40, 3 + Math.abs(y1 - y0) / ex * 0.5, 5);
+  }
+
+  // ------------------------------------------------------------------ materials and meshes
+  const cut = sharedCut;
+  const textures: THREE.Texture[] = [];
+  const keep = <T extends THREE.Texture | null>(t: T): T => {
+    if (t) textures.push(t);
+    return t;
+  };
+  const tex = {
+    tile: keep(TX.tileTexture()),
+    stone: keep(TX.stoneTexture()),
+    paver: keep(TX.paverTexture()),
+    asphalt: keep(TX.asphaltTexture()),
+    tactile: keep(TX.tactileTexture()),
+    wall: keep(TX.wallTexture()),
+    ceil: keep(TX.ceilingTexture()),
+    stair: keep(TX.stairTexture()),
+    esc: keep(TX.escalatorTexture()),
+    shop: keep(TX.shopAtlas()),
+  };
+  const lambert = (map: THREE.Texture | null, fallback: string, extra: THREE.MeshLambertMaterialParameters = {}) =>
+    withCut(new THREE.MeshLambertMaterial({ map, color: map ? new THREE.Color(dim, dim, dim) : col(fallback, dim), ...extra }), cut);
+
+  // Signs: build the atlas now that every face is known; one extra blank face for the edges.
+  faces.push([]);
+  const atlas = TX.signAtlas(faces);
+  if (atlas) keep(atlas.tex);
+  const rows = atlas?.rows ?? Math.ceil(faces.length / TX.SIGN_COLS);
+  const blank = TX.cellUV(faces.length - 1, TX.SIGN_COLS, rows, 0.01);
+  const blankUV: UV4 = [blank[0], blank[1], blank[0], blank[1], blank[0], blank[1], blank[0], blank[1]];
+  for (const s of signs) {
+    const nrm = s.normal;
+    const r = V(nrm.z, 0, -nrm.x); // reader's right when facing -normal
+    const hw = s.width / 2;
+    const hh = 0.42 * ex;
+    const dep = 0.07;
+    const base = s.at.clone().setY(s.at.y + s.bottom);
+    const pt = (lat: number, h: number, depth: number) => base.clone().add(r.clone().multiplyScalar(lat)).add(nrm.clone().multiplyScalar(depth)).setY(base.y + h);
+    const [a0, b0, a1, b1] = TX.cellUV(s.faceA, TX.SIGN_COLS, rows);
+    const [c0, d0, c1, d1] = TX.cellUV(s.faceB, TX.SIGN_COLS, rows);
+    geo.sign.quad(pt(-hw, 0, dep), pt(hw, 0, dep), pt(hw, hh, dep), pt(-hw, hh, dep), [a0, b0, a1, b0, a1, b1, a0, b1], nrm);
+    geo.sign.quad(pt(hw, 0, -dep), pt(-hw, 0, -dep), pt(-hw, hh, -dep), pt(hw, hh, -dep), [c0, d0, c1, d0, c1, d1, c0, d1], nrm.clone().negate());
+    geo.sign.quad(pt(-hw, hh, dep), pt(hw, hh, dep), pt(hw, hh, -dep), pt(-hw, hh, -dep), blankUV, UP);
+    geo.sign.quad(pt(-hw, 0, dep), pt(hw, 0, dep), pt(hw, 0, -dep), pt(-hw, 0, -dep), blankUV, DOWN);
+    geo.sign.quad(pt(-hw, 0, dep), pt(-hw, 0, -dep), pt(-hw, hh, -dep), pt(-hw, hh, dep), blankUV, r.clone().negate());
+    geo.sign.quad(pt(hw, 0, dep), pt(hw, 0, -dep), pt(hw, hh, -dep), pt(hw, hh, dep), blankUV, r);
+    if (s.ceil !== null && s.ceil > s.bottom + hh) {
+      for (const lat of [-hw * 0.7, hw * 0.7]) {
+        const y0 = base.y + hh;
+        const y1 = s.at.y + s.ceil;
+        boxes.add(pt(lat, hh + (y1 - y0) / 2, 0), _s.set(0.04, y1 - y0, 0.04), yawOf(nrm), c.signRod);
+      }
+    }
+  }
+
+  const meshes: (THREE.Mesh | null)[] = [
+    geo.tile.mesh(lambert(tex.tile, '#d8cfc2', { vertexColors: true }), 'floor-tile'),
+    geo.stone.mesh(lambert(tex.stone, '#cfc6b8', { vertexColors: true }), 'floor-stone'),
+    geo.paver.mesh(lambert(tex.paver, '#a39e96', { vertexColors: true }), 'floor-paver'),
+    geo.asphalt.mesh(lambert(tex.asphalt, '#4c4f53', { vertexColors: true }), 'floor-asphalt'),
+    geo.marks.mesh(withCut(new THREE.MeshLambertMaterial({ vertexColors: true }), cut), 'markings'),
+    geo.tactile.mesh(lambert(tex.tactile, '#e9b400'), 'tactile'),
+    geo.wall.mesh(lambert(tex.wall, '#e6e6e2', { vertexColors: true, emissive: new THREE.Color(0.1, 0.1, 0.1).multiplyScalar(dim) }), 'walls'),
+    geo.ceil.mesh(lambert(tex.ceil, '#ecebe6', { emissive: new THREE.Color(0.32, 0.32, 0.31).multiplyScalar(dim), emissiveMap: tex.ceil }), 'ceilings'),
+    geo.light.mesh(withCut(new THREE.MeshBasicMaterial({ color: '#fffaf0' }), cut), 'ceiling-lights'),
+    geo.shop.mesh(lambert(tex.shop, '#f3dcb4', { emissive: new THREE.Color(1, 1, 1), emissiveMap: tex.shop, emissiveIntensity: o.dark ? 0.62 : 0.5 }), 'shopfronts'),
+    geo.sign.mesh(withCut(new THREE.MeshBasicMaterial({ map: atlas?.tex ?? null, color: atlas ? '#ffffff' : '#1b1d20' }), cut), 'signs'),
+    geo.stair.mesh(lambert(tex.stair, '#b0aaa0'), 'stairs'),
+    geo.esc.mesh(lambert(tex.esc, '#4a4e53'), 'escalator-treads'),
+    geo.glass.mesh(
+      withCut(new THREE.MeshLambertMaterial({ color: '#c9e2ee', transparent: true, opacity: o.dark ? 0.2 : 0.24, depthWrite: false, side: THREE.DoubleSide }), cut),
+      'glass',
+    ),
+    boxes.mesh(withCut(new THREE.MeshLambertMaterial(), cut), 'fittings'),
+    glow.mesh(withCut(new THREE.MeshBasicMaterial(), cut), 'lamps'),
+  ];
+  const cabinMesh = cabins.mesh(withCut(new THREE.MeshLambertMaterial(), cut), 'elevator-cabins');
+  if (cabinMesh) {
+    cabinMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    cabinMesh.frustumCulled = false;
+    meshes.push(cabinMesh);
+  }
+  for (const m of meshes) {
+    if (!m) continue;
+    if (m.name === 'glass') m.renderOrder = 3;
+    group.add(m);
+  }
+
+  const state: WalkState = { time: 0, esc: tex.esc, cabins: cabinMesh, cabinData: new Float32Array(cabinData), cut, textures };
+  group.userData.walkway = state;
   return group;
 }
 
-function addTactile(soup: Soup, p: Platform, Y: (y: number) => number, color: THREE.Color): void {
-  const a = new THREE.Vector3(p.a[0], Y(p.y) + 0.03, p.a[1]);
-  const b = new THREE.Vector3(p.b[0], Y(p.y) + 0.03, p.b[1]);
-  const { left } = frame(a, b);
-  for (const side of [1, -1]) {
-    const edge = left.clone().multiplyScalar(side * (p.width / 2 - 1.0));
-    const inner = left.clone().multiplyScalar(side * (p.width / 2 - 1.4));
-    soup.quad(a.clone().add(edge), b.clone().add(edge), b.clone().add(inner), a.clone().add(inner), color);
+/**
+ * Per-frame animation: escalator treads, elevator cabins and the chase-camera cut-away (pass the
+ * camera position and a point on the walker; null disables it, e.g. in first person).
+ * Allocation-free.
+ */
+export function updateWalkway(group: THREE.Object3D, dt: number, cut: WalkCut | null = null): void {
+  const s = group.userData.walkway as WalkState | undefined;
+  if (!s) return;
+  s.time += dt;
+  // 0.5 m/s real tread speed.
+  if (s.esc) s.esc.offset.y = ((s.time * 0.5) / TX.ESC_STEP) % 1;
+  const m = s.cabins;
+  if (m) {
+    const d = s.cabinData;
+    for (let i = 0; i * CABIN_STRIDE < d.length; i++) {
+      const k = i * CABIN_STRIDE;
+      const f = cabinCycle(s.time + d[k + 6], d[k + 7], d[k + 8]);
+      _p.set(d[k], d[k + 3] + (d[k + 4] - d[k + 3]) * f + d[k + 5] / 2, d[k + 1]);
+      _q.setFromEuler(_e.set(0, d[k + 2], 0));
+      _m.compose(_p, _q, _s.set(2.1, d[k + 5], 2.1));
+      m.setMatrixAt(i, _m);
+    }
+    m.instanceMatrix.needsUpdate = true;
   }
+  if (cut) {
+    s.cut.uCutA.value.copy(cut.eye);
+    s.cut.uCutB.value.copy(cut.target);
+    s.cut.uCutR.value = CUT_RADIUS;
+  } else {
+    s.cut.uCutR.value = 0;
+  }
+}
+
+/** Frees every geometry, material and texture created by `buildWalkway`. */
+export function disposeWalkway(group: THREE.Object3D): void {
+  group.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    mesh.geometry.dispose();
+    const mat = mesh.material as THREE.Material | THREE.Material[];
+    if (Array.isArray(mat)) mat.forEach((x) => x.dispose());
+    else mat.dispose();
+    if ((mesh as THREE.InstancedMesh).isInstancedMesh) (mesh as THREE.InstancedMesh).dispose();
+  });
+  const s = group.userData.walkway as WalkState | undefined;
+  if (s) for (const t of s.textures) t.dispose();
+  delete group.userData.walkway;
+  sharedCut.uCutR.value = 0;
+}
+
+/** Draw calls and triangles of a walkway group (for budgets and tests). */
+export function walkwayStats(group: THREE.Object3D): { drawCalls: number; triangles: number } {
+  let drawCalls = 0;
+  let triangles = 0;
+  group.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    drawCalls++;
+    const g = mesh.geometry;
+    const tris = (g.index ? g.index.count : g.getAttribute('position').count) / 3;
+    triangles += tris * ((mesh as THREE.InstancedMesh).isInstancedMesh ? (mesh as THREE.InstancedMesh).count : 1);
+  });
+  return { drawCalls, triangles };
 }
 
 /**
@@ -316,8 +1355,8 @@ export function buildTrain(p: Platform, color: string, Y: (y: number) => number,
     body.add(center, new THREE.Vector3(2.9, bodyH, carLen), yaw, bodyColor);
     band.add(center.clone().add(new THREE.Vector3(0, bodyH * 0.15, 0)), new THREE.Vector3(2.96, bodyH * 0.28, carLen * 0.92), yaw, glass);
   }
-  const m1 = body.mesh(new THREE.MeshLambertMaterial());
-  const m2 = band.mesh(new THREE.MeshLambertMaterial());
+  const m1 = body.mesh(withWalkCut(new THREE.MeshLambertMaterial()), 'train-body');
+  const m2 = band.mesh(withWalkCut(new THREE.MeshLambertMaterial()), 'train-windows');
   if (m1) group.add(m1);
   if (m2) group.add(m2);
   return group;
@@ -328,17 +1367,19 @@ export function buildTrain(p: Platform, color: string, Y: (y: number) => number,
  * every few metres pointing the way (follows stairs and escalators; skips elevator shafts).
  */
 export function buildGuideLine(points: THREE.Vector3[], color: THREE.Color): THREE.Mesh | null {
-  const band = new Soup();
+  const band = new Geo();
   const white = new THREE.Color('#ffffff');
-  const lift = new THREE.Vector3(0, 0.18, 0);
+  const uv0: UV4 = [0, 0, 0, 0, 0, 0, 0, 0];
   let carry = 0;
   for (let i = 0; i < points.length - 1; i++) {
+    const { dir, left, run } = frame(points[i], points[i + 1]);
+    if (run < 0.3) continue; // vertical (elevator): nothing to paint
+    // On stairs the band floats over the step noses instead of cutting through the treads.
+    const lift = new THREE.Vector3(0, Math.abs(points[i + 1].y - points[i].y) / run > 0.08 ? 0.34 : 0.18, 0);
     const a = points[i].clone().add(lift);
     const b = points[i + 1].clone().add(lift);
-    const { dir, left, run } = frame(a, b);
-    if (run < 0.3) continue; // vertical (elevator): nothing to paint
     const h = left.clone().multiplyScalar(0.7);
-    band.quad(a.clone().add(h), b.clone().add(h), b.clone().sub(h), a.clone().sub(h), color);
+    band.quad(a.clone().add(h), b.clone().add(h), b.clone().sub(h), a.clone().sub(h), uv0, UP, color);
     // Chevrons every 7 m of horizontal distance.
     const seg = a.distanceTo(b);
     for (let d = 7 - carry; d < seg; d += 7) {
@@ -347,13 +1388,13 @@ export function buildGuideLine(points: THREE.Vector3[], color: THREE.Color): THR
       const l = p.clone().add(left.clone().multiplyScalar(0.55));
       const r = p.clone().sub(left.clone().multiplyScalar(0.55));
       const back = p.clone().sub(dir.clone().multiplyScalar(0.2));
-      band.quad(l, tip, back, l, white);
-      band.quad(r, back, tip, r, white);
+      band.tri(l, tip, back, [0, 0, 0, 0, 0, 0], UP, white);
+      band.tri(r, back, tip, [0, 0, 0, 0, 0, 0], UP, white);
       carry = seg - d;
     }
     carry = (carry + seg) % 7;
   }
-  return band.mesh(new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  return band.mesh(withWalkCut(new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })), 'guide-line');
 }
 
 /** Heading (yaw, radians; 0 = +z/south) from a to b, or null for (nearly) vertical moves. */
@@ -363,12 +1404,3 @@ export function headingBetween(a: { x: number; z: number }, b: { x: number; z: n
   if (Math.hypot(dx, dz) < 0.4) return null;
   return Math.atan2(dx, dz);
 }
-
-/** Shortest signed angle from a to b. */
-export function angleDelta(a: number, b: number): number {
-  let d = (b - a) % (Math.PI * 2);
-  if (d > Math.PI) d -= Math.PI * 2;
-  if (d < -Math.PI) d += Math.PI * 2;
-  return d;
-}
-

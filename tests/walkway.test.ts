@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
 import { buildGraph } from '../src/core/graph';
 import { umeda } from '../src/data/umeda';
-import { angleDelta, buildGuideLine, buildTrain, buildWalkway, headingBetween } from '../src/render/walkway';
+import { angleDelta, buildGuideLine, buildTrain, buildWalkway, disposeWalkway, headingBetween, updateWalkway, walkwayStats } from '../src/render/walkway';
 
 const g = buildGraph(umeda.network);
 
@@ -59,5 +59,94 @@ describe('walk-through geometry', () => {
     expect(headingBetween({ x: 0, z: 0 }, { x: 5, z: 0 })).toBeCloseTo(Math.PI / 2);
     expect(angleDelta(3, -3)).toBeCloseTo(2 * Math.PI - 6);
     expect(angleDelta(-3, 3)).toBeCloseTo(6 - 2 * Math.PI);
+  });
+});
+
+describe('walk-through interiors', () => {
+  const opts = { Y: (y: number) => y * 1.5, ex: 1.5, dark: false, levelVisible: () => true };
+
+  it('stays within the draw-call and triangle budget', () => {
+    const group = buildWalkway(g, opts);
+    const s = walkwayStats(group);
+    expect(s.drawCalls).toBeLessThanOrEqual(20);
+    expect(s.triangles).toBeLessThan(400_000);
+    disposeWalkway(group);
+  });
+
+  it('builds without a DOM (plain colours instead of canvas textures)', () => {
+    const group = buildWalkway(g, { ...opts, dark: true });
+    const names: string[] = [];
+    group.traverse((o) => names.push(o.name));
+    for (const n of ['floor-tile', 'floor-stone', 'walls', 'ceilings', 'shopfronts', 'signs', 'stairs', 'escalator-treads', 'fittings', 'lamps', 'elevator-cabins']) {
+      expect(names).toContain(n);
+    }
+    disposeWalkway(group);
+  });
+
+  it('faces walls into the corridors, ceilings down and floors up', () => {
+    const group = buildWalkway(g, opts);
+    const mesh = (name: string) => group.getObjectByName(name) as THREE.Mesh;
+    const ny = (name: string) => {
+      const n = mesh(name).geometry.getAttribute('normal');
+      let up = 0;
+      let down = 0;
+      for (let i = 0; i < n.count; i++) {
+        if (n.getY(i) > 0.5) up++;
+        if (n.getY(i) < -0.5) down++;
+      }
+      return { up, down, count: n.count };
+    };
+    const floor = ny('floor-stone');
+    expect(floor.up).toBe(floor.count);
+    const ceil = ny('ceilings');
+    expect(ceil.down).toBe(ceil.count);
+    // Walls are vertical.
+    const w = mesh('walls').geometry.getAttribute('normal');
+    for (let i = 0; i < w.count; i++) expect(Math.abs(w.getY(i))).toBeLessThan(1e-6);
+    disposeWalkway(group);
+  });
+
+  it('lays the route’s staircase on the node line the walker follows', () => {
+    const stairs = g.edges.find((e) => e.kind === 'stairs' && e.a === 'f_mido_s' && e.b === 'f_jrf_b1')!;
+    const esc = g.edges.find((e) => e.kind === 'escalator' && e.a === 'f_mido_s' && e.b === 'f_jrf_b1')!;
+    const mid = (id: string) => {
+      const group = buildWalkway(g, { ...opts, routeEdges: new Set([id]) });
+      const m = group.getObjectByName('stairs') as THREE.Mesh;
+      const pos = m.geometry.getAttribute('position');
+      const a = g.nodes[g.nodeIndex.get('f_mido_s')!];
+      const b = g.nodes[g.nodeIndex.get('f_jrf_b1')!];
+      // Distance of the stair vertices closest to the segment a–b (plan view).
+      const dx = b.x - a.x;
+      const dz = b.z - a.z;
+      const len = Math.hypot(dx, dz);
+      // Mean signed lateral offset of the stair vertices from the segment a–b (plan view).
+      let sum = 0;
+      let n = 0;
+      for (let i = 0; i < pos.count; i++) {
+        const px = pos.getX(i) - a.x;
+        const pz = pos.getZ(i) - a.z;
+        const t = (px * dx + pz * dz) / (len * len);
+        const lat = (px * dz - pz * dx) / len;
+        // Only this flight: between its landings in plan and in height, within a few metres.
+        if (t < 0.2 || t > 0.8 || Math.abs(lat) > 6 || pos.getY(i) > a.y * 1.5 || pos.getY(i) < b.y * 1.5) continue;
+        sum += lat;
+        n++;
+      }
+      disposeWalkway(group);
+      return Math.abs(sum / n);
+    };
+    expect(mid(stairs.id)).toBeLessThan(0.5); // the flight straddles the line
+    expect(mid(esc.id)).toBeGreaterThan(0.5); // …and moves aside when the escalator is taken
+  });
+
+  it('animates escalators and elevator cabins without NaN', () => {
+    const group = buildWalkway(g, opts);
+    const cut = { eye: new THREE.Vector3(0, 10, 0), target: new THREE.Vector3(5, 1, 5) };
+    for (let i = 0; i < 50; i++) updateWalkway(group, 0.1, i % 2 ? cut : null);
+    const cabins = group.getObjectByName('elevator-cabins') as THREE.InstancedMesh;
+    const arr = cabins.instanceMatrix.array;
+    for (let i = 0; i < arr.length; i++) expect(Number.isFinite(arr[i])).toBe(true);
+    disposeWalkway(group);
+    expect(group.userData.walkway).toBeUndefined();
   });
 });
