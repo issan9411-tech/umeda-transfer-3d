@@ -4,9 +4,10 @@ import { CSS2DObject, CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer
 import type { Graph } from '../core/graph';
 import { sampleKeyframes } from '../core/keyframes';
 import type { Keyframe, RouteSummary } from '../core/planner';
-import type { NetNode, Platform } from '../core/types';
+import type { EdgeKind, NetNode, Platform } from '../core/types';
 import { heatColor, KIND_COLORS, readPalette, type ScenePalette } from './palette';
-import { angleDelta, buildGuideLine, buildTrain, buildWalkway, headingBetween } from './walkway';
+import { PeopleCrowd, createWalkerFigure, type PeopleOptions, type WalkerFigure } from './people';
+import { angleDelta, buildGuideLine, buildTrain, buildWalkway, headingBetween, verticalLaneOffsets } from './walkway';
 
 export interface ViewEvents {
   /** x, y are relative to the view container. */
@@ -22,8 +23,36 @@ export type WalkView = 'chase' | 'first' | 'orbit';
 
 /** Vertical exaggeration used while walking: close to real scale so stairs look like stairs. */
 const WALK_EX = 1.5;
-/** Size of the walker figure while walking (the overview figure is drawn oversized). */
+/** Size of the walker's halo while walking (the overview marker is drawn oversized). */
 const WALKER_SCALE = 0.3;
+/**
+ * Pedestrian figures while walking: a little above real size, between the real horizontal
+ * scale and the 1.5× vertical exaggeration, so people, gates and steps read in proportion.
+ */
+const PEOPLE_SCALE = 1.25;
+/** The walker figure in the overview: a "you are here" marker, larger than the crowd (×5). */
+const WALKER_OVERVIEW_SCALE = 9;
+
+/** Overview figures shrink as the camera closes in (each agent stands for ~20 people). */
+const overviewZoom = (dist: number) => Math.min(1, Math.max(0.3, dist / 500));
+/** Soles above Y(level) while walking (walkway floors are lifted 0.08 to avoid z-fighting). */
+const FLOOR_LIFT = 0.09;
+/** Stair flights in the walk scene rise ≈0.94 m per metre (1.5× exaggerated). */
+const WALK_STAIR_SLOPE = 0.9;
+
+/** Per-agent crowd state the view draws (CrowdSim satisfies it). */
+export interface CrowdFrame {
+  readonly positions: Float32Array;
+  readonly headings: Float32Array;
+  readonly speeds: Float32Array;
+  readonly ids: Uint32Array;
+  readonly climbs: Int8Array;
+  readonly lateral: Float32Array;
+  readonly edgeOf: Int32Array;
+  /** Destination colours (0xrrggbb), used to colour-code the overview crowd. */
+  readonly colors: Uint32Array;
+  readonly count: number;
+}
 
 const tmpColor = new THREE.Color();
 
@@ -47,8 +76,21 @@ export class UmedaView {
   private networkGroup = new THREE.Group();
   private routeGroup = new THREE.Group();
   private labelGroup = new THREE.Group();
-  private crowdMesh: THREE.InstancedMesh | null = null;
+  private people: PeopleCrowd | null = null;
+  private crowdFrame: CrowdFrame | null = null;
+  private crowdOffsets = new Float32Array(0);
+  private peopleOpts: PeopleOptions;
+  /** Sideways shift of each drawn stair / escalator / elevator flight (x, z per edge). */
+  private laneOffsets: Float32Array;
+  /** Levels at both ends of each edge (crowd visibility without per-agent map lookups). */
+  private edgeLevels: [string, string][];
   private walker: THREE.Group;
+  private figure: WalkerFigure;
+  /** Per keyframe segment of the walker's track: edge walked (−1 while waiting). */
+  private walkerSegEdge = new Int32Array(0);
+  private walkerYaw = 0;
+  private walkerOff = new THREE.Vector3();
+  private walkerLift = 0;
   private platformMeshes: THREE.Mesh[] = [];
   private edgeLines: THREE.LineSegments | null = null;
   private routes: RouteSummary[] = [];
@@ -122,9 +164,19 @@ export class UmedaView {
     this.miniFrame.hidden = true;
     this.miniFrame.setAttribute('aria-hidden', 'true');
     container.appendChild(this.miniFrame);
+    this.laneOffsets = verticalLaneOffsets(g);
+    this.edgeLevels = g.edges.map((e) => [g.nodes[g.nodeIndex.get(e.a) as number].level, g.nodes[g.nodeIndex.get(e.b) as number].level]);
+    this.figure = createWalkerFigure();
     this.walker = this.makeWalker();
     this.walker.visible = false;
     this.scene.add(this.walker);
+    this.setWalkerScale();
+    this.peopleOpts = {
+      Y: (y) => this.Y(y),
+      scale: 1,
+      visible: (i) => this.crowdVisible(i),
+      groundLift: (i) => this.crowdGroundLift(i),
+    };
 
     this.computeBounds();
     this.rebuildAll();
@@ -236,7 +288,7 @@ export class UmedaView {
       this.camAnim = null;
       this.camera.near = 0.3;
       this.camera.updateProjectionMatrix();
-      this.walker.scale.setScalar(WALKER_SCALE);
+      this.setWalkerScale();
       this.setWalkerTime(this.walkerT);
       this.heading = this.lookaheadHeading() ?? this.heading;
       this.snapWalkCamera();
@@ -267,7 +319,7 @@ export class UmedaView {
     this.camera.updateProjectionMatrix();
     this.controls.enabled = true;
     this.controls.minDistance = 40;
-    this.walker.scale.setScalar(1);
+    this.setWalkerScale();
     this.walker.visible = this.walkerTrack.length > 0;
     this.miniFrame.hidden = true;
     this.miniMarker.visible = false;
@@ -308,15 +360,18 @@ export class UmedaView {
     const w = this.walker.position;
     const fwd = new THREE.Vector3(Math.sin(this.heading), 0, Math.cos(this.heading));
     if (this.walkView === 'first') {
-      const eye = w.clone().add(new THREE.Vector3(0, 2.4, 0));
+      const eye = w.clone().add(new THREE.Vector3(0, 1.6 * PEOPLE_SCALE, 0));
       const ahead = sampleKeyframes(this.walkerTrack, this.walkerT + 4);
-      const dy = this.Y(ahead.y) - (w.y - 0.8);
+      const dy = this.Y(ahead.y) - (w.y - FLOOR_LIFT - this.walkerLift);
       return { pos: eye, target: eye.clone().add(fwd.multiplyScalar(14)).add(new THREE.Vector3(0, dy * 0.7 - 1.2, 0)) };
     }
-    return {
-      pos: w.clone().sub(fwd.clone().multiplyScalar(16)).add(new THREE.Vector3(0, 7.5, 0)),
-      target: w.clone().add(fwd.multiplyScalar(9)).add(new THREE.Vector3(0, 1.2, 0)),
-    };
+    // Close behind and below the corridor ceiling (walls are 3.2 m × 1.5 high, with light strips
+    // just under the top), so the ceiling never hides the walker; on the way down a flight the
+    // camera stays above the steps behind.
+    const pos = w.clone().sub(fwd.clone().multiplyScalar(8)).add(new THREE.Vector3(0, 3.4, 0));
+    const behind = sampleKeyframes(this.walkerTrack, this.walkerT - 6);
+    pos.y = Math.max(pos.y, this.Y(behind.y) + 2.6);
+    return { pos, target: w.clone().add(fwd.multiplyScalar(7)).add(new THREE.Vector3(0, 1.0, 0)) };
   }
 
   private snapWalkCamera(): void {
@@ -364,11 +419,17 @@ export class UmedaView {
     this.miniCam.updateProjectionMatrix();
     const fog = this.scene.fog;
     this.scene.fog = null;
+    // People are sub-pixel from up here: skip their ~20 draw calls in the minimap pass.
+    const people = this.people?.object;
+    if (people) people.visible = false;
+    this.figure.object.visible = false;
     this.renderer.setScissorTest(true);
     this.renderer.setScissor(x, bottom, size, size);
     this.renderer.setViewport(x, bottom, size, size);
     this.renderer.render(this.scene, this.miniCam);
     this.renderer.setScissorTest(false);
+    if (people) people.visible = true;
+    this.figure.object.visible = true;
     this.scene.fog = fog;
     this.renderer.setViewport(0, 0, w, h);
   }
@@ -552,7 +613,9 @@ export class UmedaView {
       const n = g.nodes[g.nodeIndex.get(id) as number];
       if (this.levelVisible(n.level)) markers.push({ n, color: KIND_COLORS.elevator, size: 1.6 });
     }
-    if (markers.length) {
+    // Overview markers only: walking shows the real gate machines and lift shafts (walkway.ts),
+    // and a 2 m block at eye height would swallow the camera.
+    if (markers.length && !this.walkView) {
       const inst = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshLambertMaterial(), markers.length);
       const m4 = new THREE.Matrix4();
       markers.forEach((mk, i) => {
@@ -700,18 +763,78 @@ export class UmedaView {
 
   private makeWalker(): THREE.Group {
     const g = new THREE.Group();
-    const body = new THREE.Mesh(new THREE.CapsuleGeometry(1.6, 3.2, 6, 14), new THREE.MeshLambertMaterial({ color: 0x1b2a38, emissive: 0x1b2a38, emissiveIntensity: 0.2 }));
-    body.position.y = 3.4;
-    g.add(body);
-    const head = new THREE.Mesh(new THREE.SphereGeometry(1.4, 16, 12), new THREE.MeshLambertMaterial({ color: 0xffc400, emissive: 0xffc400, emissiveIntensity: 0.5 }));
-    head.position.y = 7.4;
-    g.add(head);
+    g.add(this.figure.object);
     const halo = new THREE.Mesh(new THREE.RingGeometry(4, 5.2, 32), new THREE.MeshBasicMaterial({ color: 0xffc400, transparent: true, opacity: 0.8, side: THREE.DoubleSide }));
     halo.rotation.x = -Math.PI / 2;
     halo.position.y = 0.6;
     halo.name = 'halo';
     g.add(halo);
     return g;
+  }
+
+  /** Figure at crowd scale while walking, a large marker (with its halo) in the overview. */
+  private setWalkerScale(): void {
+    const halo = this.walker.getObjectByName('halo') as THREE.Object3D;
+    const walking = !!this.walkView;
+    this.figure.object.scale.setScalar(walking ? PEOPLE_SCALE : WALKER_OVERVIEW_SCALE);
+    halo.userData.base = walking ? WALKER_SCALE : 1.5;
+    halo.position.y = walking ? 0.12 : 0.6;
+  }
+
+  /** Maps each keyframe segment of the walker's track to the edge it walks (−1 = waiting). */
+  private buildWalkerSegments(r: RouteSummary | undefined): void {
+    const kf = r?.keyframes ?? [];
+    const steps = r?.path.steps ?? [];
+    this.walkerSegEdge = new Int32Array(Math.max(0, kf.length - 1)).fill(-1);
+    let s = 0;
+    for (let i = 0; i + 1 < kf.length; i++) {
+      const a = kf[i];
+      const b = kf[i + 1];
+      if (a.x === b.x && a.y === b.y && a.z === b.z) continue; // waiting at a / b
+      if (s < steps.length) this.walkerSegEdge[i] = steps[s++].edge;
+    }
+  }
+
+  /** Index of the keyframe segment containing t (clamped). */
+  private walkerSegment(t: number): number {
+    const kf = this.walkerTrack;
+    let lo = 0;
+    let hi = kf.length - 1;
+    if (hi < 1) return 0;
+    if (t <= kf[0].t) return 0;
+    if (t >= kf[hi].t) return hi - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (kf[mid].t <= t) lo = mid;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  private edgeKind(e: number): EdgeKind | null {
+    return e >= 0 ? this.g.edges[e].kind : null;
+  }
+
+  /** Extra height of a stair tread / escalator step above the line between two landings. */
+  private flightLift(kind: EdgeKind | null): number {
+    if (!this.walkView) return 0;
+    if (kind === 'stairs') return 0.09 * this.exaggeration;
+    if (kind === 'escalator') return 0.35;
+    return 0;
+  }
+
+  private crowdVisible(i: number): boolean {
+    const f = this.crowdFrame;
+    if (!f) return false;
+    // Same rule as the network lines: hidden only when both ends of its edge are hidden.
+    const ends = this.edgeLevels[f.edgeOf[i]];
+    if (!ends || this.hiddenLevels.size === 0) return true;
+    return this.levelVisible(ends[0]) || this.levelVisible(ends[1]);
+  }
+
+  private crowdGroundLift(i: number): number {
+    const f = this.crowdFrame;
+    return f ? this.flightLift(this.edgeKind(f.edgeOf[i])) : 0;
   }
 
   // ---------------------------------------------------------------- public API
@@ -724,6 +847,7 @@ export class UmedaView {
     this.buildLabels();
     this.buildRoutes();
     this.walkerTrack = routes[this.selected]?.keyframes ?? [];
+    this.buildWalkerSegments(routes[this.selected]);
     this.walker.visible = this.walkerTrack.length > 0 && this.walkView !== 'first';
     this.setWalkerTime(0);
     if (this.walkView) {
@@ -849,73 +973,102 @@ export class UmedaView {
   private walkerT = 0;
 
   setWalkerTime(t: number): void {
+    const dt = Math.abs(t - this.walkerT);
     this.walkerT = t;
     if (!this.walkerTrack.length) return;
     const p = sampleKeyframes(this.walkerTrack, t);
-    this.walker.position.set(p.x, this.Y(p.y) + 0.8, p.z);
+    // What the walker is doing on this stretch: walking, climbing, riding or waiting.
+    const k = this.walkerSegment(t);
+    const a = this.walkerTrack[k];
+    const b = this.walkerTrack[Math.min(k + 1, this.walkerTrack.length - 1)];
+    const edge = this.walkerSegEdge[k] ?? -1;
+    const kind = this.edgeKind(edge);
+    const run = Math.hypot(b.x - a.x, b.z - a.z);
+    const riding = kind === null || kind === 'escalator' || kind === 'elevator';
+    const speed = riding || b.t <= a.t ? 0 : run / (b.t - a.t);
+    if (run > 0.3) this.walkerYaw = Math.atan2(b.x - a.x, b.z - a.z);
+    const climb = kind === 'stairs' ? (Math.sign(b.y - a.y) as -1 | 0 | 1) : 0;
+    // Stand on the flight that is actually drawn (parallel flights are shifted sideways).
+    const walking = !!this.walkView;
+    const ox = walking && edge >= 0 ? this.laneOffsets[edge * 2] : 0;
+    const oz = walking && edge >= 0 ? this.laneOffsets[edge * 2 + 1] : 0;
+    const e = dt > 2 ? 1 : 1 - Math.exp(-dt / 0.6);
+    this.walkerOff.x += (ox - this.walkerOff.x) * e;
+    this.walkerOff.z += (oz - this.walkerOff.z) * e;
+    this.walkerLift += (this.flightLift(kind) - this.walkerLift) * (dt > 2 ? 1 : 1 - Math.exp(-dt / 0.25));
+    const base = walking ? FLOOR_LIFT + this.walkerLift : 0.8;
+    this.walker.position.set(p.x + this.walkerOff.x, this.Y(p.y) + base, p.z + this.walkerOff.z);
+    this.figure.update(Math.min(dt, 5), speed, this.walkerYaw, climb, walking ? WALK_STAIR_SLOPE : undefined);
   }
 
   get walkerPosition(): THREE.Vector3 {
     return this.walker.position;
   }
 
-  /** Updates the crowd instances from packed positions. */
-  setCrowd(positions: Float32Array | null, colors: Uint32Array | null, count: number, edgeOf: Int32Array | null = null): void {
-    if (!positions || !colors || count === 0) {
-      if (this.crowdMesh) this.crowdMesh.count = 0;
+  /**
+   * Draws the crowd as animated people; `dt` is the simulated time since the last call (so
+   * strides match how far everyone moved). Pass null to hide it.
+   */
+  setCrowd(frame: CrowdFrame | null, dt = 0): void {
+    if (!frame || frame.count === 0) {
+      this.crowdFrame = null;
+      this.people?.clear();
       return;
     }
-    if (!this.crowdMesh || this.crowdMesh.instanceMatrix.count < count) {
-      if (this.crowdMesh) {
-        this.scene.remove(this.crowdMesh);
-        this.crowdMesh.geometry.dispose();
-        (this.crowdMesh.material as THREE.Material).dispose();
+    const cap = frame.positions.length / 3;
+    if (!this.people || this.people.capacity < cap) {
+      if (this.people) {
+        this.scene.remove(this.people.object);
+        this.people.dispose();
       }
-      const cap = Math.max(count, positions.length / 3);
-      // Each agent stands for ~20 people, so draw it well above human scale to stay visible.
-      this.crowdMesh = new THREE.InstancedMesh(new THREE.CapsuleGeometry(2.2, 3.2, 3, 8), new THREE.MeshLambertMaterial(), cap);
-      this.crowdMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      this.crowdMesh.frustumCulled = false;
-      this.scene.add(this.crowdMesh);
+      this.people = new PeopleCrowd(cap, { detail: 'low' });
+      this.scene.add(this.people.object);
     }
-    const m4 = new THREE.Matrix4();
-    const mesh = this.crowdMesh;
-    // Agents are drawn oversized for the overview; shrink them as the camera closes in.
-    const sc = this.walkView ? 0.26 : Math.min(1, Math.max(0.3, this.camera.position.distanceTo(this.controls.target) / 500));
-    let w = 0;
-    for (let i = 0; i < count; i++) {
-      const y = positions[i * 3 + 1];
-      if (edgeOf) {
-        // Same rule as the network lines: hidden only when both ends of its edge are hidden.
-        const ed = this.g.edges[edgeOf[i]];
-        const la = this.g.nodes[this.g.nodeIndex.get(ed.a) as number].level;
-        const lb = this.g.nodes[this.g.nodeIndex.get(ed.b) as number].level;
-        if (!this.levelVisible(la) && !this.levelVisible(lb)) continue;
-      } else {
-        const lvl = this.levelOfY(y);
-        if (lvl && !this.levelVisible(lvl)) continue;
-      }
-      m4.makeScale(sc, sc, sc).setPosition(positions[i * 3], this.Y(y) + 3.8 * sc, positions[i * 3 + 2]);
-      mesh.setMatrixAt(w, m4);
-      mesh.setColorAt(w, tmpColor.setHex(colors[i]));
-      w++;
+    this.crowdFrame = frame;
+    const n = frame.count;
+    if (this.crowdOffsets.length < n * 2) this.crowdOffsets = new Float32Array(cap * 2);
+    // Spread people across walkways (to the right of their direction of travel) and, while
+    // walking, onto the stairs / escalators actually drawn beside the node line.
+    const walking = !!this.walkView;
+    const off = this.crowdOffsets;
+    for (let i = 0; i < n; i++) {
+      const h = frame.headings[i];
+      const lat = frame.lateral[i];
+      const e = frame.edgeOf[i];
+      off[i * 2] = -Math.cos(h) * lat + (walking ? this.laneOffsets[e * 2] : 0);
+      off[i * 2 + 1] = Math.sin(h) * lat + (walking ? this.laneOffsets[e * 2 + 1] : 0);
     }
-    mesh.count = w;
-    mesh.instanceMatrix.needsUpdate = true;
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  }
-
-  private levelOfY(y: number): string | null {
-    let best: string | null = null;
-    let bd = Infinity;
-    for (const l of this.g.net.levels) {
-      const d = Math.abs(l.y - y);
-      if (d < bd) {
-        bd = d;
-        best = l.id;
-      }
+    const o = this.peopleOpts;
+    o.ids = frame.ids;
+    o.climbs = frame.climbs;
+    o.offsets = off;
+    if (walking) {
+      o.scale = PEOPLE_SCALE;
+      o.lift = FLOOR_LIFT;
+      o.camera = this.camera;
+      o.maxDistance = 260;
+      o.minDistance = this.walkView === 'first' ? 2 : 2.5;
+      o.maxDrawn = 350;
+      o.tints = undefined;
+      o.detail = 'high';
+      o.stairSlope = WALK_STAIR_SLOPE;
+      o.shadows = true;
+    } else {
+      // Each agent stands for ~20 people, so draw it well above human scale to stay visible;
+      // shrink as the camera closes in.
+      o.scale = 5 * overviewZoom(this.camera.position.distanceTo(this.controls.target));
+      o.lift = 0;
+      o.camera = undefined;
+      o.maxDistance = undefined;
+      o.minDistance = undefined;
+      o.maxDrawn = undefined;
+      o.tints = frame.colors;
+      o.tintAmount = 0.6;
+      o.detail = 'low';
+      o.stairSlope = undefined; // overview stairs are lines: a normal stair pose is enough
+      o.shadows = false;
     }
-    return bd < 2.5 ? best : null;
+    this.people.update(frame.positions, frame.headings, frame.speeds, n, dt, o);
   }
 
   refreshTheme(): void {
@@ -1018,8 +1171,13 @@ export class UmedaView {
     }
     this.pulse += dt;
     const halo = this.walker.getObjectByName('halo');
+    if (!this.walkView) {
+      const zoom = overviewZoom(this.camera.position.distanceTo(this.controls.target));
+      this.figure.object.scale.setScalar(WALKER_OVERVIEW_SCALE * zoom);
+      if (halo) halo.userData.base = 1.5 * zoom;
+    }
     if (halo) {
-      const s = 1 + 0.25 * Math.sin(this.pulse * 4);
+      const s = (1 + 0.25 * Math.sin(this.pulse * 4)) * ((halo.userData.base as number | undefined) ?? 1);
       halo.scale.set(s, s, s);
     }
     if (!this.walkView || this.walkView === 'orbit') this.controls.update();

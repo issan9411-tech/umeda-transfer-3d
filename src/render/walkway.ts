@@ -127,18 +127,13 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
 
   // Parallel vertical edges (stairs + escalator + elevator between the same landings) are
   // spread sideways so they do not overlap.
-  const lane = new Map<string, number>();
-  const laneOf = (e: NetEdge) => {
-    const key = e.a < e.b ? `${e.a}|${e.b}` : `${e.b}|${e.a}`;
-    const n = lane.get(key) ?? 0;
-    lane.set(key, n + 1);
-    return n;
-  };
+  const lanes = verticalLaneOffsets(g);
 
   // Node joints: fill the gaps where corridors meet.
   const jointWidth = new Map<string, number>();
 
-  for (const e of g.edges) {
+  for (let ei = 0; ei < g.edges.length; ei++) {
+    const e = g.edges[ei];
     if (!visible(e)) continue;
     const na = nodeOf(e.a);
     const nb = nodeOf(e.b);
@@ -191,8 +186,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     if (e.kind === 'stairs' || e.kind === 'escalator' || e.kind === 'elevator') {
       const [lo, hi] = a.y <= b.y ? [a, b] : [b, a];
       const { dir, left, run } = frame(lo, hi);
-      const k = laneOf(e);
-      const shift = left.clone().multiplyScalar((k === 0 ? -1 : k === 1 ? 1 : 3) * 2.2);
+      const shift = new THREE.Vector3(lanes[ei * 2], 0, lanes[ei * 2 + 1]);
       const l0 = lo.clone().add(shift);
       const h0 = hi.clone().add(shift);
       const rise = h0.y - l0.y;
@@ -273,6 +267,30 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
   if (wallMesh) wallMesh.renderOrder = 3;
   if (shaftMesh) shaftMesh.renderOrder = 3;
   return group;
+}
+
+/**
+ * Sideways placement of stairs, escalators and elevators: parallel flights between the same
+ * two landings are spread apart. Per edge, the world (x, z) offset of the drawn flight from the
+ * straight line between its nodes (0 for other kinds) — pedestrians use it to stay on the steps.
+ */
+export function verticalLaneOffsets(g: Graph): Float32Array {
+  const out = new Float32Array(g.edges.length * 2);
+  const lane = new Map<string, number>();
+  g.edges.forEach((e, i) => {
+    if (e.kind !== 'stairs' && e.kind !== 'escalator' && e.kind !== 'elevator') return;
+    const key = e.a < e.b ? `${e.a}|${e.b}` : `${e.b}|${e.a}`;
+    const k = lane.get(key) ?? 0;
+    lane.set(key, k + 1);
+    const na = g.nodes[g.nodeIndex.get(e.a) as number];
+    const nb = g.nodes[g.nodeIndex.get(e.b) as number];
+    const [lo, hi] = na.y <= nb.y ? [na, nb] : [nb, na];
+    const { left } = frame(new THREE.Vector3(lo.x, 0, lo.z), new THREE.Vector3(hi.x, 0, hi.z));
+    const m = (k === 0 ? -1 : k === 1 ? 1 : 3) * 2.2;
+    out[i * 2] = left.x * m;
+    out[i * 2 + 1] = left.z * m;
+  });
+  return out;
 }
 
 function addTactile(soup: Soup, p: Platform, Y: (y: number) => number, color: THREE.Color): void {
