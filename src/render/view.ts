@@ -6,6 +6,7 @@ import { sampleKeyframes } from '../core/keyframes';
 import type { Keyframe, RouteSummary } from '../core/planner';
 import type { NetNode, Platform } from '../core/types';
 import { heatColor, KIND_COLORS, readPalette, type ScenePalette } from './palette';
+import { angleDelta, buildGuideLine, buildTrain, buildWalkway, headingBetween } from './walkway';
 
 export interface ViewEvents {
   /** x, y are relative to the view container. */
@@ -15,6 +16,14 @@ export interface ViewEvents {
 }
 
 type CameraPreset = 'overview' | 'north' | 'section' | 'top';
+
+/** Walk-through camera: behind the walker, at eye level, or orbiting while following. */
+export type WalkView = 'chase' | 'first' | 'orbit';
+
+/** Vertical exaggeration used while walking: close to real scale so stairs look like stairs. */
+const WALK_EX = 1.5;
+/** Size of the walker figure while walking (the overview figure is drawn oversized). */
+const WALKER_SCALE = 0.3;
 
 const tmpColor = new THREE.Color();
 
@@ -45,7 +54,6 @@ export class UmedaView {
   private routes: RouteSummary[] = [];
   private selected = 0;
   private walkerTrack: Keyframe[] = [];
-  private follow = false;
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
   private hovered: THREE.Mesh | null = null;
@@ -55,6 +63,19 @@ export class UmedaView {
   /** Node indices of the selected route (their labels are always shown). */
   private routeNodes = new Set<number>();
   private radius = 600;
+
+  // Walk-through state
+  private walkView: WalkView | null = null;
+  private walkGroup: THREE.Group | null = null;
+  private trainGroup = new THREE.Group();
+  private signGroup = new THREE.Group();
+  private savedEx = 4;
+  private heading = 0;
+  private camPos = new THREE.Vector3();
+  private camTarget = new THREE.Vector3();
+  private miniCam = new THREE.OrthographicCamera(-160, 160, 160, -160, 1, 6000);
+  private miniMarker: THREE.Mesh;
+  private miniFrame: HTMLDivElement;
 
   constructor(container: HTMLElement, g: Graph, events: ViewEvents = {}) {
     this.container = container;
@@ -85,7 +106,22 @@ export class UmedaView {
     sun.position.set(-400, 900, 300);
     this.scene.add(sun);
 
-    this.scene.add(this.staticGroup, this.networkGroup, this.routeGroup, this.labelGroup, this.highlightNodes);
+    this.scene.add(this.staticGroup, this.networkGroup, this.routeGroup, this.labelGroup, this.highlightNodes, this.trainGroup, this.signGroup);
+
+    // Minimap: top-down orthographic camera that also sees layer 1 (the heading marker).
+    this.miniCam.up.set(0, 0, -1);
+    this.miniCam.layers.enable(1);
+    const marker = new THREE.Mesh(new THREE.ConeGeometry(9, 22, 3), new THREE.MeshBasicMaterial({ color: 0xffc400 }));
+    marker.geometry.rotateX(Math.PI / 2);
+    marker.layers.set(1);
+    marker.visible = false;
+    this.miniMarker = marker;
+    this.scene.add(marker);
+    this.miniFrame = document.createElement('div');
+    this.miniFrame.className = 'minimap-frame';
+    this.miniFrame.hidden = true;
+    this.miniFrame.setAttribute('aria-hidden', 'true');
+    container.appendChild(this.miniFrame);
     this.walker = this.makeWalker();
     this.walker.visible = false;
     this.scene.add(this.walker);
@@ -133,6 +169,208 @@ export class UmedaView {
     this.buildNetwork();
     this.buildLabels();
     this.buildRoutes();
+    if (this.walkView) this.buildWalkScene();
+  }
+
+  // ---------------------------------------------------------------- walk-through
+
+  /** Floors, walls, stairs, gates (walkway.ts), trains at both ends and signboards. */
+  private buildWalkScene(): void {
+    if (this.walkGroup) {
+      this.scene.remove(this.walkGroup);
+      this.walkGroup.traverse((o) => {
+        const m = o as THREE.Mesh;
+        m.geometry?.dispose?.();
+        (m.material as THREE.Material | undefined)?.dispose?.();
+      });
+    }
+    this.walkGroup = buildWalkway(this.g, {
+      Y: (y) => this.Y(y),
+      ex: this.exaggeration,
+      dark: this.palette.dark,
+      levelVisible: (l) => this.levelVisible(l),
+    });
+    this.scene.add(this.walkGroup);
+
+    this.clearGroup(this.trainGroup);
+    this.clearGroup(this.signGroup);
+    const r = this.routes[this.selected];
+    if (!r) return;
+    const ends = [r.boardingNode, r.alightNode];
+    ends.forEach((n, i) => {
+      const p = this.g.net.platforms.find((x) => x.id === n.platformId);
+      if (!p || !this.levelVisible(p.level)) return;
+      const line = this.g.net.lines.find((l) => l.id === p.lineIds[0]);
+      this.trainGroup.add(buildTrain(p, line?.color ?? '#888', (y) => this.Y(y), this.exaggeration, i === 0 ? 1 : -1));
+    });
+
+    // Signboards where each instruction begins (station-sign style, see styles.css).
+    r.instructions.forEach((ins, i) => {
+      if (ins.kind === 'start') return;
+      const stepIdx = Math.min(Math.max(0, ins.steps[0]), r.path.steps.length - 1);
+      const nodeIdx = ins.kind === 'arrive' ? r.path.nodes[r.path.nodes.length - 1] : r.path.steps[stepIdx]?.from;
+      if (nodeIdx === undefined) return;
+      const n = this.g.nodes[nodeIdx];
+      const el = document.createElement('div');
+      el.className = `sign sign-${ins.kind}`;
+      el.innerHTML = `<span class="sign-lvl"></span><span class="sign-text"></span>`;
+      (el.firstChild as HTMLElement).textContent = ins.level;
+      (el.lastChild as HTMLElement).textContent = ins.text;
+      const obj = new CSS2DObject(el);
+      obj.position.copy(this.v(n)).add(new THREE.Vector3(0, 3.4 * this.exaggeration + 1.5, 0));
+      obj.userData.instruction = i;
+      this.signGroup.add(obj);
+    });
+  }
+
+  /** Enters (or switches) walk-through mode for the selected route. */
+  enterWalk(view: WalkView): void {
+    if (!this.routes[this.selected]) return;
+    const first = this.walkView === null;
+    this.walkView = view;
+    if (first) {
+      this.savedEx = this.exaggeration;
+      this.exaggeration = WALK_EX;
+      this.scene.fog = new THREE.Fog(this.palette.bg, 90, 520);
+      this.rebuildAll();
+      this.camAnim = null;
+      this.camera.near = 0.3;
+      this.camera.updateProjectionMatrix();
+      this.walker.scale.setScalar(WALKER_SCALE);
+      this.setWalkerTime(this.walkerT);
+      this.heading = this.lookaheadHeading() ?? this.heading;
+      this.snapWalkCamera();
+    }
+    this.controls.enabled = view === 'orbit';
+    if (view === 'orbit') {
+      this.controls.target.copy(this.walker.position);
+      this.controls.minDistance = 15;
+      if (this.camera.position.distanceTo(this.walker.position) > 400) this.snapWalkCamera();
+    }
+    this.walker.visible = view !== 'first' && this.walkerTrack.length > 0;
+    this.miniFrame.hidden = false;
+    this.miniMarker.visible = true;
+  }
+
+  exitWalk(): void {
+    if (!this.walkView) return;
+    this.walkView = null;
+    if (this.walkGroup) {
+      this.scene.remove(this.walkGroup);
+      this.walkGroup = null;
+    }
+    this.clearGroup(this.trainGroup);
+    this.clearGroup(this.signGroup);
+    this.exaggeration = this.savedEx;
+    this.scene.fog = null;
+    this.camera.near = 1;
+    this.camera.updateProjectionMatrix();
+    this.controls.enabled = true;
+    this.controls.minDistance = 40;
+    this.walker.scale.setScalar(1);
+    this.walker.visible = this.walkerTrack.length > 0;
+    this.miniFrame.hidden = true;
+    this.miniMarker.visible = false;
+    this.rebuildAll();
+    this.setWalkerTime(this.walkerT);
+    this.focusRoute();
+  }
+
+  get walking(): WalkView | null {
+    return this.walkView;
+  }
+
+  /** Index of the instruction the walker is currently carrying out. */
+  private currentInstruction(): number {
+    const r = this.routes[this.selected];
+    if (!r) return 0;
+    let acc = 0;
+    for (let i = 0; i < r.instructions.length; i++) {
+      acc += r.instructions[i].timeS;
+      if (this.walkerT < acc) return i;
+    }
+    return r.instructions.length - 1;
+  }
+
+  /** Direction of travel a few seconds ahead of the walker (null while moving vertically). */
+  private lookaheadHeading(): number | null {
+    const p0 = sampleKeyframes(this.walkerTrack, this.walkerT);
+    for (const ahead of [2, 5, 10, 20]) {
+      const h = headingBetween(p0, sampleKeyframes(this.walkerTrack, this.walkerT + ahead));
+      if (h !== null) return h;
+    }
+    // At the destination: keep facing the way we arrived.
+    const back = headingBetween(sampleKeyframes(this.walkerTrack, this.walkerT - 5), p0);
+    return back;
+  }
+
+  private walkPose(): { pos: THREE.Vector3; target: THREE.Vector3 } {
+    const w = this.walker.position;
+    const fwd = new THREE.Vector3(Math.sin(this.heading), 0, Math.cos(this.heading));
+    if (this.walkView === 'first') {
+      const eye = w.clone().add(new THREE.Vector3(0, 2.4, 0));
+      const ahead = sampleKeyframes(this.walkerTrack, this.walkerT + 4);
+      const dy = this.Y(ahead.y) - (w.y - 0.8);
+      return { pos: eye, target: eye.clone().add(fwd.multiplyScalar(14)).add(new THREE.Vector3(0, dy * 0.7 - 1.2, 0)) };
+    }
+    return {
+      pos: w.clone().sub(fwd.clone().multiplyScalar(16)).add(new THREE.Vector3(0, 7.5, 0)),
+      target: w.clone().add(fwd.multiplyScalar(9)).add(new THREE.Vector3(0, 1.2, 0)),
+    };
+  }
+
+  private snapWalkCamera(): void {
+    const { pos, target } = this.walkPose();
+    this.camPos.copy(pos);
+    this.camTarget.copy(target);
+    this.camera.position.copy(pos);
+    this.camera.lookAt(target);
+    this.controls.target.copy(target);
+  }
+
+  private updateWalkCamera(dt: number): void {
+    const h = this.lookaheadHeading();
+    if (h !== null) this.heading += angleDelta(this.heading, h) * Math.min(1, dt * 2.4);
+    this.miniMarker.position.copy(this.walker.position).setY(this.walker.position.y + 40);
+    this.miniMarker.rotation.set(0, this.heading, 0);
+    if (this.walkView === 'orbit') {
+      const delta = this.walker.position.clone().sub(this.controls.target).multiplyScalar(Math.min(1, dt * 3));
+      this.controls.target.add(delta);
+      this.camera.position.add(delta);
+      return;
+    }
+    const { pos, target } = this.walkPose();
+    const k = 1 - Math.exp(-dt * 5);
+    this.camPos.lerp(pos, k);
+    this.camTarget.lerp(target, k);
+    this.camera.position.copy(this.camPos);
+    this.camera.lookAt(this.camTarget);
+    this.controls.target.copy(this.camTarget);
+  }
+
+  private renderMinimap(): void {
+    const w = this.container.clientWidth;
+    const h = this.container.clientHeight;
+    const size = Math.round(Math.min(190, w * 0.3, h * 0.32));
+    const x = w - size - 14;
+    const bottom = w < 760 ? 70 : 92;
+    this.miniFrame.style.width = `${size}px`;
+    this.miniFrame.style.height = `${size}px`;
+    this.miniFrame.style.left = `${x}px`;
+    this.miniFrame.style.top = `${h - bottom - size}px`;
+    const p = this.walker.position;
+    this.miniCam.position.set(p.x, p.y + 1500, p.z);
+    this.miniCam.lookAt(p.x, p.y, p.z);
+    this.miniCam.updateProjectionMatrix();
+    const fog = this.scene.fog;
+    this.scene.fog = null;
+    this.renderer.setScissorTest(true);
+    this.renderer.setScissor(x, bottom, size, size);
+    this.renderer.setViewport(x, bottom, size, size);
+    this.renderer.render(this.scene, this.miniCam);
+    this.renderer.setScissorTest(false);
+    this.scene.fog = fog;
+    this.renderer.setViewport(0, 0, w, h);
   }
 
   private clearGroup(group: THREE.Group): void {
@@ -343,6 +581,7 @@ export class UmedaView {
       obj.position.set(s.anchor[0], this.Y(s.anchor[1]) + 10, s.anchor[2]);
       this.labelGroup.add(obj);
     }
+    if (this.walkView) return; // signboards take over while walking
     this.g.nodes.forEach((n, i) => {
       if (!n.label || !this.levelVisible(n.level) || this.routeNodes.has(i)) return;
       const el = document.createElement('div');
@@ -379,6 +618,16 @@ export class UmedaView {
   private buildRoutes(): void {
     this.clearGroup(this.routeGroup);
     this.clearGroup(this.highlightNodes);
+    if (this.walkView) {
+      // Walking: a guide line painted on the floor instead of the overview tube and pins.
+      const r = this.routes[this.selected];
+      if (!r) return;
+      const pts = r.path.nodes.map((ni) => this.v(this.g.nodes[ni]));
+      const guide = buildGuideLine(pts, this.palette.accent);
+      if (guide) this.routeGroup.add(guide);
+      if (this.edgeLines) (this.edgeLines.material as THREE.LineBasicMaterial).opacity = 0.25;
+      return;
+    }
     if (this.edgeLines) (this.edgeLines.material as THREE.LineBasicMaterial).opacity = this.routes.length ? 0.5 : 0.9;
     const p = this.palette;
     this.routes.forEach((r, idx) => {
@@ -468,14 +717,19 @@ export class UmedaView {
   // ---------------------------------------------------------------- public API
 
   setRoutes(routes: RouteSummary[], selected = 0): void {
+    const prevKey = this.routes[this.selected]?.path.nodes.join(',');
     this.routes = routes;
     this.selected = Math.min(selected, Math.max(0, routes.length - 1));
     this.routeNodes = new Set(routes[this.selected]?.path.nodes ?? []);
     this.buildLabels();
     this.buildRoutes();
     this.walkerTrack = routes[this.selected]?.keyframes ?? [];
-    this.walker.visible = this.walkerTrack.length > 0;
+    this.walker.visible = this.walkerTrack.length > 0 && this.walkView !== 'first';
     this.setWalkerTime(0);
+    if (this.walkView) {
+      if (routes[this.selected]?.path.nodes.join(',') !== prevKey) this.exitWalk();
+      else this.buildWalkScene();
+    }
   }
 
   selectRoute(i: number): void {
@@ -545,6 +799,10 @@ export class UmedaView {
   }
 
   setExaggeration(ex: number): void {
+    if (this.walkView) {
+      this.savedEx = ex;
+      return;
+    }
     this.exaggeration = ex;
     this.rebuildAll();
     this.setWalkerTime(this.walkerT);
@@ -556,6 +814,7 @@ export class UmedaView {
     this.buildStatic();
     this.buildNetwork();
     this.buildLabels();
+    if (this.walkView) this.buildWalkScene();
   }
 
   isLevelVisible(level: string): boolean {
@@ -585,10 +844,6 @@ export class UmedaView {
       attr.setXYZ(2 * k + 1, c.r, c.g, c.b);
     }
     attr.needsUpdate = true;
-  }
-
-  setFollow(on: boolean): void {
-    this.follow = on;
   }
 
   private walkerT = 0;
@@ -626,7 +881,7 @@ export class UmedaView {
     const m4 = new THREE.Matrix4();
     const mesh = this.crowdMesh;
     // Agents are drawn oversized for the overview; shrink them as the camera closes in.
-    const sc = Math.min(1, Math.max(0.3, this.camera.position.distanceTo(this.controls.target) / 500));
+    const sc = this.walkView ? 0.26 : Math.min(1, Math.max(0.3, this.camera.position.distanceTo(this.controls.target) / 500));
     let w = 0;
     for (let i = 0; i < count; i++) {
       const y = positions[i * 3 + 1];
@@ -665,6 +920,7 @@ export class UmedaView {
 
   refreshTheme(): void {
     this.palette = readPalette();
+    if (this.scene.fog) (this.scene.fog as THREE.Fog).color.copy(this.palette.bg);
     this.rebuildAll();
   }
 
@@ -744,17 +1000,21 @@ export class UmedaView {
       this.camera.position.lerpVectors(a.from, a.to, e);
       this.controls.target.lerpVectors(a.tFrom, a.tTo, e);
       if (a.t >= 1) this.camAnim = null;
-    } else if (this.follow && this.walker.visible) {
-      const target = this.walker.position;
-      const delta = target.clone().sub(this.controls.target).multiplyScalar(Math.min(1, dt * 3));
-      this.controls.target.add(delta);
-      this.camera.position.add(delta);
+    } else if (this.walkView) {
+      this.updateWalkCamera(dt);
     }
     // Minor labels only when the camera is close enough to read them.
     const camPos = this.camera.position;
     for (const obj of this.labelGroup.children) {
       if (!obj.userData.minor) continue;
-      obj.visible = obj.position.distanceTo(camPos) < 520;
+      obj.visible = obj.position.distanceTo(camPos) < (this.walkView ? 120 : 520);
+    }
+    if (this.walkView) {
+      const cur = this.currentInstruction();
+      for (const obj of this.signGroup.children) {
+        const i = obj.userData.instruction as number;
+        obj.visible = i >= cur && i <= cur + 2 && obj.position.distanceTo(camPos) < 260;
+      }
     }
     this.pulse += dt;
     const halo = this.walker.getObjectByName('halo');
@@ -762,9 +1022,10 @@ export class UmedaView {
       const s = 1 + 0.25 * Math.sin(this.pulse * 4);
       halo.scale.set(s, s, s);
     }
-    this.controls.update();
+    if (!this.walkView || this.walkView === 'orbit') this.controls.update();
     this.renderer.render(this.scene, this.camera);
     this.labelRenderer.render(this.scene, this.camera);
+    if (this.walkView) this.renderMinimap();
   }
 
   platformAt(id: string): Platform | undefined {

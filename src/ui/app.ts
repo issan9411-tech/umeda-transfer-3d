@@ -4,7 +4,7 @@ import type { Graph } from '../core/graph';
 import { transferMatrix, type TransferMatrix } from '../core/matrix';
 import { endpointSources, endpointTargets, planRoute, type Boarding, type Endpoint, type RoutePlan } from '../core/planner';
 import type { DataSet } from '../data/dataset';
-import { UmedaView } from '../render/view';
+import { UmedaView, type WalkView } from '../render/view';
 import { KIND_COLORS } from '../render/palette';
 import { CrowdSim, type Endpoint as CrowdEndpoint } from '../sim/crowd';
 import { escapeHtml, hourLabel, jpDuration, meters, minutes, mmss, readableOn } from './format';
@@ -24,7 +24,8 @@ interface State {
   rain: boolean;
   selected: number;
   rate: number;
-  follow: boolean;
+  /** Camera used when playback starts ('off' keeps the overview). */
+  walkView: WalkView | 'off';
   labels: boolean;
   exag: number;
   crowd: boolean;
@@ -34,7 +35,8 @@ interface State {
 }
 
 const STORE_KEY = 'umeda-transfer-3d:v1';
-const PERSIST: (keyof State)[] = ['from', 'to', 'profile', 'objective', 'boarding', 'day', 'speed', 'hour', 'congestion', 'rain', 'rate', 'labels', 'exag', 'matrixMode'];
+const PERSIST: (keyof State)[] = ['from', 'to', 'profile', 'objective', 'boarding', 'day', 'speed', 'hour', 'congestion', 'rain', 'rate', 'walkView', 'labels', 'exag', 'matrixMode'];
+const RATES = [1, 2, 4, 10, 30];
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -89,8 +91,8 @@ export class App {
       congestion: true,
       rain: false,
       selected: 0,
-      rate: 10,
-      follow: false,
+      rate: 4,
+      walkView: 'chase',
       labels: true,
       exag: 4,
       crowd: false,
@@ -126,7 +128,8 @@ export class App {
     s.speed = num(s.speed, 0.7, 2.0, PROFILES[s.profile].speed);
     s.hour = num(s.hour, 5, 24, d.hour);
     s.exag = num(s.exag, 1, 8, d.exag);
-    s.rate = [1, 4, 10, 30].includes(s.rate) ? s.rate : d.rate;
+    s.rate = RATES.includes(s.rate) ? s.rate : d.rate;
+    s.walkView = oneOf(s.walkView, ['chase', 'first', 'orbit', 'off'] as const, d.walkView);
     s.congestion = bool(s.congestion, d.congestion);
     s.rain = bool(s.rain, d.rain);
     s.labels = bool(s.labels, d.labels);
@@ -296,10 +299,17 @@ export class App {
       this.state.rate = Number(el.value);
       this.saveState();
     });
-    onChange('follow', (el) => {
-      this.state.follow = el.checked;
-      this.view.setFollow(el.checked);
+    onChange('walkView', (el) => {
+      this.state.walkView = el.value as State['walkView'];
+      this.saveState();
+      if (this.view.walking) {
+        if (this.state.walkView === 'off') this.exitWalk();
+        else this.view.enterWalk(this.state.walkView);
+      } else if (this.playing && this.state.walkView !== 'off') {
+        this.enterWalk();
+      }
     });
+    $('whExit').addEventListener('click', () => this.exitWalk());
     document.addEventListener('keydown', (e) => {
       const el = e.target as HTMLElement;
       const interactive =
@@ -308,7 +318,10 @@ export class App {
         e.preventDefault();
         this.setPlaying(!this.playing);
       }
-      if (e.key === 'Escape') this.hideTip();
+      if (e.key === 'Escape') {
+        this.hideTip();
+        if (this.view.walking) this.exitWalk();
+      }
     });
   }
 
@@ -328,6 +341,7 @@ export class App {
     ($('congestion') as HTMLInputElement).checked = s.congestion;
     ($('rain') as HTMLInputElement).checked = s.rain;
     ($('rate') as HTMLSelectElement).value = String(s.rate);
+    ($('walkView') as HTMLSelectElement).value = s.walkView;
     ($('labels') as HTMLInputElement).checked = s.labels;
     ($('exag') as HTMLInputElement).value = String(s.exag);
     $('exagOut').textContent = `×${s.exag}`;
@@ -372,6 +386,7 @@ export class App {
       this.setResultsHtml(`<div class="empty">出発と到着に同じホームが含まれています。別のホームか駅を選んでください。</div>`);
       this.setStepsHtml('');
       this.view.setRoutes([]);
+      this.syncWalkUi();
       this.updateFloorsForRoute();
       this.updateClock();
       return;
@@ -399,6 +414,7 @@ export class App {
     }
     this.state.selected = Math.max(0, Math.min(sel, routes.length - 1));
     this.view.setRoutes(routes, this.state.selected);
+    if (!this.view.walking) this.syncWalkUi();
     if (!this.current()) this.setPlaying(false);
     if (refocus) {
       this.t = 0;
@@ -422,6 +438,9 @@ export class App {
     this.view.selectRoute(i);
     this.t = 0;
     this.view.setWalkerTime(0);
+    // A different route ends the current walk; keep walking the new one if playback is running.
+    if (this.playing) this.enterWalk();
+    this.syncWalkUi();
     this.renderResults();
     this.renderSteps();
     this.updateFloorsForRoute();
@@ -444,6 +463,7 @@ export class App {
     el.querySelectorAll<HTMLButtonElement>('[data-route]').forEach((b) =>
       b.addEventListener('click', () => this.selectRoute(Number(b.dataset.route))),
     );
+    el.querySelector<HTMLButtonElement>('[data-walk]')?.addEventListener('click', () => this.startWalk());
     if (focused !== null) el.querySelector<HTMLButtonElement>(`[data-route="${focused}"]`)?.focus();
   }
 
@@ -531,8 +551,9 @@ export class App {
         ? `<div class="hint"><span class="hint-icon">乗</span><div>おすすめ乗車位置：<b>${escapeHtml(r0.boardingNode.name)}</b><br><span style="color:var(--ink-3)">この位置で降りると乗換が最短になります</span></div></div>`
         : '';
 
+    const walkCta = `<button type="button" class="walk-cta" data-walk="1"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M7 5v14l12-7z" fill="currentColor"/></svg>このルートを3Dで歩く</button>`;
     this.setResultsHtml(
-      `<div class="route-head"><span>${escapeHtml(fromSt?.nameJa ?? '')} <span class="lvl">${r0.boardingNode.level}</span> → ${escapeHtml(toSt?.nameJa ?? '')} <span class="lvl">${r0.alightNode.level}</span></span><span>${escapeHtml(r0.levels.map(lvlName).join('→'))}</span></div>${cards}${boardHint}`,
+      `<div class="route-head"><span>${escapeHtml(fromSt?.nameJa ?? '')} <span class="lvl">${r0.boardingNode.level}</span> → ${escapeHtml(toSt?.nameJa ?? '')} <span class="lvl">${r0.alightNode.level}</span></span><span>${escapeHtml(r0.levels.map(lvlName).join('→'))}</span></div>${cards}${walkCta}${boardHint}`,
     );
   }
 
@@ -689,8 +710,73 @@ export class App {
     const r = this.current();
     if (on && r && this.t >= r.timeS - 0.1) this.t = 0;
     this.playing = on && !!r;
+    // Playing a route walks it in 3D unless the viewer chose to stay in the overview.
+    if (this.playing && this.state.walkView !== 'off' && !this.view.walking) this.enterWalk();
     $('playIcon').setAttribute('d', this.playing ? 'M7 5h4v14H7zM13 5h4v14h-4z' : 'M7 5v14l12-7z');
     $('play').setAttribute('aria-label', this.playing ? '一時停止' : '再生');
+  }
+
+  /** Starts the walk-through from the beginning of the selected route. */
+  private startWalk(): void {
+    if (!this.current()) return;
+    if (this.state.walkView === 'off') {
+      this.state.walkView = 'chase';
+      ($('walkView') as HTMLSelectElement).value = 'chase';
+      this.saveState();
+    }
+    this.hideTip();
+    this.t = 0;
+    this.view.setWalkerTime(0);
+    this.setPlaying(true);
+    this.updateClock();
+  }
+
+  private enterWalk(): void {
+    if (!this.current() || this.state.walkView === 'off') return;
+    const wasWalking = !!this.view.walking;
+    this.view.enterWalk(this.state.walkView);
+    this.syncWalkUi();
+    // On phones the 3D view sits above the panel: bring it into view when the walk starts.
+    if (!wasWalking && matchMedia('(max-width: 760px)').matches) {
+      $('stage').scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+    }
+  }
+
+  private exitWalk(): void {
+    this.view.exitWalk();
+    this.syncWalkUi();
+  }
+
+  /** Shows the walk HUD / hides overview controls to match the view's walk state. */
+  private syncWalkUi(): void {
+    const walking = !!this.view.walking;
+    $('walkHud').hidden = !walking;
+    $('stage').classList.toggle('is-walking', walking);
+    ($('exag') as HTMLInputElement).disabled = walking;
+    if (!walking) document.querySelectorAll('.floor').forEach((b) => b.classList.remove('is-current'));
+    this.updateClock();
+  }
+
+  /** Walk HUD: current and next instruction, level and what remains. */
+  private updateWalkHud(idx: number): void {
+    const r = this.current();
+    if (!r || !this.view.walking) return;
+    const ins = r.instructions[idx];
+    const next = r.instructions.slice(idx + 1).find((x) => x.kind !== 'walk' || x.distM > 25);
+    const arrived = this.t >= r.timeS - 0.1;
+    $('whIcon').innerHTML = ICONS[arrived ? 'arrive' : ins.kind];
+    ($('whIcon') as HTMLElement).style.setProperty('--k', KIND_CSS[arrived ? 'arrive' : ins.kind]);
+    $('whNow').textContent = arrived ? `到着：${r.instructions[r.instructions.length - 1].text}` : ins.text;
+    $('whNext').textContent = arrived ? 'もう一度歩くには ▶ を押してください' : next ? `次：${next.text}` : '';
+    const lvl = this.g.net.levels.find((l) => l.id === ins.level);
+    $('whLevel').innerHTML = `<b>${escapeHtml(ins.level)}</b><span>${escapeHtml(lvl?.nameJa ?? '')}</span>`;
+    // Remaining distance: later instructions plus the unfinished part of the current one.
+    let acc = 0;
+    for (let i = 0; i < idx; i++) acc += r.instructions[i].timeS;
+    const frac = ins.timeS > 0 ? Math.min(1, Math.max(0, (this.t - acc) / ins.timeS)) : 1;
+    const remainM = r.instructions.slice(idx + 1).reduce((s, x) => s + x.distM, 0) + ins.distM * (1 - frac);
+    $('whRemain').textContent = arrived ? `所要 ${jpDuration(r.timeS)}・${meters(r.distM)}` : `残り 約${meters(remainM)}・${jpDuration(r.timeS - this.t)}`;
+    document.querySelectorAll<HTMLButtonElement>('.floor').forEach((b) => b.classList.toggle('is-current', b.dataset.level === ins.level));
   }
 
   /** Updates the clock, scrubber and current-step highlight; `forceIdx` pins the highlighted step. */
@@ -717,6 +803,7 @@ export class App {
     const ins = r.instructions[idx];
     $('scrubNow').textContent = ins ? `${ins.level}｜${ins.text}` : '';
     document.querySelectorAll('.step').forEach((li, i) => li.classList.toggle('is-now', i === idx));
+    this.updateWalkHud(idx);
   }
 
   private loop(): void {

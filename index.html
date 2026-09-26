@@ -137,11 +137,32 @@
           <span class="clock" id="clock">0:00 / 0:00</span>
           <select id="rate" aria-label="再生速度">
             <option value="1">×1</option>
-            <option value="4">×4</option>
-            <option value="10" selected>×10</option>
+            <option value="2">×2</option>
+            <option value="4" selected>×4</option>
+            <option value="10">×10</option>
             <option value="30">×30</option>
           </select>
-          <label class="hud-check" for="follow"><input type="checkbox" id="follow" /> 追従</label>
+          <select id="walkView" aria-label="再生時の視点">
+            <option value="chase">歩行者視点</option>
+            <option value="first">一人称</option>
+            <option value="orbit">俯瞰で追従</option>
+            <option value="off">全体表示のまま</option>
+          </select>
+        </div>
+
+        <div class="walkhud" id="walkHud" hidden>
+          <div class="walkhud-main">
+            <span class="walkhud-icon" id="whIcon" aria-hidden="true"></span>
+            <div class="walkhud-text">
+              <div class="walkhud-now" id="whNow"></div>
+              <div class="walkhud-next" id="whNext"></div>
+            </div>
+            <div class="walkhud-level" id="whLevel"></div>
+          </div>
+          <div class="walkhud-bar">
+            <span id="whRemain"></span>
+            <button type="button" id="whExit">全体表示に戻る</button>
+          </div>
         </div>
 
         <div class="legend" id="legend"></div>
