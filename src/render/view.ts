@@ -6,7 +6,7 @@ import { sampleKeyframes } from '../core/keyframes';
 import type { Keyframe, RouteSummary } from '../core/planner';
 import type { NetNode, Platform } from '../core/types';
 import { heatColor, KIND_COLORS, readPalette, type ScenePalette } from './palette';
-import { angleDelta, buildGuideLine, buildTrain, buildWalkway, headingBetween } from './walkway';
+import { angleDelta, buildGuideLine, buildTrain, buildWalkway, disposeWalkway, headingBetween, updateWalkway, type WalkCut } from './walkway';
 
 export interface ViewEvents {
   /** x, y are relative to the view container. */
@@ -76,6 +76,7 @@ export class UmedaView {
   private miniCam = new THREE.OrthographicCamera(-160, 160, 160, -160, 1, 6000);
   private miniMarker: THREE.Mesh;
   private miniFrame: HTMLDivElement;
+  private walkCut: WalkCut = { eye: new THREE.Vector3(), target: new THREE.Vector3() };
 
   constructor(container: HTMLElement, g: Graph, events: ViewEvents = {}) {
     this.container = container;
@@ -178,17 +179,15 @@ export class UmedaView {
   private buildWalkScene(): void {
     if (this.walkGroup) {
       this.scene.remove(this.walkGroup);
-      this.walkGroup.traverse((o) => {
-        const m = o as THREE.Mesh;
-        m.geometry?.dispose?.();
-        (m.material as THREE.Material | undefined)?.dispose?.();
-      });
+      disposeWalkway(this.walkGroup);
     }
+    const sel = this.routes[this.selected];
     this.walkGroup = buildWalkway(this.g, {
       Y: (y) => this.Y(y),
       ex: this.exaggeration,
       dark: this.palette.dark,
       levelVisible: (l) => this.levelVisible(l),
+      routeEdges: new Set(sel ? sel.path.steps.map((st) => this.g.edges[st.edge].id) : []),
     });
     this.scene.add(this.walkGroup);
 
@@ -257,6 +256,7 @@ export class UmedaView {
     this.walkView = null;
     if (this.walkGroup) {
       this.scene.remove(this.walkGroup);
+      disposeWalkway(this.walkGroup);
       this.walkGroup = null;
     }
     this.clearGroup(this.trainGroup);
@@ -493,6 +493,8 @@ export class UmedaView {
       const mat = new THREE.MeshLambertMaterial({ color, emissive: color, emissiveIntensity: 0.15 });
       const mesh = new THREE.Mesh(geo, mat);
       mesh.position.set((ax + bx) / 2, this.Y(pl.y) - 0.6, (az + bz) / 2);
+      // While walking, walkway.ts draws the platform slabs (with the stair wells cut out).
+      mesh.visible = !this.walkView;
       mesh.rotation.y = -Math.atan2(bz - az, bx - ax);
       mesh.userData = { platformId: pl.id, baseEmissive: 0.15 };
       this.staticGroup.add(mesh);
@@ -552,7 +554,7 @@ export class UmedaView {
       const n = g.nodes[g.nodeIndex.get(id) as number];
       if (this.levelVisible(n.level)) markers.push({ n, color: KIND_COLORS.elevator, size: 1.6 });
     }
-    if (markers.length) {
+    if (markers.length && !this.walkView) {
       const inst = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshLambertMaterial(), markers.length);
       const m4 = new THREE.Matrix4();
       markers.forEach((mk, i) => {
@@ -1002,6 +1004,12 @@ export class UmedaView {
       if (a.t >= 1) this.camAnim = null;
     } else if (this.walkView) {
       this.updateWalkCamera(dt);
+    }
+    if (this.walkGroup) {
+      // Cut away whatever stands between the following camera and the walker.
+      this.walkCut.eye.copy(this.camera.position);
+      this.walkCut.target.copy(this.walker.position).y += 1.2;
+      updateWalkway(this.walkGroup, dt, this.walkView === 'first' ? null : this.walkCut);
     }
     // Minor labels only when the camera is close enough to read them.
     const camPos = this.camera.position;
