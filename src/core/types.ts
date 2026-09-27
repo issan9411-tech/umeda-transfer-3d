@@ -128,13 +128,50 @@ export interface Footprint {
   y0: number;
   y1: number;
   kind: 'station' | 'building' | 'mall' | 'deck';
+  /** Inner rings (courtyards), clockwise when `poly` is counter-clockwise. */
+  holes?: [number, number][][];
+  /**
+   * Massing of mapped buildings (OSM building:part), real metres: when present these replace
+   * the outline for the 3D volume; the outline still marks the plot.
+   */
+  parts?: FootprintPart[];
+  /** Height not in the source data (no height or storey count): estimated. */
+  estimated?: boolean;
+  /** Where the outline comes from, e.g. 'osm' (OpenStreetMap via Overture Maps). */
+  source?: string;
+  /** Mapped building use (OSM building class), e.g. 'commercial', 'residential', 'roof' (a canopy). */
+  use?: string;
+  /** A helicopter landing pad is mapped on the roof. */
+  helipad?: boolean;
 }
+
+export interface FootprintPart {
+  poly: [number, number][];
+  holes?: [number, number][][];
+  /** Bottom and top elevation (real metres). */
+  y0: number;
+  y1: number;
+  estimated?: boolean;
+}
+
+export type RoadClass = 'trunk' | 'primary' | 'secondary' | 'tertiary' | 'unclassified' | 'residential' | 'service';
 
 export interface Road {
   id: string;
   nameJa: string;
   points: [number, number][];
+  /** Carriageway width (kerb to kerb). */
   width: number;
+  /** Road class (OSM highway=*); hand-placed roads leave it out. */
+  cls?: RoadClass;
+  /** One-way carriageway: traffic runs from the first point to the last. */
+  oneway?: boolean;
+  /** Mapped crosswalks on this carriageway: [x0, z0, x1, z1, width] (the walking line, kerb to kerb). */
+  crosswalks?: [number, number, number, number, number][];
+  /** Buses and taxis wait along it (bus terminal / taxi rank). */
+  terminal?: boolean;
+  /** Where the centreline comes from, e.g. 'osm'. */
+  source?: string;
 }
 
 export interface Network {
