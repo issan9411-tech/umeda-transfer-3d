@@ -7,9 +7,10 @@ import {
   boxCorners,
   FACADE_STYLES,
   fadeTarget,
+  flightWells,
   gondolaOffset,
-  groundCells,
-  groundOpenings,
+  groundPieces,
+  inflateConvex,
   junctionStations,
   lanesPerDirection,
   layoutParts,
@@ -17,13 +18,19 @@ import {
   placeStreetFurniture,
   PODIUM_TOP,
   pointAt,
+  polyBox,
+  portalFrames,
   realHeight,
   rng,
   sceneHeight,
   segmentNearPoint,
+  slabHoles,
   streetPiercing,
   sidewalkWidth,
   stepTraffic,
+  subtractAll,
+  wallOpenings,
+  wallPanels,
   WHEEL_GONDOLAS,
   WHEEL_PERIOD_S,
   type BuildingSpec,
@@ -33,8 +40,12 @@ import {
   type PartSpec,
   type RoadInfo,
   type Vehicle,
+  type WallRect,
 } from './city-layout';
 import { acquireCityTextures, FACADE_TILE, releaseCityTextures } from './city-textures';
+import { CLEARANCE, clipConvex, corridorWidth, insideConvex, WalkSpace, type WalkPiece } from './walk-space';
+import { ceilingHeight } from './walkway';
+import type { P2 } from './walkway-util';
 
 /**
  * City context around the station: building massing at real heights with curtain-wall
@@ -137,6 +148,19 @@ class Geo {
         const [px, py, pz] = pts[k];
         this.vert(px, py, pz, 0, up ? 1 : -1, 0, px * uvScale, -pz * uvScale, c, b);
       }
+    }
+  }
+
+  /** Horizontal convex polygon fanned from its first vertex (n − 2 triangles), facing up or down. */
+  poly(ring: P2[], y: number, c: THREE.Color, b = 0, up = true, uvScale = 0): void {
+    const [x0, z0] = ring[0];
+    for (let i = 1; i < ring.length - 1; i++) {
+      const [x1, z1] = ring[i];
+      const [x2, z2] = ring[i + 1];
+      const cross = (x1 - x0) * (z2 - z0) - (z1 - z0) * (x2 - x0);
+      if (Math.abs(cross) < 1e-9) continue;
+      const pts = (cross < 0) === up ? [ring[0], ring[i], ring[i + 1]] : [ring[0], ring[i + 1], ring[i]];
+      for (const [px, pz] of pts) this.vert(px, y, pz, 0, up ? 1 : -1, 0, px * uvScale, -pz * uvScale, c, b);
     }
   }
 
@@ -282,9 +306,45 @@ export function buildCity(net: Network, opts: CityOptions): City {
   const uReveal = { value: new THREE.Vector4(0, 0, 0, 0) };
   const buildings: BuildingRec[] = [];
 
+  // ------------------------------------------------------------ walkable space
+  // Where people walk (walk-space.ts, real metres; the network's scene y is real y × ex):
+  // facades get entrance portals, slabs and the street surface get openings, and street
+  // furniture keeps off it, so the walker and the crowd never pass through anything solid.
+  const space = WalkSpace.of(net);
+  const wells = flightWells(net);
+  const edgeById = new Map(net.edges.map((e) => [e.id, e]));
+  // Ceiling height of the enclosed corridors meeting at each junction (their portals match it).
+  const junctionCeil = new Map<string, number>();
+  for (const e of net.edges) {
+    if (!e.indoor || (e.kind !== 'walk' && e.kind !== 'gate')) continue;
+    const h = ceilingHeight(corridorWidth(e));
+    for (const id of [`node:${e.a}`, `node:${e.b}`]) junctionCeil.set(id, Math.max(junctionCeil.get(id) ?? 0, h));
+  }
+  /** Height (real m above the floor) a portal for this piece is opened to: its ceiling, or head room. */
+  const headRoom = (p: WalkPiece): number => {
+    if (p.kind === 'shaft') return p.clear;
+    const e = edgeById.get(p.id);
+    const ceil = p.kind === 'junction' ? (junctionCeil.get(p.id) ?? 0) : e && e.indoor && (e.kind === 'walk' || e.kind === 'gate') ? ceilingHeight(corridorWidth(e)) : p.kind === 'flight' && e?.indoor ? 3 : 0;
+    return Math.max(CLEARANCE + 0.4, ceil + 0.3);
+  };
+  /** Does a box (scene units, yawed about y) reach into walkable space? Tested on its plan bounds. */
+  const boxInWalk = (cx: number, cy: number, cz: number, sx: number, sy: number, sz: number, yaw: number): boolean => {
+    const c = Math.abs(Math.cos(yaw));
+    const s = Math.abs(Math.sin(yaw));
+    // Box local x/z rotated by yaw about y: plan half extents.
+    const hx = (sx / 2) * c + (sz / 2) * s;
+    const hz = (sx / 2) * s + (sz / 2) * c;
+    return space.intersectsBox(cx - hx, cx + hx, (cy - sy / 2) / ex, (cy + sy / 2) / ex, cz - hz, cz + hz);
+  };
+
   // ------------------------------------------------------------ buildings
   const walls = new Map<FacadeStyle, Geo>(FACADE_STYLES.map((s) => [s, new Geo()]));
   const roofs = new Geo();
+  const frameC = col('#4a4f55');
+  /** Rooftop / canopy box, left out where it would reach into walkable space. */
+  const solidBox = (cx: number, cy: number, cz: number, sx: number, sy: number, sz: number, yaw: number, c: THREE.Color, bid: number) => {
+    if (!boxInWalk(cx, cy, cz, sx, sy, sz, yaw)) roofs.box(cx, cy, cz, sx, sy, sz, yaw, c, bid);
+  };
   const beacons: THREE.Vector3[] = [];
   let wheelSpec: { hub: THREE.Vector3; ax: THREE.Vector3; along: THREE.Vector3; radius: number; bid: number } | null = null;
   const R = rng(42);
@@ -342,17 +402,60 @@ export function buildCity(net: Network, opts: CityOptions): City {
       n[2] = pz * sgn;
       const u0 = s / tw + uOff;
       const u1 = (s + len) / tw + uOff;
+      // Entrance portals wherever a corridor, deck or flight runs through this facade.
+      const holes = wallOpenings(space, x0, z0, x1, z1, b.y0, b.y1, ex, headRoom);
       for (let k = 0; k < ys.length - 1; k++) {
         const ya = ys[k];
         const yb = ys[k + 1];
         const va = realHeight(ya, ex) / th + vOff;
         const vb = realHeight(yb, ex) / th + vOff;
-        geo.quad([[x0, ya, z0], [x1, ya, z1], [x1, yb, z1], [x0, yb, z0]], n, tint, bid, [[u0, va], [u1, va], [u1, vb], [u0, vb]]);
+        for (const r of wallPanels(holes, ya, yb)) {
+          const ua = u0 + (u1 - u0) * r.t0;
+          const ub = u0 + (u1 - u0) * r.t1;
+          const v0 = va + ((vb - va) * (r.y0 - ya)) / (yb - ya);
+          const v1 = va + ((vb - va) * (r.y1 - ya)) / (yb - ya);
+          const ax = x0 + (x1 - x0) * r.t0;
+          const az = z0 + (z1 - z0) * r.t0;
+          const bx = x0 + (x1 - x0) * r.t1;
+          const bz = z0 + (z1 - z0) * r.t1;
+          geo.quad([[ax, r.y0, az], [bx, r.y0, bz], [bx, r.y1, bz], [ax, r.y1, az]], n, tint, bid, [[ua, v0], [ub, v0], [ub, v1], [ua, v1]]);
+        }
       }
+      addPortalFrames(holes, x0, z0, x1, z1, n, b.y1, bid);
       s += len;
     }
     if (b.y0 < 0.01 && p.roof !== 'none' && realHeight(b.y1, ex) > 12) addStreetFront(b, cs, bid);
     addRoof(b, p, bid);
+  }
+
+  /**
+   * A dark steel frame around each group of openings in a wall: a lintel over it (where the
+   * wall continues above) and a jamb at either side, standing proud of the facade and the
+   * shop-window band. Pieces that would reach into walkable space are left out.
+   */
+  function addPortalFrames(holes: WallRect[], x0: number, z0: number, x1: number, z1: number, n: [number, number, number], top: number, bid: number): void {
+    if (!holes.length) return;
+    const len = Math.hypot(x1 - x0, z1 - z0);
+    const yaw = Math.atan2(x1 - x0, z1 - z0);
+    const jw = 0.35;
+    const depth = 0.6;
+    const at = (t: number, off: number): [number, number] => [x0 + (x1 - x0) * t + n[0] * off, z0 + (z1 - z0) * t + n[2] * off];
+    for (const f of portalFrames(holes, 0.8 / len)) {
+      const lt = Math.min(0.55 * ex, top - f.y1);
+      const tA = Math.max(0, f.t0 - jw / len);
+      const tB = Math.min(1, f.t1 + jw / len);
+      if (top - f.y1 > 0.1) {
+        const [mx, mz] = at((tA + tB) / 2, 0.1);
+        const ly = f.y1 + lt / 2;
+        if (!boxInWalk(mx, ly, mz, depth, lt, (tB - tA) * len, yaw)) roofs.box(mx, ly, mz, depth, lt, (tB - tA) * len, yaw, frameC, bid);
+      }
+      for (const [t, edge] of [[f.t0 - jw / (2 * len), f.t0], [f.t1 + jw / (2 * len), f.t1]] as const) {
+        if (edge < 1e-3 || edge > 1 - 1e-3) continue;
+        const [jx, jz] = at(t, 0.1);
+        const jy = (f.y0 + f.y1) / 2;
+        if (!boxInWalk(jx, jy, jz, depth, f.y1 - f.y0, jw, yaw)) roofs.box(jx, jy, jz, depth, f.y1 - f.y0, jw, yaw, frameC, bid);
+      }
+    }
   }
 
   /**
@@ -376,13 +479,38 @@ export function buildCity(net: Network, opts: CityOptions): City {
         nz = -nz;
       }
       const o = 0.12;
-      const q = [[x0 + nx * o, 0, z0 + nz * o], [x1 + nx * o, 0, z1 + nz * o], [x1 + nx * o, top, z1 + nz * o], [x0 + nx * o, top, z0 + nz * o]];
+      const ax = x0 + nx * o;
+      const az = z0 + nz * o;
+      const bx = x1 + nx * o;
+      const bz = z1 + nz * o;
       const u1 = len / (tile.bay * tile.bays);
-      geo.quad(q, [nx, 0, nz], glassTint, bid, [[0, 0.02], [u1, 0.02], [u1, 0.13], [0, 0.13]]);
-      // Canopy: a thin slab projecting 1.8 m over the pavement.
-      const mx = (x0 + x1) / 2 + nx * 0.9;
-      const mz = (z0 + z1) / 2 + nz * 0.9;
-      roofs.box(mx, top + 0.25, mz, 1.8, 0.35, len, Math.atan2(x1 - x0, z1 - z0), canopyC, bid);
+      // Shop windows, open where the facade has a portal.
+      for (const r of wallPanels(wallOpenings(space, ax, az, bx, bz, 0, top, ex, headRoom), 0, top)) {
+        const pa = [ax + (bx - ax) * r.t0, az + (bz - az) * r.t0];
+        const pb = [ax + (bx - ax) * r.t1, az + (bz - az) * r.t1];
+        const v0 = 0.02 + (0.11 * r.y0) / top;
+        const v1 = 0.02 + (0.11 * r.y1) / top;
+        geo.quad([[pa[0], r.y0, pa[1]], [pb[0], r.y0, pb[1]], [pb[0], r.y1, pb[1]], [pa[0], r.y1, pa[1]]], [nx, 0, nz], glassTint, bid, [[u1 * r.t0, v0], [u1 * r.t1, v0], [u1 * r.t1, v1], [u1 * r.t0, v1]]);
+      }
+      // Canopy: a thin slab projecting 1.8 m over the pavement, broken where a walkway (a flight
+      // up to a deck, say) passes through it.
+      const cy0 = (top + 0.075) / ex;
+      const cy1 = (top + 0.425) / ex;
+      const blockedAt: [number, number][] = [];
+      for (const off of [0.05, 0.9, 1.75]) blockedAt.push(...space.blocked(x0 + nx * off, z0 + nz * off, x1 + nx * off, z1 + nz * off, cy0, cy1));
+      blockedAt.sort((p, q) => p[0] - q[0]);
+      let t = 0;
+      const yaw = Math.atan2(x1 - x0, z1 - z0);
+      const piece = (ta: number, tb: number) => {
+        if ((tb - ta) * len < 0.6) return;
+        const tm = (ta + tb) / 2;
+        roofs.box(x0 + (x1 - x0) * tm + nx * 0.9, top + 0.25, z0 + (z1 - z0) * tm + nz * 0.9, 1.8, 0.35, (tb - ta) * len, yaw, canopyC, bid);
+      };
+      for (const [s0, s1] of blockedAt) {
+        piece(t, s0 - 0.3 / len);
+        t = Math.max(t, s1 + 0.3 / len);
+      }
+      piece(t, 1);
     }
   }
 
@@ -390,7 +518,12 @@ export function buildCity(net: Network, opts: CityOptions): City {
     const roofC = col(p.roof === 'shed' ? '#8e969c' : '#9a9d9f');
     const edge = col('#b9bcbd');
     const cs = boxCorners(b);
-    roofs.fan(b.cx, b.y1, b.cz, cs, roofC, bid, true);
+    // Stair wells (and anything else people walk through) are cut out of the slab.
+    const xs = cs.map((c) => c[0]);
+    const zs = cs.map((c) => c[1]);
+    const holes = slabHoles(space, wells, b.y1 / ex, Math.min(...xs), Math.max(...xs), Math.min(...zs), Math.max(...zs));
+    if (!holes.length) roofs.fan(b.cx, b.y1, b.cz, cs, roofC, bid, true);
+    else for (const piece of subtractAll(cs, holes)) roofs.poly(piece, b.y1, roofC, bid, true);
     const yaw = Math.atan2(b.ux, b.uz);
     const vx = -b.uz;
     const vz = b.ux;
@@ -402,11 +535,11 @@ export function buildCity(net: Network, opts: CityOptions): City {
       // Box local x runs across the footprint (b axis), local z along it (a axis).
       for (const sa of [-1, 1]) {
         const [x, z] = at(sa * (b.hl - 0.25), 0);
-        roofs.box(x, b.y1 + ph / 2, z, b.hw * 2, ph, 0.5, yaw, edge, bid);
+        solidBox(x, b.y1 + ph / 2, z, b.hw * 2, ph, 0.5, yaw, edge, bid);
       }
       for (const sb of [-1, 1]) {
         const [x, z] = at(0, sb * (b.hw - 0.25));
-        roofs.box(x, b.y1 + ph / 2, z, 0.5, ph, b.hl * 2, yaw, edge, bid);
+        solidBox(x, b.y1 + ph / 2, z, 0.5, ph, b.hl * 2, yaw, edge, bid);
       }
     }
     const realTop = realHeight(b.y1, ex);
@@ -421,10 +554,10 @@ export function buildCity(net: Network, opts: CityOptions): City {
         const h = 1.5 + r() * 3.5;
         const [x, z] = at(p.roof === 'heli' ? Math.sign(a || 1) * (b.hl - sx / 2 - 2) : a, w);
         const shade = 0.72 + r() * 0.2;
-        roofs.box(x, b.y1 + h / 2, z, sz, h, sx, yaw, new THREE.Color(shade, shade, shade * 1.02), bid);
+        solidBox(x, b.y1 + h / 2, z, sz, h, sx, yaw, new THREE.Color(shade, shade, shade * 1.02), bid);
       }
     }
-    if (p.roof === 'heli' && Math.min(b.hl, b.hw) > 11) {
+    if (p.roof === 'heli' && Math.min(b.hl, b.hw) > 11 && !holes.length) {
       // Emergency helicopter space: dark pad, white circle and "H" (as on Japanese high-rises).
       const rad = Math.min(b.hl, b.hw) * 0.62;
       const ring: [number, number][] = [];
@@ -449,14 +582,19 @@ export function buildCity(net: Network, opts: CityOptions): City {
       const light = col('#c9d6dc');
       for (const w of [-0.33, 0, 0.33]) {
         const [x, z] = at(0, w * b.hw * 2);
-        roofs.box(x, b.y1 + 0.3, z, 6, 0.6, b.hl * 1.9, yaw, light, bid);
+        solidBox(x, b.y1 + 0.3, z, 6, 0.6, b.hl * 1.9, yaw, light, bid);
       }
       const colC = col('#7d858b');
       const base = sceneHeight(10.4, ex);
       for (let a = -b.hl + 8; a <= b.hl - 8; a += 24) {
         for (const w of [-1, 1]) {
-          const [x, z] = at(a, w * (b.hw - 1));
-          roofs.box(x, (base + b.y0) / 2, z, 0.9, b.y0 - base, 0.9, yaw, colC, bid);
+          // A column that would stand on a walking line moves along the row (or is left out).
+          for (const da of [0, 3, -3, 6, -6]) {
+            const [x, z] = at(a + da, w * (b.hw - 1));
+            if (boxInWalk(x, (base + b.y0) / 2, z, 0.9, b.y0 - base, 0.9, yaw)) continue;
+            roofs.box(x, (base + b.y0) / 2, z, 0.9, b.y0 - base, 0.9, yaw, colC, bid);
+            break;
+          }
         }
       }
     }
@@ -514,6 +652,10 @@ export function buildCity(net: Network, opts: CityOptions): City {
           shininess: style === 'curtain' ? 70 : 20,
           transparent: pass === 'ghost',
           depthWrite: pass === 'solid',
+          // Solid buildings are seen into through their entrance portals: show the far walls'
+          // inner faces rather than the sky behind a hollow box (shadows cast as before).
+          side: pass === 'solid' ? THREE.DoubleSide : THREE.FrontSide,
+          shadowSide: THREE.BackSide,
         }),
       );
       patchFade(m, uFade, pass);
@@ -528,7 +670,15 @@ export function buildCity(net: Network, opts: CityOptions): City {
   if (roofs.count) {
     const g = own(roofs.build());
     for (const pass of ['solid', 'ghost'] as const) {
-      const m = own(new THREE.MeshLambertMaterial({ vertexColors: true, transparent: pass === 'ghost', depthWrite: pass === 'solid' }));
+      const m = own(
+        new THREE.MeshLambertMaterial({
+          vertexColors: true,
+          transparent: pass === 'ghost',
+          depthWrite: pass === 'solid',
+          side: pass === 'solid' ? THREE.DoubleSide : THREE.FrontSide,
+          shadowSide: THREE.BackSide,
+        }),
+      );
       // Rooftop clutter stacks many faces: when cut away, ghost it harder than the walls.
       patchFade(m, uFade, pass, 0.45);
       roofMats.push(m);
@@ -597,6 +747,24 @@ export function buildCity(net: Network, opts: CityOptions): City {
   let groundMesh: THREE.Mesh | null = null;
   const tmp = { x: 0, z: 0, dx: 1, dz: 0, seg: 0 };
 
+  // Stair wells, lift shafts and underground head room that reach up through street level: every
+  // street surface (asphalt, pavements, markings and, walking, the paved ground) is open there.
+  const nx0 = Math.min(...net.nodes.map((n) => n.x)) - 50;
+  const nx1 = Math.max(...net.nodes.map((n) => n.x)) + 50;
+  const nz0 = Math.min(...net.nodes.map((n) => n.z)) - 50;
+  const nz1 = Math.max(...net.nodes.map((n) => n.z)) + 50;
+  const streetHoles = net.nodes.length ? slabHoles(space, wells, Y_GROUND / ex, nx0, nx1, nz0, nz1) : [];
+  const holeBox = streetHoles.map(polyBox);
+  const holesNear = (x0: number, x1: number, z0: number, z1: number) => streetHoles.filter((_, k) => holeBox[k][0] < x1 && holeBox[k][1] > x0 && holeBox[k][2] < z1 && holeBox[k][3] > z0);
+  /** Horizontal street surface (convex, at scene height y) minus the holes it overlaps. */
+  const surface = (geo: Geo, ring: P2[], y: number, c: THREE.Color, uv = 0) => {
+    const xs = ring.map((q) => q[0]);
+    const zs = ring.map((q) => q[1]);
+    const near = holesNear(Math.min(...xs), Math.max(...xs), Math.min(...zs), Math.max(...zs));
+    if (!near.length) geo.poly(ring, y, c, 0, true, uv);
+    else for (const piece of subtractAll(ring, near)) geo.poly(piece, y, c, 0, true, uv);
+  };
+
   const ribbon = (geo: Geo, info: RoadInfo, s0: number, s1: number, l0: number, l1: number, y: number, c: THREE.Color, uv = 0) => {
     // Quad between arc s0..s1 and lateral offsets l0..l1 (left of the polyline direction).
     pointAt(info, s0, tmp);
@@ -608,9 +776,8 @@ export function buildCity(net: Network, opts: CityOptions): City {
     const bx = tmp.x;
     const bz = tmp.z;
     // Use the direction at the start for both ends (pieces are short and straight).
-    const P = (x: number, z: number, l: number) => [x + alx * l, y, z + alz * l];
-    const p = [P(ax, az, l0), P(bx, bz, l0), P(bx, bz, l1), P(ax, az, l1)];
-    geo.quad(p, [0, 1, 0], c, 0, uv ? p.map((q) => [q[0] * uv, -q[2] * uv]) : undefined);
+    const P = (x: number, z: number, l: number): P2 => [x + alx * l, z + alz * l];
+    surface(geo, [P(ax, az, l0), P(bx, bz, l0), P(bx, bz, l1), P(ax, az, l1)], y, c, uv);
   };
 
   infos.forEach((info, i) => {
@@ -625,7 +792,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
         const [x, z] = info.pts[k];
         const ring: [number, number][] = [];
         for (let t = 0; t < 20; t++) ring.push([x + Math.cos((t / 20) * Math.PI * 2) * (w / 2), z + Math.sin((t / 20) * Math.PI * 2) * (w / 2)]);
-        asphalt.fan(x, Y_ROAD, z, ring, asphaltC, 0, true, 1 / 7);
+        surface(asphalt, ring, Y_ROAD, asphaltC, 1 / 7);
       }
     }
     const stations = junctionStations(info, junctions);
@@ -654,7 +821,20 @@ export function buildCity(net: Network, opts: CityOptions): City {
           const bz = tmp.z - tmp.dx * l;
           const nx = tmp.dz * side * (l === l0 ? -1 : 1);
           const nz = -tmp.dx * side * (l === l0 ? -1 : 1);
-          walksG.quad([[ax, y0, az], [bx, y0, bz], [bx, Y_WALK, bz], [ax, Y_WALK, az]], [nx, 0, nz], kerbC);
+          // Kerbs stop at a well's edge.
+          let t = 0;
+          const cuts = holesNear(Math.min(ax, bx), Math.max(ax, bx), Math.min(az, bz), Math.max(az, bz))
+            .map((h) => clipConvex(h, ax, az, bx - ax, bz - az))
+            .filter((c): c is [number, number] => c !== null)
+            .sort((p, q) => p[0] - q[0]);
+          for (const [c0, c1] of [...cuts, [1, 1] as [number, number]]) {
+            if (c0 - t > 1e-3) {
+              const p0 = [ax + (bx - ax) * t, az + (bz - az) * t];
+              const p1 = [ax + (bx - ax) * c0, az + (bz - az) * c0];
+              walksG.quad([[p0[0], y0, p0[1]], [p1[0], y0, p1[1]], [p1[0], Y_WALK, p1[1]], [p0[0], Y_WALK, p0[1]]], [nx, 0, nz], kerbC);
+            }
+            t = Math.max(t, c1);
+          }
         }
       }
     }
@@ -714,11 +894,9 @@ export function buildCity(net: Network, opts: CityOptions): City {
       const x = a.x + dx * d;
       const z = a.z + dz * d;
       if (!onOtherRoad(x, z, infos, -1, -0.8)) continue;
-      const p0 = [x - lx * W / 2, Y_MARK + 0.005, z - lz * W / 2];
-      const p1 = [x + lx * W / 2, Y_MARK + 0.005, z + lz * W / 2];
-      const q1 = [p1[0] + dx * 0.45, p1[1], p1[2] + dz * 0.45];
-      const q0 = [p0[0] + dx * 0.45, p0[1], p0[2] + dz * 0.45];
-      marks.quad([p0, p1, q1, q0], [0, 1, 0], white);
+      const p0: P2 = [x - (lx * W) / 2, z - (lz * W) / 2];
+      const p1: P2 = [x + (lx * W) / 2, z + (lz * W) / 2];
+      surface(marks, [p0, p1, [p1[0] + dx * 0.45, p1[1] + dz * 0.45], [p0[0] + dx * 0.45, p0[1] + dz * 0.45]], Y_MARK + 0.005, white);
     }
   }
 
@@ -748,10 +926,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
     const half = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...zs) - Math.min(...zs)) / 2 + 320;
     const ground = new Geo();
     const gc = col('#ffffff');
-    for (const [x0, z0, x1, z1] of groundCells(gx, gz, half, groundOpenings(net.nodes, net.edges))) {
-      const q = [[x0, Y_GROUND, z0], [x1, Y_GROUND, z0], [x1, Y_GROUND, z1], [x0, Y_GROUND, z1]];
-      ground.quad(q, [0, 1, 0], gc, 0, q.map((v) => [v[0] / 3.2, -v[2] / 3.2]));
-    }
+    for (const piece of groundPieces(gx, gz, half, streetHoles)) ground.poly(piece, Y_GROUND, gc, 0, true, 1 / 3.2);
     const groundMat = own(
       new THREE.MeshLambertMaterial({
         color: dark ? 0xa39a8c : 0xd9cfc0,
@@ -771,10 +946,25 @@ export function buildCity(net: Network, opts: CityOptions): City {
 
   // ------------------------------------------------------------ trees and lamps
   const footprintBoxes = buildings.flatMap((b) => b.parts.filter((p) => p.y0 < 1));
-  const blocked = (x: number, z: number) =>
+  /**
+   * Whether a tree or lamp's envelope (scene units, at the largest random size) would reach
+   * into walkable space: trunk / pole, then crown / arm and lamp head. Crowns start above the
+   * head room of street-level walkways (so they may overhang them) but not decks or flights.
+   */
+  const inWalk = (x: number, z: number, what: 'tree' | 'lamp', kind: number): boolean => {
+    const box = (r: number, y0: number, y1: number) => space.intersectsBox(x - r, x + r, y0 / ex, y1 / ex, z - r, z + r);
+    if (what === 'lamp') return box(0.35, 0, 9.1) || box(2.8, 8.4, 9.1);
+    const ginkgo = kind === 1;
+    const [tl, tu] = [(ginkgo ? 4.4 : 3.8) * 0.85, (ginkgo ? 4.4 : 3.8) * 1.15];
+    const [yl, yu] = [(ginkgo ? 4.6 : 3.0) * 0.85, (ginkgo ? 4.6 : 3.0) * 1.15];
+    const crownLow = tl + yl * 0.06;
+    return box(0.35, 0, crownLow) || box((ginkgo ? 2.4 : 3.4) * 1.15 * 1.1, crownLow, tu + yu * 1.9);
+  };
+  const blocked = (x: number, z: number, what: 'tree' | 'lamp', kind: number) =>
     footprintBoxes.some((b) => inBox(x, z, b, 2)) ||
     crossings.some((c) => segDist(x, z, c.a.x, c.a.z, c.b.x, c.b.z) < (c.e.width ?? 8) / 2 + 4) ||
-    net.nodes.some((n) => n.level === '1F' && n.kind !== 'junction' && Math.hypot(n.x - x, n.z - z) < 5);
+    net.nodes.some((n) => n.level === '1F' && n.kind !== 'junction' && Math.hypot(n.x - x, n.z - z) < 5) ||
+    inWalk(x, z, what, kind);
   const { trees, lamps } = placeStreetFurniture(infos, junctions, blocked);
 
   const trunkGeo = own(new THREE.CylinderGeometry(0.16, 0.26, 1, 6).translate(0, 0.5, 0));
@@ -853,12 +1043,26 @@ export function buildCity(net: Network, opts: CityOptions): City {
     const last = info.pts[info.pts.length - 1];
     const phase: 0 | 1 = Math.abs(last[0] - first[0]) > Math.abs(last[1] - first[1]) ? 1 : 0;
     const st = junctionStations(info, junctions);
+    // The network's own crossings: traffic stops short of the zebra on red, and whenever the
+    // walker is on it, so no car ever waits on (or drives through) a walking line.
+    const xs: { s: number; hw: number; c: number }[] = [];
+    crossings.forEach((c, ci) => {
+      const s = crossingOnRoad(info, c.a.x, c.a.z, c.b.x, c.b.z);
+      if (s !== null) xs.push({ s, hw: corridorWidth(c.e) / 2, c: ci });
+    });
     for (const dir of [1, -1] as const) {
       const stops = st.map((j) => j.s - dir * (j.r + 8)).filter((s) => s > 0 && s < info.len);
       if (dir === -1) stops.reverse();
-      for (let k = 0; k < count; k++) lanes.push({ road: ri, dir, lat: dir * (0.4 + (k + 0.5) * 3.25), stops, phase });
+      const holds = xs.map((x) => ({ s: x.s - dir * (x.hw + 2.5), c: x.c })).filter((h) => h.s > 0 && h.s < info.len);
+      for (let k = 0; k < count; k++) lanes.push({ road: ri, dir, lat: dir * (0.4 + (k + 0.5) * 3.25), stops, phase, holds: holds.length ? holds : undefined });
     }
   });
+  // Crossing areas (a little beyond the walkway) and whether the walker is on each.
+  const crossingPolys = crossings.map((c) => {
+    const piece = space.pieces.find((p) => p.id === c.e.id);
+    return piece ? inflateConvex(piece.poly, 1.5) : null;
+  });
+  const held = new Uint8Array(crossings.length);
   const vehicles: Vehicle[] = [];
   const byLane: number[][] = lanes.map(() => []);
   const vr = rng(9);
@@ -875,6 +1079,22 @@ export function buildCity(net: Network, opts: CityOptions): City {
   });
   // Parked buses at the 大阪駅前 bus terminal and a taxi rank opposite.
   const statics: { x: number; z: number; yaw: number; type: 0 | 1; color: string }[] = [];
+  /** Parks a bus / taxi (at the road point in `tmp`) at lateral offset l, or up to 4 m further from the kerb, clear of walkways. */
+  const park = (l: number, yaw: number, type: 0 | 1, color: string) => {
+    const [hl, hw, h] = type === 1 ? [5.6, 1.3, 3.4] : [2.4, 0.9, 1.7];
+    const c = Math.abs(Math.cos(yaw));
+    const sn = Math.abs(Math.sin(yaw));
+    const rx = hl * sn + hw * c;
+    const rz = hl * c + hw * sn;
+    for (let k = 0; k <= 4; k++) {
+      const ll = l - Math.sign(l) * k;
+      const x = tmp.x + tmp.dz * ll;
+      const z = tmp.z - tmp.dx * ll;
+      if (space.intersectsBox(x - rx, x + rx, 0, h / ex, z - rz, z + rz)) continue;
+      statics.push({ x, z, yaw, type, color });
+      return;
+    }
+  };
   const eki = infos.find((i) => i.road.id === 'ekimae');
   if (eki) {
     const w = eki.road.width;
@@ -884,16 +1104,14 @@ export function buildCity(net: Network, opts: CityOptions): City {
       pointAt(eki, s, tmp);
       // Keep-left: the station (north) kerb carries eastbound buses, the south kerb westbound taxis.
       const north = -tmp.dx < 0 ? 1 : -1; // sign of "left" (dz, −dx) pointing north
-      const l = north * (w / 2 - 2.2);
       const east = tmp.dx >= 0 ? 1 : -1;
-      statics.push({ x: tmp.x + tmp.dz * l, z: tmp.z - tmp.dx * l, yaw: Math.atan2(tmp.dx * east, tmp.dz * east), type: 1, color: vr() < 0.7 ? '#f0f2f0' : '#e6ecf5' });
+      park(north * (w / 2 - 2.2), Math.atan2(tmp.dx * east, tmp.dz * east), 1, vr() < 0.7 ? '#f0f2f0' : '#e6ecf5');
     }
     for (let s = 120; s < eki.len - 90; s += 5.6) {
       pointAt(eki, s, tmp);
       const north = -tmp.dx < 0 ? 1 : -1;
-      const l = -north * (w / 2 - 2);
       const east = tmp.dx >= 0 ? 1 : -1;
-      statics.push({ x: tmp.x + tmp.dz * l, z: tmp.z - tmp.dx * l, yaw: Math.atan2(-tmp.dx * east, -tmp.dz * east), type: 0, color: vr() < 0.6 ? '#1c1d20' : vr() < 0.5 ? '#f2c230' : '#2f6a4a' });
+      park(-north * (w / 2 - 2), Math.atan2(-tmp.dx * east, -tmp.dz * east), 0, vr() < 0.6 ? '#1c1d20' : vr() < 0.5 ? '#f2c230' : '#2f6a4a');
     }
   }
 
@@ -1091,7 +1309,13 @@ export function buildCity(net: Network, opts: CityOptions): City {
         if (cut) uReveal.value.set(pierce.x, pierce.z, revealR, 0);
         else uReveal.value.z = revealR;
       }
-      stepTraffic(lanes, infos, vehicles, byLane, time, dt);
+      if (walk) {
+        for (let i = 0; i < crossingPolys.length; i++) {
+          const poly = crossingPolys[i];
+          held[i] = poly && focus.y < 4 && focus.y > -2 && insideConvex(poly, focus.x, focus.z) ? 1 : 0;
+        }
+      }
+      stepTraffic(lanes, infos, vehicles, byLane, time, dt, held);
       writeVehicles();
       writeGondolas();
       if (beaconMesh && night) beaconMat.opacity = 0.25 + 0.75 * Math.max(0, Math.sin(time * 3.1));
@@ -1140,6 +1364,24 @@ function segDist(px: number, pz: number, ax: number, az: number, bx: number, bz:
   const l2 = dx * dx + dz * dz || 1;
   const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / l2));
   return Math.hypot(px - ax - dx * t, pz - az - dz * t);
+}
+
+/** Arc position where the segment a→b crosses the road's centre line, or null. */
+function crossingOnRoad(info: RoadInfo, ax: number, az: number, bx: number, bz: number): number | null {
+  const dx = bx - ax;
+  const dz = bz - az;
+  for (let i = 0; i < info.pts.length - 1; i++) {
+    const [px, pz] = info.pts[i];
+    const ex = info.pts[i + 1][0] - px;
+    const ez = info.pts[i + 1][1] - pz;
+    const den = dx * ez - dz * ex;
+    if (Math.abs(den) < 1e-9) continue;
+    // a + t·d = p + u·e
+    const t = ((px - ax) * ez - (pz - az) * ex) / den;
+    const u = ((px - ax) * dz - (pz - az) * dx) / den;
+    if (t >= 0 && t <= 1 && u >= 0 && u <= 1) return info.cum[i] + u * (info.cum[i + 1] - info.cum[i]);
+  }
+  return null;
 }
 
 function inBox(x: number, z: number, b: OBox, margin: number): boolean {
