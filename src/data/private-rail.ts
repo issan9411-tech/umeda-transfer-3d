@@ -99,7 +99,8 @@ export function addHankyu(b: NetBuilder): void {
 
 // ------------------------------------------------------------------------------------------------
 
-const HS_PLAT = -7;
+// Platforms, concourse and gates are all on the B1 floor (a terminus: level walk from the platform heads).
+const HS_PLAT = -6;
 const HS_CONC = -6;
 
 export function addHanshin(b: NetBuilder): void {

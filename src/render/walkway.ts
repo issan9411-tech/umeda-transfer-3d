@@ -768,8 +768,12 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     n = Math.min(24, Math.max(4, n));
     const pitch = 0.9;
     const bodyH = 0.95 * ex;
+    const own = not(e.id, `node:${e.a}`, `node:${e.b}`);
     for (let i = 0; i < n; i++) {
       const lat = (i - (n - 1) / 2) * pitch;
+      // A machine never stands in another walkway that happens to cross the gate line.
+      const q = at(s, lat);
+      if (space.intersectsBox(q.x - 0.4, q.x + 0.4, real(q.y), real(q.y) + 1, q.z - 0.4, q.z + 0.4, own)) continue;
       boxes.add(at(s, lat, bodyH / 2), _s.set(0.22, bodyH, 1.5), yaw, c.gateBody);
       boxes.add(at(s, lat, bodyH + 0.03), _s.set(0.27, 0.06, 1.54), yaw, c.gateTop);
       for (const end of [-1, 1]) {
@@ -934,13 +938,16 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
       const d = dirOf(a);
       const p = perpOf(a).multiplyScalar(a.width / 2);
       const H = a.H * ex;
-      const lo = C.clone().sub(p);
-      const hi = C.clone().add(p);
+      // The end wall (and entrance doors) stand 0.4 m behind the node, so a walker starting or
+      // ending there is inside the corridor, not in the doorway.
+      const back = d.clone().multiplyScalar(-0.4);
+      const lo = C.clone().sub(p).add(back);
+      const hi = C.clone().add(p).add(back);
       vquad(geo.wall, lo, hi, hi.clone().setY(C.y + H), lo.clone().setY(C.y + H), uvRect(0, 0, a.width / TX.WALL_M, 1), d, c.wallStation, not(a.e.id, `node:${id}`));
       if (n.kind === 'entrance') {
         const dw = Math.min(a.width * 0.8, 7);
         const q = perpOf(a).multiplyScalar(dw / 2);
-        const off = d.clone().multiplyScalar(0.05);
+        const off = d.clone().multiplyScalar(0.05).add(back);
         const top = Math.min(3 * ex, H * 0.95);
         const [u0, v0, u1, v1] = TX.cellUV(TX.DOOR_CELL, TX.SHOP_COLS, TX.SHOP_ROWS);
         // Seen from inside (facing -d) the reader's right is +perp.
@@ -1069,7 +1076,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     const skipOwn = (p: WalkPiece) => f.ids.has(p.id) || p.id === `node:${f.hi.id}` || p.id === `node:${f.lo.id}`;
 
     if (f.kind === 'elevator') {
-      addElevator(f.segs[0].e, (s, lat, h = 0) => V(A.x + dir.x * s + left.x * lat, A.y + h, A.z + dir.z * s + left.z * lat), 0, 0, A, B, dir, left);
+      addElevator(f.segs[0].e, A, B, f.lo, f.hi);
       continue;
     }
     for (const sg of f.segs) {
@@ -1258,7 +1265,12 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
       const lat = off + side * 0.62;
       boxes.beam(line(0, off + side * 0.72, 0.12), line(run, off + side * 0.72, 0.12), 0.26, 0.2, c.escDeck);
       geo.glass.quad(line(0, lat, 0.2), line(run, lat, 0.2), line(run, lat, h), line(0, lat, h), uvRect(0, 0, 1, 1), UP);
-      boxes.beam(line(-0.6, lat, h + 0.05), line(run + 0.6, lat, h + 0.05), 0.09, 0.1, c.rail);
+      // Handrails follow the incline, then level off for 0.6 m at each end (newels).
+      const r0 = line(0, lat, h + 0.05);
+      const r1 = line(run, lat, h + 0.05);
+      boxes.beam(r0, r1, 0.09, 0.1, c.rail);
+      boxes.beam(r0.clone().sub(dir.clone().multiplyScalar(0.6)), r0, 0.09, 0.1, c.rail);
+      boxes.beam(r1, r1.clone().add(dir.clone().multiplyScalar(0.6)), 0.09, 0.1, c.rail);
     }
     // Landing plates at both ends.
     const endA = line(0, off).sub(dir.clone().multiplyScalar(0.7));
@@ -1267,48 +1279,73 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     boxes.add(endB.add(V(0, 0.04, 0)), _s.set(1.3, 0.05, 1.4), yaw, c.escDeck);
   }
 
-  function addElevator(
-    e: NetEdge,
-    line: (s: number, lat: number, h?: number) => THREE.Vector3,
-    off: number,
-    run: number,
-    lo: THREE.Vector3,
-    hi: THREE.Vector3,
-    dir: THREE.Vector3,
-    left: THREE.Vector3,
-  ): void {
-    const S = line(run / 2, off);
+  /**
+   * Glass lift shaft around the cabin line (both landings share x, z). Each landing gets a door
+   * opening in the face its walkway leaves through; the doors are drawn open (slid aside).
+   */
+  function addElevator(e: NetEdge, lo: THREE.Vector3, hi: THREE.Vector3, loNode: NetNode, hiNode: NetNode): void {
+    const S = lo;
     const y0 = lo.y;
     const y1 = hi.y;
     const top = y1 + 3.0 * ex;
     const hs = 1.2;
+    // Face directions: the shaft is aligned with its first walkway (else with x).
+    const exitDir = (n: NetNode) => {
+      for (const x of g.edges) {
+        if (x.kind !== 'walk' || (x.a !== n.id && x.b !== n.id)) continue;
+        const o = nodeOf(x.a === n.id ? x.b : x.a);
+        const d = V(o.x - n.x, 0, o.z - n.z);
+        if (d.lengthSq() > 0.01) return d.normalize();
+      }
+      return null;
+    };
+    const dLo = exitDir(loNode);
+    const dHi = exitDir(hiNode);
+    const dir = (dLo ?? dHi ?? V(1, 0, 0)).clone();
+    const left = V(-dir.z, 0, dir.x);
     const yaw = yawOf(dir);
-    const corner = (i: number, j: number, y: number) => S.clone().add(dir.clone().multiplyScalar(i * hs)).add(left.clone().multiplyScalar(j * hs)).setY(y);
-    const sides: [number, number, number, number][] = [
-      [1, 1, 1, -1],
-      [1, -1, -1, -1],
-      [-1, -1, -1, 1],
-      [-1, 1, 1, 1],
-    ];
-    for (const [i0, j0, i1, j1] of sides) {
-      geo.glass.quad(corner(i0, j0, y0 - 0.2), corner(i1, j1, y0 - 0.2), corner(i1, j1, top), corner(i0, j0, top), uvRect(0, 0, 1, 1), UP);
-      boxes.add(corner(i0, j0, (y0 + top) / 2), _s.set(0.14, top - y0 + 0.2, 0.14), yaw, c.frame);
+    const faceOf = (d: THREE.Vector3 | null) => {
+      if (!d) return -1;
+      const fs = [dir, left, dir.clone().negate(), left.clone().negate()];
+      let best = 0;
+      for (let i = 1; i < 4; i++) if (fs[i].dot(d) > fs[best].dot(d)) best = i;
+      return best;
+    };
+    const doorH = 2.2 * ex;
+    const doors: { face: number; y: number }[] = [];
+    if (faceOf(dLo) >= 0) doors.push({ face: faceOf(dLo), y: y0 });
+    if (faceOf(dHi) >= 0) doors.push({ face: faceOf(dHi), y: y1 });
+    const normals = [dir, left, dir.clone().negate(), left.clone().negate()];
+    for (let fi = 0; fi < 4; fi++) {
+      const nrm = normals[fi];
+      const side = V(nrm.z, 0, -nrm.x);
+      const c0 = S.clone().add(nrm.clone().multiplyScalar(hs));
+      const P2_ = (lat: number, y: number) => c0.clone().add(side.clone().multiplyScalar(lat)).setY(y);
+      const glass = (l0: number, l1: number, ya: number, yb: number) => {
+        if (l1 - l0 < 0.02 || yb - ya < 0.02) return;
+        geo.glass.quad(P2_(l0, ya), P2_(l1, ya), P2_(l1, yb), P2_(l0, yb), uvRect(0, 0, 1, 1), nrm);
+      };
+      const here = doors.filter((d) => d.face === fi).sort((p, q) => p.y - q.y);
+      let y = y0 - 0.2;
+      for (const d of here) {
+        glass(-hs, hs, y, d.y);
+        glass(-hs, -0.55, d.y, d.y + doorH);
+        glass(0.55, hs, d.y, d.y + doorH);
+        // Frame posts, lintel and the two door leaves standing open behind the side panels.
+        boxes.add(P2_(-0.6, d.y + doorH / 2), _s.set(0.1, doorH, 0.14), yawOf(nrm), c.frame);
+        boxes.add(P2_(0.6, d.y + doorH / 2), _s.set(0.1, doorH, 0.14), yawOf(nrm), c.frame);
+        boxes.add(P2_(0, d.y + doorH + 0.06), _s.set(1.3, 0.12, 0.14), yawOf(nrm), c.frame);
+        for (const sgn of [-1, 1]) boxes.add(P2_(sgn * 0.88, d.y + doorH / 2).sub(nrm.clone().multiplyScalar(0.08)), _s.set(0.04, doorH * 0.95, 0.6), yawOf(nrm), c.steel);
+        glow.add(P2_(0.85, d.y + 1.0 * ex).add(nrm.clone().multiplyScalar(0.06)), _s.set(0.12, 0.25 * ex, 0.03), yawOf(nrm), c.callPanel);
+        y = d.y + doorH;
+      }
+      glass(-hs, hs, y, top);
+    }
+    for (const [i0, j0] of [[1, 1], [1, -1], [-1, -1], [-1, 1]]) {
+      const corner = S.clone().add(dir.clone().multiplyScalar(i0 * hs)).add(left.clone().multiplyScalar(j0 * hs));
+      boxes.add(corner.setY((y0 + top) / 2), _s.set(0.14, top - y0 + 0.2, 0.14), yaw, c.frame);
     }
     boxes.add(S.clone().setY(top + 0.12), _s.set(2.6, 0.24, 2.6), yaw, c.frame);
-    // Doors at each landing, on the shaft face towards the landing node.
-    for (const [land, y] of [[lo, y0], [hi, y1]] as const) {
-      const f = land.clone().sub(S).setY(0);
-      if (f.lengthSq() < 0.25) f.copy(land === lo ? dir.clone().negate() : dir);
-      f.normalize();
-      const side = V(f.z, 0, -f.x);
-      const fyaw = yawOf(f);
-      const dc = S.clone().add(f.clone().multiplyScalar(hs + 0.02));
-      boxes.add(dc.clone().setY(y + 1.15 * ex), _s.set(1.5, 2.3 * ex, 0.12), fyaw, c.frame);
-      for (const sgn of [-1, 1]) {
-        boxes.add(dc.clone().add(f.clone().multiplyScalar(0.07)).add(side.clone().multiplyScalar(sgn * 0.31)).setY(y + 1.05 * ex), _s.set(0.6, 2.1 * ex, 0.04), fyaw, c.steel);
-      }
-      glow.add(dc.clone().add(f.clone().multiplyScalar(0.08)).add(side.clone().multiplyScalar(0.95)).setY(y + 1.0 * ex), _s.set(0.12, 0.25 * ex, 0.03), fyaw, c.callPanel);
-    }
     // Moving cabin (animated in updateWalkway).
     const ch = 2.4 * ex;
     cabins.add(S.clone().setY(y0 + ch / 2), _s.set(2.1, ch, 2.1), yaw, c.steel);

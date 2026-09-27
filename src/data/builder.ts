@@ -323,13 +323,27 @@ export class NetBuilder {
     const na = this.get(v.a);
     const nb = this.get(v.b);
     const [L, U] = na.y <= nb.y ? [na, nb] : [nb, na];
-    const rise = U.y - L.y;
     // A few steps (or a ramp) between nearly level nodes: keep the direct link.
-    if (rise < 1.2) {
+    if (U.y - L.y < 1.2) {
       for (const m of v.modes) this.edge(m.kind, v.a, v.b, { ...m.o, dir: m.dir });
       return;
     }
-    const f = this.bundleFrame(L, U, v);
+    // Try the natural direction first; if the bundle cannot be placed clear of every corridor,
+    // also try it reversed (and, off platforms, turned by 90°) and keep the best.
+    const f0 = this.bundleFrame(L, U, v, 0);
+    const turns = v.o.bearingUp !== undefined ? [0] : f0.platform ? [0, Math.PI] : [0, Math.PI, Math.PI / 2, -Math.PI / 2];
+    let best = { cost: Infinity, turn: 0 };
+    for (const turn of turns) {
+      const cost = this.placeBundle(L, U, v, this.bundleFrame(L, U, v, turn), true);
+      if (cost < best.cost) best = { cost, turn };
+      if (cost === 0) break;
+    }
+    this.placeBundle(L, U, v, this.bundleFrame(L, U, v, best.turn), false);
+  }
+
+  /** Lays a bundle out in frame f; with `dry` only returns its conflict count. */
+  private placeBundle(L: NetNode, U: NetNode, v: VerticalSpec, f: ReturnType<NetBuilder['bundleFrame']>, dry: boolean): number {
+    const rise = U.y - L.y;
     // Flights first (inner lanes), elevators after them (outer lane / beyond the anchored end).
     const flights = v.modes.map((m, k) => ({ m, k })).filter(({ m }) => m.kind !== 'elevator');
     const lifts = v.modes.map((m, k) => ({ m, k })).filter(({ m }) => m.kind === 'elevator');
@@ -351,8 +365,9 @@ export class NetBuilder {
 
     // Longitudinal extent of each flight: aligned at the anchored end, 1.2 m clear of the node.
     const CLEAR = 1.2;
-    const liftRoom = f.platform && lifts.length ? LANE_WIDTH.elevator + 0.8 : 0;
+    const liftRoom = 0;
     const span = new Map<number, [number, number]>();
+    const shafts: { k: number; s: number; l: number; rect: ORect }[] = [];
     const place = (ds: number, dl: number) => {
       for (const { m, k } of flights) {
         const R = flightRun(m.kind, rise);
@@ -360,6 +375,24 @@ export class NetBuilder {
         span.set(k, [s0, s0 + R]);
       }
       for (const [k, l] of baseLat) lat.set(k, l + dl);
+      shafts.length = 0;
+      lifts.forEach(({ k }, i) => {
+        const h = LANE_WIDTH.elevator / 2;
+        let sc: number;
+        let l: number;
+        if (f.platform) {
+          // On a platform the shaft stands on the flights' line beyond their far end, clear of
+          // the space where people step on and off the flights.
+          const ends = [...span.values()];
+          sc = f.anchor === 'bottom' ? Math.max(...ends.map((e) => e[1])) + 4 + h : Math.min(...ends.map((e) => e[0])) - 4 - h;
+          if (!ends.length) sc = (f.anchor === 'bottom' ? CLEAR + h : f.len - CLEAR - h) + ds;
+          l = center + i * (LANE_WIDTH.elevator + LANE_GAP) + dl;
+        } else {
+          sc = (f.anchor === 'bottom' ? CLEAR + h : f.anchor === 'top' ? f.len - CLEAR - h : f.len / 2) + ds;
+          l = lat.get(k) as number;
+        }
+        shafts.push({ k, s: sc, l, rect: rectFromFrame(f.o, f.u, sc - h, sc + h, l - h, l + h) });
+      });
     };
     const baseLat = new Map(lat);
     const lowPart = (k: number, m: VerticalMode): ORect => {
@@ -400,6 +433,11 @@ export class NetBuilder {
           const w = well(k, m);
           for (const o of others) if (rectsOverlap(w, o.rect)) c++;
         }
+        for (const sh of shafts) {
+          const r = inflate(sh.rect, 0.5);
+          for (const ln of lines) if (segmentHitsRect(r, ln.a, ln.b)) c++;
+          for (const o of others) if (rectsOverlap(sh.rect, o.rect)) c++;
+        }
         return c;
       };
       const steps = f.anchor === 'top' ? [0, -1, -2, -3, -4, -5, -6, -8, -10, -12, -15, -18, -22] : f.anchor === 'bottom' ? [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 22] : [0, 1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 12, -12];
@@ -416,28 +454,36 @@ export class NetBuilder {
         if (best.c === 0) break;
       }
       place(best.ds, best.dl);
+      if (dry) return best.c;
       for (const { m, k } of flights) this.placedFlights.push({ rect: well(k, m), y0: L.y, y1: U.y });
+      for (const sh of shafts) this.placedFlights.push({ rect: sh.rect, y0: L.y, y1: U.y });
     }
-    const shafts: { k: number; s: number; l: number; rect: ORect }[] = [];
-    lifts.forEach(({ k }, i) => {
-      let s: number;
-      let l: number;
-      if (f.platform) {
-        // On a platform the shaft stands on the flights' line, between the node and the flights.
-        s = f.anchor === 'bottom' ? CLEAR + LANE_WIDTH.elevator / 2 : f.len - CLEAR - LANE_WIDTH.elevator / 2;
-        l = center + i * (LANE_WIDTH.elevator + LANE_GAP);
-      } else {
-        s = f.anchor === 'bottom' ? CLEAR + LANE_WIDTH.elevator / 2 : f.anchor === 'top' ? f.len - CLEAR - LANE_WIDTH.elevator / 2 : f.len / 2;
-        l = lat.get(k) as number;
-      }
-      const h = LANE_WIDTH.elevator / 2;
-      shafts.push({ k, s, l, rect: rectFromFrame(f.o, f.u, s - h, s + h, l - h, l + h) });
-    });
     const lowObstacles = [...flights.map(({ m, k }) => lowPart(k, m)), ...shafts.map((x) => x.rect)];
     const highObstacles = [...flights.map(({ m, k }) => well(k, m)), ...shafts.map((x) => x.rect)];
 
-    /** Level walkway from a flight end (or shaft) to a node, around wells and other shafts. */
-    const link = (from: string, to: string, level: 'low' | 'high', m: VerticalMode, w: number, own?: ORect) => {
+    /**
+     * Level walkway from a flight end (or shaft) to a node, around wells and other shafts. The
+     * last / first 1.2 m run straight along the flight (`approach`), as people step on and off.
+     */
+    const link = (from: string, to: string, level: 'low' | 'high', m: VerticalMode, w: number, own?: ORect, approach?: { at: XZ; near: 'from' | 'to' }) => {
+      if (approach) {
+        const end = this.get(approach.near === 'from' ? from : to);
+        const other = this.get(approach.near === 'from' ? to : from);
+        if (Math.hypot(other.x - approach.at.x, other.z - approach.at.z) > 0.6) {
+          const id = `${end.id}:step`;
+          const n = this.has(id) ? id : newNode(id, approach.at, end, end.name);
+          const opts = { indoor: m.o.indoor, busy: m.o.busy, width: Math.max(w, 2.4) };
+          // Only the step through the shaft's own door may cross the shaft; the rest avoids it.
+          if (approach.near === 'from') {
+            this.edge('walk', from, n, opts);
+            link(n, to, level, m, w);
+          } else {
+            link(from, n, level, m, w);
+            this.edge('walk', n, to, opts);
+          }
+          return;
+        }
+      }
       const a = this.get(from);
       const b = this.get(to);
       const obstacles = (level === 'low' ? lowObstacles : highObstacles).filter((r) => r !== own);
@@ -481,8 +527,8 @@ export class NetBuilder {
       } else {
         this.edge('escalator', foot, head, opts);
       }
-      link(L.id, foot, 'low', m, widthOf(m));
-      link(head, U.id, 'high', m, widthOf(m));
+      link(L.id, foot, 'low', m, widthOf(m), undefined, { at: at(s0 - 1.2, l), near: 'to' });
+      link(head, U.id, 'high', m, widthOf(m), undefined, { at: at(s1 + 1.2, l), near: 'from' });
     }
     for (const sh of shafts) {
       const m = v.modes[sh.k];
@@ -492,9 +538,13 @@ export class NetBuilder {
       const foot = newNode(`${tag(sh.k)}:foot`, c, L, `${label}（${L.level}）`);
       const head = newNode(`${tag(sh.k)}:head`, c, U, `${label}（${U.level}）`);
       this.edge('elevator', foot, head, { ...m.o });
-      link(L.id, foot, 'low', m, LANE_WIDTH.elevator, sh.rect);
-      link(head, U.id, 'high', m, LANE_WIDTH.elevator, sh.rect);
+      // Doors face the anchored end (the node side): step out 2 m through that face.
+      const out = f.anchor === 'top' ? 1 : -1;
+      const door = at(sh.s + out * (LANE_WIDTH.elevator / 2 + 0.8), sh.l);
+      link(L.id, foot, 'low', m, LANE_WIDTH.elevator, sh.rect, { at: door, near: 'to' });
+      link(head, U.id, 'high', m, LANE_WIDTH.elevator, sh.rect, { at: door, near: 'from' });
     }
+    return 0;
   }
 
   /**
@@ -506,6 +556,7 @@ export class NetBuilder {
     L: NetNode,
     U: NetNode,
     v: VerticalSpec,
+    turn = 0,
   ): { o: XZ; u: XZ; n: XZ; len: number; anchor: 'top' | 'bottom' | 'mid'; platform: Platform | null; center: (w: number) => number } {
     const dx = U.x - L.x;
     const dz = U.z - L.z;
@@ -548,6 +599,11 @@ export class NetBuilder {
       const bz = best ? best.z - U.z : -1;
       const bl = Math.hypot(bx, bz) || 1;
       u = { x: bx / bl, z: bz / bl };
+    }
+    if (turn) {
+      const c = Math.cos(turn);
+      const sn = Math.sin(turn);
+      u = { x: u.x * c - u.z * sn, z: u.x * sn + u.z * c };
     }
     const n = { x: -u.z, z: u.x };
     const len = dx * u.x + dz * u.z;
