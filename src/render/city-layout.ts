@@ -1,4 +1,6 @@
-import type { Footprint, Road } from '../core/types';
+import type { Footprint, NetEdge, NetNode, Road } from '../core/types';
+import { CLEARANCE, clipConvex, flightWidth, type WalkPiece, type WalkSpace } from './walk-space';
+import { clipHalfPlane, polyArea, subtractConvex, type P2 } from './walkway-util';
 
 /**
  * Pure layout maths for the city context (no three.js, no DOM): building massing specs,
@@ -498,12 +500,13 @@ export interface Placement {
 
 /**
  * Trees (御堂筋 ginkgo = kind 1, other roads' zelkova = kind 0) and street lamps along both
- * kerbs, skipping junctions, other roads, crossings and anything `blocked` rejects.
+ * kerbs, skipping junctions, other roads, crossings and anything `blocked` rejects (it is told
+ * what would stand there, so it can test that object's own envelope).
  */
 export function placeStreetFurniture(
   infos: RoadInfo[],
   junctions: Junction[],
-  blocked: (x: number, z: number) => boolean,
+  blocked: (x: number, z: number, what: 'tree' | 'lamp', kind: number) => boolean,
 ): { trees: Placement[]; lamps: Placement[] } {
   const trees: Placement[] = [];
   const lamps: Placement[] = [];
@@ -514,7 +517,7 @@ export function placeStreetFurniture(
     const ginkgo = info.road.id === 'midosuji' || info.road.id === 'shinmidosuji';
     const stations = junctionStations(info, junctions);
     const nearJunction = (s: number) => stations.some((j) => Math.abs(j.s - s) < j.r + 12);
-    const place = (spacing: number, inset: number, list: Placement[], kind: number, phase: number) => {
+    const place = (spacing: number, inset: number, list: Placement[], what: 'tree' | 'lamp', kind: number, phase: number) => {
       for (let s = phase; s < info.len; s += spacing) {
         if (nearJunction(s)) continue;
         pointAt(info, s, tmp);
@@ -523,13 +526,13 @@ export function placeStreetFurniture(
           const lz = -tmp.dx * side;
           const x = tmp.x + lx * (w / 2 + inset);
           const z = tmp.z + lz * (w / 2 + inset);
-          if (onOtherRoad(x, z, infos, i, sw * 0.5) || blocked(x, z)) continue;
+          if (onOtherRoad(x, z, infos, i, sw * 0.5) || blocked(x, z, what, kind)) continue;
           list.push({ x, z, yaw: Math.atan2(-lx, -lz), kind });
         }
       }
     };
-    if (info.road.id !== 'ekimae') place(ginkgo ? 10 : 18, Math.min(1.4, sw * 0.3), trees, ginkgo ? 1 : 0, 4);
-    place(30, 0.5, lamps, 0, 15);
+    if (info.road.id !== 'ekimae') place(ginkgo ? 10 : 18, Math.min(1.4, sw * 0.3), trees, 'tree', ginkgo ? 1 : 0, 4);
+    place(30, 0.5, lamps, 'lamp', 0, 15);
   });
   return { trees, lamps };
 }
@@ -546,6 +549,11 @@ export interface Lane {
   stops: number[];
   /** East–west roads get green in the other half of the signal cycle. */
   phase: 0 | 1;
+  /**
+   * Stop lines before the network's signalised crossings: obeyed on red like `stops`, and also
+   * whenever `held[c]` is set (someone is on crossing c).
+   */
+  holds?: { s: number; c: number }[];
 }
 
 export interface Vehicle {
@@ -574,7 +582,7 @@ export function greenFor(phase: 0 | 1, t: number): boolean {
  * stop lines; at the end of a lane they re-enter at its start. `vehicles` of one lane must stay
  * sorted by travel order, which the model preserves (no overtaking).
  */
-export function stepTraffic(lanes: Lane[], infos: RoadInfo[], vehicles: Vehicle[], byLane: number[][], t: number, dt: number): void {
+export function stepTraffic(lanes: Lane[], infos: RoadInfo[], vehicles: Vehicle[], byLane: number[][], t: number, dt: number, held?: ArrayLike<number>): void {
   const h = Math.min(0.1, Math.max(0, dt));
   if (h === 0) return;
   for (let li = 0; li < lanes.length; li++) {
@@ -595,6 +603,14 @@ export function stepTraffic(lanes: Lane[], infos: RoadInfo[], vehicles: Vehicle[
       if (!green) {
         for (const st of lane.stops) {
           const ps = lane.dir === 1 ? st : len - st;
+          const d = ps - pos - veh.len / 2;
+          if (d > -0.5 && d < gap) gap = d;
+        }
+      }
+      if (lane.holds) {
+        for (const h of lane.holds) {
+          if (green && !held?.[h.c]) continue;
+          const ps = lane.dir === 1 ? h.s : len - h.s;
           const d = ps - pos - veh.len / 2;
           if (d > -0.5 && d < gap) gap = d;
         }
@@ -641,66 +657,324 @@ export function rng(seed: number): () => number {
   };
 }
 
-// ---------------------------------------------------------------- street-level ground
+// ---------------------------------------------------------------- walkable space
 
 /**
- * Openings in the street-level ground where stairs, escalators, lifts or ramps pass through it
- * (every edge whose ends lie on opposite sides of street level), as horizontal boxes.
+ * A convex plan polygon grown by m metres (every edge moved outwards). Orientation-agnostic.
  */
-export function groundOpenings(nodes: { id: string; x: number; y: number; z: number }[], edges: { a: string; b: string; kind: string }[]): OBox[] {
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  const out: OBox[] = [];
-  for (const e of edges) {
+export function inflateConvex(poly: P2[], m: number): P2[] {
+  const n = poly.length;
+  if (n < 3 || m === 0) return poly.map((p) => [p[0], p[1]] as P2);
+  let area = 0;
+  for (let i = 0; i < n; i++) area += poly[i][0] * poly[(i + 1) % n][1] - poly[(i + 1) % n][0] * poly[i][1];
+  const s = area >= 0 ? 1 : -1;
+  const out: P2[] = [];
+  for (let i = 0; i < n; i++) {
+    const p = poly[(i + n - 1) % n];
+    const q = poly[i];
+    const r = poly[(i + 1) % n];
+    // Outward normals of the edges p→q and q→r (for CCW: (dz, −dx)).
+    const l1 = Math.hypot(q[0] - p[0], q[1] - p[1]) || 1;
+    const l2 = Math.hypot(r[0] - q[0], r[1] - q[1]) || 1;
+    const n1x = (s * (q[1] - p[1])) / l1;
+    const n1z = (-s * (q[0] - p[0])) / l1;
+    const n2x = (s * (r[1] - q[1])) / l2;
+    const n2z = (-s * (r[0] - q[0])) / l2;
+    const k = m / Math.max(0.2, 1 + n1x * n2x + n1z * n2z);
+    out.push([q[0] + (n1x + n2x) * k, q[1] + (n1z + n2z) * k]);
+  }
+  return out;
+}
+
+/** Plan rectangle of half width hw along a→b (null when a and b coincide in plan). */
+export function stripPoly(ax: number, az: number, bx: number, bz: number, hw: number): P2[] | null {
+  const dx = bx - ax;
+  const dz = bz - az;
+  const l = Math.hypot(dx, dz);
+  if (l < 0.05) return null;
+  const nx = (-dz / l) * hw;
+  const nz = (dx / l) * hw;
+  return [
+    [ax - nx, az - nz],
+    [bx - nx, bz - nz],
+    [bx + nx, bz + nz],
+    [ax + nx, az + nz],
+  ];
+}
+
+/**
+ * The well of one stair / escalator run: its flights and landings (a chain of flights joined at
+ * landing nodes) as plan rectangles, with the lowest and highest floor along it (real metres).
+ */
+export interface Well {
+  polys: P2[][];
+  lo: number;
+  hi: number;
+}
+
+/**
+ * Stair and escalator wells of the network. The walk-through frames every flight as one open
+ * well with a balustrade around it at the upper floor, so a slab it passes through is opened
+ * over the whole run (not just where a head would touch it), `pad` metres beyond each side.
+ */
+export function flightWells(net: { nodes: NetNode[]; edges: NetEdge[] }, pad = 0.2): Well[] {
+  const byId = new Map(net.nodes.map((n) => [n.id, n]));
+  const flights = net.edges.filter((e) => e.kind === 'stairs' || e.kind === 'escalator');
+  const parent = flights.map((_, i) => i);
+  const find = (i: number): number => {
+    while (parent[i] !== i) i = parent[i] = parent[parent[i]];
+    return i;
+  };
+  const firstAt = new Map<string, number>();
+  flights.forEach((e, i) => {
+    for (const id of [e.a, e.b]) {
+      if (!byId.get(id)?.landing) continue;
+      const j = firstAt.get(id);
+      if (j === undefined) firstAt.set(id, i);
+      else parent[find(i)] = find(j);
+    }
+  });
+  const wells = new Map<number, Well>();
+  flights.forEach((e, i) => {
     const a = byId.get(e.a);
     const b = byId.get(e.b);
-    if (!a || !b) continue;
-    const lo = Math.min(a.y, b.y);
-    const hi = Math.max(a.y, b.y);
-    if (!(lo < -0.5 && hi > -0.5)) continue;
-    const dx = b.x - a.x;
-    const dz = b.z - a.z;
-    const run = Math.hypot(dx, dz);
-    const ux = run > 0.5 ? dx / run : 1;
-    const uz = run > 0.5 ? dz / run : 0;
-    // Parallel stairs / escalators / lifts are spread up to ±6.6 m sideways (walkway.ts).
-    out.push({ cx: (a.x + b.x) / 2, cz: (a.z + b.z) / 2, ux, uz, hl: run / 2 + 2.5, hw: 8.5, y0: -1, y1: 1 });
+    if (!a || !b) return;
+    const poly = stripPoly(a.x, a.z, b.x, b.z, flightWidth(e) / 2 + pad);
+    if (!poly) return;
+    const r = find(i);
+    const w = wells.get(r) ?? { polys: [], lo: Infinity, hi: -Infinity };
+    w.polys.push(poly);
+    w.lo = Math.min(w.lo, a.y, b.y);
+    w.hi = Math.max(w.hi, a.y, b.y);
+    wells.set(r, w);
+  });
+  return [...wells.values()];
+}
+
+/** Plan bounds [x0, x1, z0, z1] of a polygon. */
+export function polyBox(p: P2[]): [number, number, number, number] {
+  let x0 = Infinity;
+  let x1 = -Infinity;
+  let z0 = Infinity;
+  let z1 = -Infinity;
+  for (const [x, z] of p) {
+    x0 = Math.min(x0, x);
+    x1 = Math.max(x1, x);
+    z0 = Math.min(z0, z);
+    z1 = Math.max(z1, z);
+  }
+  return [x0, x1, z0, z1];
+}
+
+/**
+ * Holes a horizontal slab at real height y needs inside the plan box [x0, x1] × [z0, z1] so it
+ * never cuts through walkable space: whole wells whose flights pass through it, and of every
+ * other piece (lift shafts, ramps, low corridors, junctions) the part whose floor lies below the
+ * slab while its head room reaches above it. Convex plan polygons, counter-clockwise like the
+ * walk-space pieces (positive signed area in x-z).
+ */
+export function slabHoles(space: WalkSpace, wells: Well[], y: number, x0: number, x1: number, z0: number, z1: number): P2[][] {
+  const out: P2[][] = [];
+  const overlaps = (p: P2[]) => {
+    const [a0, a1, b0, b1] = polyBox(p);
+    return a0 < x1 && a1 > x0 && b0 < z1 && b1 > z0;
+  };
+  for (const w of wells) {
+    if (!(w.lo < y - 0.05 && w.hi + CLEARANCE > y)) continue;
+    for (const p of w.polys) if (overlaps(p)) out.push(p);
+  }
+  for (const p of space.query(x0, x1, z0, z1)) {
+    if (p.kind === 'flight') continue; // covered by the wells
+    // Floor F = f0 + fx·x + fz·z: keep F < y − 0.05 and F + clear > y.
+    let poly: P2[] = p.poly;
+    const flat = Math.abs(p.fx) + Math.abs(p.fz) < 1e-9;
+    if (flat) {
+      if (!(p.f0 < y - 0.05 && p.f0 + p.clear > y)) continue;
+    } else {
+      poly = clipHalfPlane(poly, p.fx, p.fz, y - 0.05 - p.f0);
+      if (poly.length >= 3) poly = clipHalfPlane(poly, -p.fx, -p.fz, p.f0 + p.clear - y);
+    }
+    if (poly.length >= 3 && polyArea(poly) > 1e-3 && overlaps(poly)) out.push(poly);
+  }
+  // (Never reverse in place: wells and pieces are shared.)
+  return out.map((h) => {
+    let a = 0;
+    for (let i = 0; i < h.length; i++) a += h[i][0] * h[(i + 1) % h.length][1] - h[(i + 1) % h.length][0] * h[i][1];
+    return a < 0 ? [...h].reverse() : h;
+  });
+}
+
+/** A convex polygon minus several convex holes, as convex pieces. */
+export function subtractAll(poly: P2[], holes: P2[][]): P2[][] {
+  let pieces: P2[][] = [poly];
+  for (const h of holes) {
+    const [h0, h1, k0, k1] = polyBox(h);
+    const next: P2[][] = [];
+    for (const p of pieces) {
+      const [p0, p1, q0, q1] = polyBox(p);
+      if (p0 >= h1 || p1 <= h0 || q0 >= k1 || q1 <= k0) next.push(p);
+      else next.push(...subtractConvex(p, h));
+    }
+    pieces = next;
+  }
+  return pieces;
+}
+
+/**
+ * Street-level ground: `coarse` square cells covering [cx ± half] × [cz ± half], with the
+ * holes cut out of the cells they touch. Convex plan polygons.
+ */
+export function groundPieces(cx: number, cz: number, half: number, holes: P2[][], coarse = 20): P2[][] {
+  const out: P2[][] = [];
+  const n = Math.ceil((half * 2) / coarse);
+  const x0 = cx - (n * coarse) / 2;
+  const z0 = cz - (n * coarse) / 2;
+  const boxes = holes.map(polyBox);
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      const ax = x0 + i * coarse;
+      const az = z0 + j * coarse;
+      const cell: P2[] = [
+        [ax, az],
+        [ax + coarse, az],
+        [ax + coarse, az + coarse],
+        [ax, az + coarse],
+      ];
+      const near = holes.filter((_, k) => boxes[k][0] < ax + coarse && boxes[k][1] > ax && boxes[k][2] < az + coarse && boxes[k][3] > az);
+      if (!near.length) out.push(cell);
+      else for (const p of subtractAll(cell, near)) if (polyArea(p) > 1e-3) out.push(p);
+    }
+  }
+  return out;
+}
+
+/** Rectangle in a wall's own frame: t along the wall (0…1) and scene height y. */
+export interface WallRect {
+  t0: number;
+  t1: number;
+  y0: number;
+  y1: number;
+}
+
+/**
+ * Openings a wall along a→b (scene heights y0…y1) needs so that nothing solid stands in
+ * walkable space: for every walk-space piece the wall line crosses, the crossing (widened by
+ * `margin` metres each side) from the piece's lowest floor there up to its highest floor plus
+ * the head room `head(p)` (real metres). Scene y = real y × ex.
+ */
+export function wallOpenings(
+  space: WalkSpace,
+  ax: number,
+  az: number,
+  bx: number,
+  bz: number,
+  y0: number,
+  y1: number,
+  ex: number,
+  head: (p: WalkPiece) => number,
+  margin = 0.25,
+): WallRect[] {
+  const dx = bx - ax;
+  const dz = bz - az;
+  if (Math.hypot(dx, dz) < 1e-6) return [];
+  const pad = margin + 0.05;
+  const out: WallRect[] = [];
+  for (const p of space.query(Math.min(ax, bx) - pad, Math.max(ax, bx) + pad, Math.min(az, bz) - pad, Math.max(az, bz) + pad)) {
+    const span = clipConvex(p.poly, ax, az, dx, dz, -margin);
+    if (!span) continue;
+    const F0 = p.f0 + p.fx * ax + p.fz * az;
+    const F1 = p.fx * dx + p.fz * dz;
+    const fa = F0 + F1 * span[0];
+    const fb = F0 + F1 * span[1];
+    // A hair below the floor, so no sliver of wall shows above a (lifted) walkway floor.
+    const lo = Math.min(fa, fb) * ex - 0.05;
+    const hi = (Math.max(fa, fb) + head(p)) * ex;
+    if (hi <= y0 + 1e-3 || lo >= y1 - 1e-3) continue;
+    out.push({ t0: span[0], t1: span[1], y0: Math.max(y0, lo), y1: Math.min(y1, hi) });
   }
   return out;
 }
 
 /**
- * Ground cells [x0, z0, x1, z1] covering the square [cx ± half] × [cz ± half], with `coarse`
- * cells near openings refined to `fine` ones and the fine cells inside an opening dropped.
+ * The band [0, 1] × [y0, y1] minus the holes, as rectangles: the wall is cut into columns at
+ * every hole edge, and runs of columns with the same open interval are merged.
  */
-export function groundCells(cx: number, cz: number, half: number, openings: OBox[], coarse = 20, fine = 4): [number, number, number, number][] {
-  const cells: [number, number, number, number][] = [];
-  const n = Math.ceil((half * 2) / coarse);
-  const x0 = cx - (n * coarse) / 2;
-  const z0 = cz - (n * coarse) / 2;
-  const reach = coarse * 0.75;
-  for (let i = 0; i < n; i++) {
-    for (let j = 0; j < n; j++) {
-      const ax = x0 + i * coarse;
-      const az = z0 + j * coarse;
-      const mx = ax + coarse / 2;
-      const mz = az + coarse / 2;
-      const near = openings.filter((o) => distanceToFootprint(mx, mz, o) < reach);
-      if (near.length === 0) {
-        cells.push([ax, az, ax + coarse, az + coarse]);
-        continue;
-      }
-      const k = Math.round(coarse / fine);
-      for (let u = 0; u < k; u++) {
-        for (let v = 0; v < k; v++) {
-          const bx = ax + u * fine;
-          const bz = az + v * fine;
-          if (near.some((o) => distanceToFootprint(bx + fine / 2, bz + fine / 2, o) < fine * 0.3)) continue;
-          cells.push([bx, bz, bx + fine, bz + fine]);
-        }
+export function wallPanels(holes: WallRect[], y0: number, y1: number): WallRect[] {
+  const ts = [0, 1];
+  for (const h of holes) {
+    if (h.y1 <= y0 || h.y0 >= y1) continue;
+    ts.push(Math.min(1, Math.max(0, h.t0)), Math.min(1, Math.max(0, h.t1)));
+  }
+  ts.sort((a, b) => a - b);
+  const cols: number[] = [];
+  for (const t of ts) if (!cols.length || t - cols[cols.length - 1] > 1e-6) cols.push(t);
+  const out: WallRect[] = [];
+  const open = new Map<string, WallRect>();
+  for (let i = 0; i < cols.length - 1; i++) {
+    const a = cols[i];
+    const b = cols[i + 1];
+    const cover: [number, number][] = [];
+    for (const h of holes) if (h.t0 <= a + 1e-9 && h.t1 >= b - 1e-9 && h.y1 > y0 && h.y0 < y1) cover.push([Math.max(y0, h.y0), Math.min(y1, h.y1)]);
+    cover.sort((p, q) => p[0] - q[0]);
+    const free: [number, number][] = [];
+    let y = y0;
+    for (const [c0, c1] of cover) {
+      if (c0 > y + 1e-4) free.push([y, c0]);
+      y = Math.max(y, c1);
+    }
+    if (y1 > y + 1e-4) free.push([y, y1]);
+    const seen = new Set<string>();
+    for (const [f0, f1] of free) {
+      const key = `${f0.toFixed(4)}|${f1.toFixed(4)}`;
+      seen.add(key);
+      const r = open.get(key);
+      if (r && Math.abs(r.t1 - a) < 1e-9) r.t1 = b;
+      else {
+        if (r) out.push(r);
+        open.set(key, { t0: a, t1: b, y0: f0, y1: f1 });
       }
     }
+    for (const [key, r] of open) {
+      if (seen.has(key)) continue;
+      out.push(r);
+      open.delete(key);
+    }
   }
-  return cells;
+  out.push(...open.values());
+  return out;
+}
+
+/**
+ * Door frames for the openings of one wall: overlapping (or nearly touching, within `gap` in
+ * t) openings are grouped, and each group gets its bounding rectangle, around which a lintel
+ * and two jambs are drawn.
+ */
+export function portalFrames(holes: WallRect[], gap: number): WallRect[] {
+  const parent = holes.map((_, i) => i);
+  const find = (i: number): number => {
+    while (parent[i] !== i) i = parent[i] = parent[parent[i]];
+    return i;
+  };
+  for (let i = 0; i < holes.length; i++) {
+    for (let j = i + 1; j < holes.length; j++) {
+      const a = holes[i];
+      const b = holes[j];
+      if (a.t0 <= b.t1 + gap && a.t1 >= b.t0 - gap && a.y0 <= b.y1 && a.y1 >= b.y0) parent[find(i)] = find(j);
+    }
+  }
+  const groups = new Map<number, WallRect>();
+  holes.forEach((h, i) => {
+    const r = find(i);
+    const g = groups.get(r);
+    if (!g) groups.set(r, { ...h });
+    else {
+      g.t0 = Math.min(g.t0, h.t0);
+      g.t1 = Math.max(g.t1, h.t1);
+      g.y0 = Math.min(g.y0, h.y0);
+      g.y1 = Math.max(g.y1, h.y1);
+    }
+  });
+  return [...groups.values()];
 }
 
 // ---------------------------------------------------------------- walk-mode helpers
