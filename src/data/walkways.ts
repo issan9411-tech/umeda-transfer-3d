@@ -25,12 +25,12 @@ export function addWalkways(b: NetBuilder): void {
   b.path(['f_chuo_sn', 'f_chuo_mid', 'jr_chuo_out', 'f_chuo_n'], { name: '中央コンコース', busy: 3, width: 20 });
   // 御堂筋口: the free concourse along the east end, between the platform ends and 国道176号, from
   // 御堂筋南口 (the station's SE corner, where the covered walk to 梅田新歩道橋 starts) to 御堂筋北口
-  // (the exit under the ノースゲートビル's one-storey east wing, onto the plaza with the stairs up to
-  // the 2F deck).
+  // (the exit past the ノースゲートビル's one-storey east wing, onto the open plaza in the notch of its
+  // outline (OSM: s 157…171, t 36…56) with the stairs up to the 2F deck).
   // The crosswalk to 阪急 starts from its south part, under the viaduct (see the street crossings).
   b.j('f_mido_s', '御堂筋南口', jrAt(149, -73), '1F', { label: true });
   b.j('f_mido_c', '御堂筋口コンコース 南側（阪急方面 横断歩道へ）', jrAt(150, -61), '1F');
-  b.j('f_mido_n', '御堂筋北口', jrAt(156, 40), '1F', { label: true });
+  b.j('f_mido_n', '御堂筋北口', jrAt(161, 38.5), '1F', { label: true });
   b.path(['f_mido_s', 'f_mido_c', 'jr_mido_out', 'f_mido_n'], { name: '御堂筋口コンコース', busy: 3, width: 15 });
 
   // South side: the sidewalk along the station's south face west of the サウスゲートビル, the concourse
@@ -77,7 +77,9 @@ export function addWalkways(b: NetBuilder): void {
   b.j('f_deck_mid', '国道176号 2階デッキ（西詰）', { x: 134.0, z: -145.5 }, '2F', D2);
   b.j('f_deck_e', '国道176号 2階デッキ（東詰・阪急前）', { x: 212.0, z: -162.0 }, '2F', D2);
   b.path(['f_deck_w', 'f_deck_y', 'f_deck_jr', 'f_deck_mid', 'f_deck_e'], { name: '2階歩道橋（屋根なし）', indoor: false, busy: 1 });
-  b.vertical('f_mido_n', 'f_deck_jr', ['stairs', 'esc'], { indoor: false, bearingUp: 0, anchor: 'bottom' });
+  // From the plaza the stairs rise NNW across it onto the deck (OSM: feet at s 160…166, t ≈ 39.5,
+  // heads at t ≈ 56).
+  b.vertical('f_mido_n', 'f_deck_jr', ['stairs', 'esc'], { indoor: false, bearingUp: JR_AXIS - 90 + 10.5, anchor: 'bottom' });
   b.j('hk_2f_w', '阪急三番街 2階 南側（歩道橋着地）', { x: 229.0, z: -172.0 }, '2F', { y: 5.5 });
   b.walk('f_deck_e', 'hk_2f_w', { name: '2階歩道橋（屋根なし）', indoor: false, busy: 1 });
   b.walk('hk_2f_w', 'hk_2f_out', { name: '2階通路' });
@@ -100,6 +102,10 @@ export function addWalkways(b: NetBuilder): void {
   b.path(['f_bridge_nw', 'f_bridge_n', 'f_bridge_e', 'f_bridge', 'f_bridge_sw'], bridge);
   b.walk('f_bridge_e', 'f_bridge_ne', bridge);
   b.walk('f_bridge', 'f_bridge_w', bridge);
+  // North of the stairs down to 御堂筋南口 the spine carries on NE along 国道176号 to the west face of
+  // 阪急うめだ本店, which it meets at 2F (OSM: the bridge way ends on the store's outline).
+  b.node('e_hkdept2', 'entrance', '阪急うめだ本店（2階 梅田新歩道橋口）', { x: 215.0, z: -47.0 }, '2F', D2);
+  b.walk('f_bridge_n', 'e_hkdept2', bridge);
   b.stairs('f_bridge_nw', 'f_mido_s', { indoor: false, bearingUp: 82, anchor: 'top' });
   b.stairs('f_bridge_ne', 'f_hk_sw', { indoor: false, anchor: 'top' });
   b.esc('f_bridge_ne', 'f_hk_sw', 'both', { indoor: false });
@@ -162,18 +168,23 @@ export function addWalkways(b: NetBuilder): void {
   // is no ground link west to うめきた here: the road north of 梅田ランプ東 has no crosswalk.
   // The atrium also opens onto the 2F deck along the north face towards 阪急 (see 阪急方面).
   b.walk('f_atrium', 'f_deck_w', { name: 'ノースゲートビル 2階', busy: 1 });
-  b.j('f_gfo2', 'グランフロント大阪 南館2階デッキ', { x: -45.0, z: -130.0 }, '2F');
-  b.j('f_gfo2p', 'うめきた広場 2階デッキ', { x: -20.0, z: -119.0 }, '2F');
-  b.path(['f_atrium', 'f_gfo2p', 'f_gfo2'], { name: 'ノースゲート〜グランフロント 2階デッキ', indoor: false, busy: 2 });
+  // The deck to グランフロント (OSM) leaves the building's north face at s ≈ 16 and crosses the plaza
+  // north-west to the junction with the Bデッキ (to GFO 北館), then on to the front of 南館.
+  b.j('f_ngb_n2', 'ノースゲートビル 2階 北出口（うめきた広場デッキ）', jrAt(16.3, 96), '2F', { y: 7 });
+  b.walk('f_atrium', 'f_ngb_n2', { name: 'ノースゲートビル 2階', busy: 2 });
+  b.j('f_gfo2p', 'うめきた広場 2階デッキ（Bデッキ分岐）', { x: -43.0, z: -101.1 }, '2F');
+  b.j('f_gfo2', 'グランフロント大阪 南館2階デッキ', { x: -53.8, z: -118.6 }, '2F');
+  b.path(['f_ngb_n2', 'f_gfo2p', 'f_gfo2'], { name: 'ノースゲート〜グランフロント 2階デッキ', indoor: false, busy: 2 });
   b.j('f_gfo1', 'グランフロント大阪 うめきた広場', { x: -34.0, z: -113.0 }, '1F', { label: true });
   b.vertical('f_gfo2p', 'f_gfo1', ['stairs', 'esc'], { anchor: 'bottom' });
 
   // 2F west of the ノースゲートビル (OSM bridge footways): from its west end a deck crosses 市道梅田線
   // to イノゲート大阪 2F, and another runs north across the 梅田ランプ東 junction and then west along
   // うめきたグリーンプレイス (UGP) 2F to グラングリーン大阪 南館 2F (opened 2024-12 and 2025-04-11).
-  b.j('f_ngb_w2', 'ルクア1100 2階（西端）', { x: -124.0, z: 12.0 }, '2F', { y: 7 });
+  // The mapped deck meets the building's west face at t ≈ 49 (OSM), where both decks start.
+  b.j('f_ngb_w2', 'ルクア1100 2階（西端）', jrAt(-112, 49.4), '2F', { y: 7 });
   b.walk('f_atrium', 'f_ngb_w2', { name: 'ルクア1100 2階', busy: 1 });
-  b.j('f_dk_se', 'ノースゲートビル西端 2階デッキ', { x: -133.0, z: 23.0 }, '2F');
+  b.j('f_dk_se', 'ノースゲートビル西端 2階デッキ', { x: -126.8, z: 20.0 }, '2F');
   b.j('f_inogate2', 'イノゲート大阪 2階', { x: -172.0, z: 45.0 }, '2F');
   b.path(['f_ngb_w2', 'f_dk_se', 'f_inogate2'], { name: 'ノースゲート〜イノゲート 2階デッキ', indoor: false });
   b.j('f_dk_ne', '梅田ランプ東 2階デッキ（北東）', { x: -146.0, z: -15.0 }, '2F', D2);
@@ -202,13 +213,21 @@ export function addWalkways(b: NetBuilder): void {
   // it (OSM steps), just north of the gate-front corridor.
   b.j('f_ugp1', 'うめきたグリーンプレイス 1階（うめきた地下口）', { x: -200.0, z: -48.0 }, '1F');
   b.vertical('uk_b1_e', 'f_ugp1', ['stairs', 'esc', 'elev'], { name: '大阪駅（うめきたエリア）地上出口', bearingUp: 25, anchor: 'bottom' });
-  b.walk('f_uk_x', 'f_ugp1', { name: 'うめきたグリーンプレイス 1階（公共広場）', indoor: false });
+  // From the corner the mapped footway runs NW in the open to the south-east corner of the UGP
+  // outline; the last stretch to the exit is inside the うめきた地下口 building.
+  b.j('f_ugp_s', 'うめきたグリーンプレイス 南東角（うめきた地下口前）', { x: -199.0, z: -22.5 }, '1F');
+  b.walk('f_uk_x', 'f_ugp_s', { name: 'うめきた地下口前', indoor: false });
+  b.walk('f_ugp_s', 'f_ugp1', { name: '大阪駅（うめきたエリア）地上出口 1階', indoor: true });
   b.vertical('f_ugp1', 'f_ugp2', ['esc', 'elev'], { anchor: 'top' });
   // うめきた公園 サウスパーク: turn left (west) out of the gate; the escalator ahead rises west to
   // the park under the 大屋根, and the B1 corridor carries straight on into GGO 南館.
   b.j('f_sp1', 'うめきた公園 サウスパーク（大屋根下）', { x: -253.0, z: -50.0 }, '1F', { label: true });
   b.vertical('uk_sp_b1', 'f_sp1', ['esc'], { name: 'うめきた公園への出口', bearingUp: 297.5, anchor: 'bottom' });
-  b.walk('f_sp1', 'f_ugp1', { name: 'うめきたグリーンプレイス 1階（うめきた公園側）' });
+  // Through UGP's ground floor: the building stands over the station and its 1F opens straight onto
+  // the 地上出口 (station research) with the park in front of it to the west; OSM maps the block as
+  // one outline from the exit to the park edge and no ground-level footway around it (only the 2F
+  // decks cross it), so the model walks straight through, indoors.
+  b.walk('f_sp1', 'f_ugp1', { name: 'うめきたグリーンプレイス 1階（うめきた公園側）', indoor: true });
   // Level with the gate-front corridor (a sloping corridor would roof over the park escalator).
   b.j('f_ggo_b1', 'グラングリーン大阪 南館 地下1階（タイムアウトマーケット）', { x: -293.0, z: -17.0 }, 'B1', { y: -7 });
   b.walk('uk_sp_b1', 'f_ggo_b1', { name: 'うめきた地下通路（グラングリーン大阪 南館方面）', busy: 1 });
@@ -234,19 +253,31 @@ export function addWalkways(b: NetBuilder): void {
   // Along the ノースゲートビル's B1 (OSM) to the foot of the stairs down from 御堂筋北口.
   b.j('f_midon_b1', 'JR御堂筋北口 地下', { x: 118.0, z: -124.0 }, 'B1', B1);
   b.walk('f_lucua_b1', 'f_midon_b1', { name: 'ルクア地下通路', busy: 2 });
-  // It goes down facing south, clear of the 2F-deck escalator that rises north from the same exit.
-  b.vertical('f_mido_n', 'f_midon_b1', ['stairs', 'esc', 'elev'], { bearingUp: 0, anchor: 'top' });
+  // The way down is inside the east wing, west of the plaza (OSM steps at s 144…150, t ≈ 44): from
+  // the exit along the wing's passage to the stair head, then down heading east along the tracks,
+  // clear of the 2F-deck stairs that rise across the plaza.
+  b.j('f_midon_1f', '御堂筋北口（地下への階段上）', jrAt(143, 44.5), '1F');
+  b.walk('f_mido_n', 'f_midon_1f', { name: '御堂筋北口', busy: 2 });
+  b.vertical('f_midon_1f', 'f_midon_b1', ['stairs', 'esc', 'elev'], { bearingUp: JR_AXIS + 180, anchor: 'top' });
   b.walk('f_midon_b1', 'm_n_out', { name: '御堂筋線北改札前通路', busy: 3 });
+  // The mapped B1 passage (OSM) along the east side of 御堂筋 runs from under 阪急三番街 south past the
+  // 北改札 to the north-west corner of 阪急うめだ本店; the way on east along the store's north side
+  // leaves it there. The 北改札 (on the line's axis) is reached from it at the level of the gate.
+  b.j('f_mn_n', '御堂筋線北改札 北側 地下通路', { x: 172.0, z: -157.0 }, 'B1', B1);
+  b.j('f_mn_e', '御堂筋線北改札 東側 地下通路', { x: 185.5, z: -116.5 }, 'B1', B1);
+  b.path(['f_mn_n', 'm_n_out', 'f_mn_e'], { name: '御堂筋線北改札前通路', busy: 3 });
   // B1 along the north side of 阪急うめだ本店 (OSM), below the south end of the moving walkway, and
   // down its west side (below the 南北コンコース) to the south-west corner.
   b.j('f_hkd_b1', '阪急うめだ本店 地下1階前', { x: 255.0, z: -100.0 }, 'B1', { ...B1, label: false });
-  b.walk('m_n_out', 'f_hkd_b1', { busy: 3 });
   b.vertical('f_hk_w', 'f_hkd_b1', ['stairs', 'esc', 'elev'], { busy: 3, anchor: 'top' });
   b.j('f_3b_b1', '阪急三番街 地下1階', { x: 245.0, z: -281.0 }, 'B1', B1);
   b.vertical('hk_1f_sanbangai', 'f_3b_b1', ['stairs', 'esc', 'elev'], { anchor: 'top' });
-  // South end of 阪急三番街 B1, on the mapped corridor along the station building's south part.
+  // South end of 阪急三番街 B1, on the mapped corridor along the station building's south part,
+  // which runs west to the passage along 御堂筋 (OSM; the model once cut straight across to the
+  // 北改札, up to 25 m from any mapped passage).
   b.j('f_3b_s', '阪急三番街 南端（地下1階）', { x: 230.0, z: -192.0 }, 'B1', B1);
-  b.path(['f_3b_b1', 'f_3b_s', 'm_n_out'], { name: '阪急三番街', busy: 2 });
+  b.j('f_3b_w', '阪急三番街 南西（御堂筋側）', { x: 165.0, z: -182.0 }, 'B1', B1);
+  b.path(['f_3b_b1', 'f_3b_s', 'f_3b_w', 'f_mn_n'], { name: '阪急三番街', busy: 2 });
   // 「地下街に続くエスカレーター」 beside the side passage at the foot of the 3F escalators: the
   // short way from the 3F gate down to the 御堂筋線 北改札. Only the way down is documented (no
   // stairs, no up escalator confirmed); an up escalator here would put 御堂筋線北改札→阪急3階改札
@@ -290,6 +321,7 @@ export function addWalkways(b: NetBuilder): void {
   b.vertical('f_hk_sw', 'f_hksw_b1', ['stairs'], { anchor: 'top' });
   b.j('f_hknw_b1', '阪急うめだ本店 北西角 地下', { x: 201.0, z: -65.0 }, 'B1', B1);
   b.path(['f_hkd_b1', 'f_hknw_b1', 'f_hksw_b1'], { name: '阪急うめだ本店 地下1階前', busy: 2 });
+  b.walk('f_mn_e', 'f_hknw_b1', { name: '御堂筋線北改札〜阪急うめだ本店 地下通路', busy: 3 });
   b.walk('f_hksw_b1', 'f_wh_c', { name: 'ホワイティうめだ', busy: 2 });
   b.path(['f_hs_se_b1', 'f_wh_sw', 'f_wh_c', 'f_wh_e', 'f_izumi'], { name: 'ホワイティうめだ', busy: 2 });
   b.path(['f_wh_n', 'f_wh_e', 't_n_out'], { name: 'ホワイティうめだ', busy: 2 });
@@ -377,7 +409,8 @@ export function addWalkways(b: NetBuilder): void {
   // Inside ドーチカ (堂島地下センター) under 四つ橋筋, ≈65 m south of 桜橋交差点.
   ent('e_sakurabashi', 'ドーチカ（堂島地下センター）・桜橋', { x: -14.7, z: 510.0 }, 'f_ksw_b1', 'B1');
   ent('e_shindo', '梅田新道', { x: 398.0, z: 448.0 }, 'f_ek3_b1', 'B1');
-  ent('e_ohatsu', 'お初天神・曽根崎', [34.7015, 135.5029], 'f_izumi', 'B1');
+  // At the mall's mapped east end (Whityうめだ landuse, x ≈ 602), towards お初天神.
+  ent('e_ohatsu', 'お初天神・曽根崎', { x: 597.0, z: 42.0 }, 'f_izumi', 'B1');
   ent('e_hep', 'HEP FIVE・東通り', { x: 358.0, z: -75.0 }, 'f_wh_n', 'B1');
   ent('e_hanshin', '阪神梅田本店（地下1階 食品売場）', { x: 147.0, z: 181.0 }, 'f_hs_psg_b1', 'B1');
   ent('e_daimaru', '大丸梅田店', { x: 70.0, z: 122.0 }, 'f_daimaru1', '1F', true);

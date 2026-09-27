@@ -765,15 +765,18 @@ export class NetBuilder {
   private platformUnder(n: NetNode): Platform | undefined {
     if (n.platformId) return this.platforms.find((p) => p.id === n.platformId);
     if (this.pieceCache?.n !== this.platforms.length) this.pieceCache = { n: this.platforms.length, pieces: this.platforms.flatMap(platformPieces) };
-    return this.pieceCache.pieces.find((p) => {
+    const on = (p: Platform, slack: number) => {
       if (Math.abs(p.y - n.y) > 0.6) return false;
       const ax = p.b[0] - p.a[0];
       const az = p.b[1] - p.a[1];
       const al = Math.hypot(ax, az) || 1;
       const t = ((n.x - p.a[0]) * ax + (n.z - p.a[1]) * az) / al;
       const lat = Math.abs(((n.x - p.a[0]) * az - (n.z - p.a[1]) * ax) / al);
-      return t >= -2 && t <= al + 2 && lat <= p.width / 2 + 0.5;
-    });
+      return t >= -slack && t <= al + slack && lat <= p.width / 2 + 0.5;
+    };
+    // A piece the node is really on first (a walkway's first metres lie within 2 m of the body's end).
+    const pieces = this.pieceCache.pieces;
+    return pieces.find((p) => on(p, 0)) ?? pieces.find((p) => on(p, 2));
   }
 
   private pieceCache: { n: number; pieces: Platform[] } | null = null;

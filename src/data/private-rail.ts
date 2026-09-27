@@ -161,10 +161,19 @@ export function addHanshin(b: NetBuilder): void {
   // OSM maps the four tracks and their platform edges ENE–WSW (bearing ≈ 59°, parallel to JR), under
   // the plaza and road between the サウスゲートビル and 阪神梅田本店: west ends under the road in front
   // of 大阪第一生命ビル, east ends at the foot of the 梅田新歩道橋. Trains leave westward (≈ 239°).
-  // Two records, each along the platform between a pair of tracks (1・2 north, 3・4 south).
+  // Since the rebuilding the station has 4 tracks, 1〜4番線 (the old 5番線 is gone), each with a
+  // boarding (乗車) and an alighting (降車) side: 1降 | 1 | 1・2乗 | 2 | 2・3降 | 3 | 3・4乗 | 4 | 4降.
+  // Two records, one per boarding island (1・2 north, 3・4 south).
+  //
+  // Approximation (kept on purpose): mid-length, the OSM tracks lie 6.8, 8.8 and 9.0 m apart
+  // (1・2乗 ≈ 3.9 m, 2・3降 ≈ 5.5 m, 3・4乗 ≈ 5.7 m between the rails). Records that narrow would put
+  // the drawn tracks on the real ones, but the stairs, escalators and lift that rise from each
+  // platform's east end to the 東口 concourse (5.3 m of flights side by side, plus the walking line
+  // beside them) and the 西口 stairs would then stand over the tracks. So each record stays 12 m
+  // wide: the renderer draws three tracks (the middle one shared), each 3–4 m off a real one.
   const plats = [
     { id: 'hs-1-2', nameJa: '1・2番線', W: { x: 67.8, z: 150.8 }, E: { x: 185.8, z: 80.6 } },
-    { id: 'hs-3-5', nameJa: '3〜5番線', W: { x: 75.9, z: 165.2 }, E: { x: 190.7, z: 97.6 } },
+    { id: 'hs-3-4', nameJa: '3・4番線', W: { x: 75.9, z: 165.2 }, E: { x: 190.7, z: 97.6 } },
   ];
   /** Platform axis W→E: the stairs rise towards the gates this way. */
   const AXIS = bearingOf(plats[0].W, plats[0].E);

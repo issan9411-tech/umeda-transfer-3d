@@ -473,11 +473,20 @@ function walkingLines(net: Network, l: StationLayout): { t: number; s0: number; 
     if (e.kind !== 'platform') continue;
     const a = byId.get(e.a) as NetNode;
     const b = byId.get(e.b) as NetNode;
-    if (!a.platformId || !plats.has(a.platformId)) continue;
+    // Boarding positions carry their platform; stair heads and the steps onto a platform's
+    // narrower walkway (JR 西口) only their station.
+    if (!(a.platformId ? plats.has(a.platformId) : a.stationId === l.id)) continue;
     const [sa, ta] = toLocal(l.f, a.x, a.z);
     const [sb, tb] = toLocal(l.f, b.x, b.z);
     const w = Math.min(16, Math.max(3, e.width ?? 6));
-    out.push({ t: (ta + tb) / 2, s0: Math.min(sa, sb), s1: Math.max(sa, sb), room: Math.min(2, Math.max(0, w / 2 - 1.6)) });
+    const room = Math.min(2, Math.max(0, w / 2 - 1.6));
+    // A line that steps sideways is kept as short pieces, each at its own lateral position.
+    const n = Math.max(1, Math.ceil(Math.abs(tb - ta) / 0.5));
+    for (let i = 0; i < n; i++) {
+      const s0 = sa + ((sb - sa) * i) / n;
+      const s1 = sa + ((sb - sa) * (i + 1)) / n;
+      out.push({ t: ta + ((tb - ta) * (i + 0.5)) / n, s0: Math.min(s0, s1), s1: Math.max(s0, s1), room });
+    }
   }
   return out;
 }
@@ -1828,7 +1837,13 @@ function drawPower(ctx: Ctx, l: StationLayout): void {
   const s1 = Math.max(...l.tracks.map((t) => t.s1));
   const ts = l.tracks.map((t) => t.t).sort((a, b) => a - b);
   const onSurf = (t: number) => l.surfs.some((s) => !s.head && t > s.t0 && t < s.t1);
-  const cols = [ts[0] - 2.6, ts[ts.length - 1] + 2.6];
+  // Outer masts stand beyond the outermost track, and beyond a platform on that side (JR 11番).
+  const beyond = (t: number, dir: 1 | -1) => {
+    let x = t;
+    for (const s of l.surfs) if (!s.head && x > s.t0 && x < s.t1) x = dir > 0 ? s.t1 + 0.6 : s.t0 - 0.6;
+    return x;
+  };
+  const cols = [beyond(ts[0] - 2.6, -1), beyond(ts[ts.length - 1] + 2.6, 1)];
   for (let i = 0; i < ts.length - 1; i++) {
     const m = (ts[i] + ts[i + 1]) / 2;
     if (ts[i + 1] - ts[i] > 5 && !onSurf(m)) cols.push(m);

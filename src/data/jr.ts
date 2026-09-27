@@ -263,7 +263,16 @@ export function addJrOsaka(b: NetBuilder): void {
   const nishiTop = (p: JrPlatform) => `jr_nishiTop_${p.id}`;
   for (const p of JR_PLATFORMS) {
     b.node(nishiTop(p), 'junction', `${p.nameJa} 西口階段上`, at(p, 'nishi', 0), '2F', { station: st, paid: true, y: PLAT_Y });
-    b.platformWalk(stops[p.id].nishi, nishiTop(p), { busy: p.busy, width: p.width * 0.6 });
+    if (!p.west) {
+      b.platformWalk(stops[p.id].nishi, nishiTop(p), { busy: p.busy, width: p.width * 0.6 });
+      continue;
+    }
+    // Where the body narrows into the walkway, the walking line (beside the stair wells, 1.6 m
+    // inside the south edge) steps across onto the walkway's own: just inside its east end.
+    const w = `jr_nishiW_${p.id}`;
+    b.node(w, 'junction', `${p.nameJa} 西口への通路`, jrAt(p.west.s - 1.5, p.west.t), '2F', { station: st, paid: true, y: PLAT_Y });
+    b.platformWalk(stops[p.id].nishi, w, { busy: p.busy, width: p.west.width * 0.6 });
+    b.platformWalk(w, nishiTop(p), { busy: p.busy, width: p.west.width * 0.6 });
   }
 
   const islands = JR_PLATFORMS.filter((p) => p.id !== 'jr-11');
