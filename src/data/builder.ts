@@ -718,6 +718,24 @@ export class NetBuilder {
         else if (t1 <= 0) left = Math.min(left, -t1 - 0.5);
         else left = right = 0;
       }
+      // On a platform people keep 1 m back from its edges (screens, tactile strip, the tracks).
+      const plat = e.kind === 'gate' ? undefined : (this.platformUnder(a) ?? this.platformUnder(b));
+      if (plat) {
+        const pl = Math.hypot(plat.b[0] - plat.a[0], plat.b[1] - plat.a[1]) || 1;
+        const po = { x: plat.a[0], z: plat.a[1] };
+        const pu = { x: (plat.b[0] - plat.a[0]) / pl, z: (plat.b[1] - plat.a[1]) / pl };
+        const c = -u.z * -pu.z + u.x * pu.x; // lateral rate of the edge's right-hand normal
+        const hw = plat.width / 2;
+        const steps = Math.max(1, Math.ceil(len));
+        for (let k = 0; k <= steps && Math.abs(c) > 0.05; k++) {
+          const p = { x: a.x + (b.x - a.x) * (k / steps), z: a.z + (b.z - a.z) * (k / steps) };
+          const t = alongOf(po, pu, p);
+          if (t < 0 || t > pl) continue;
+          const q = lateralOf(po, pu, p);
+          right = Math.min(right, (c > 0 ? hw - q : q + hw) / Math.abs(c) - 1);
+          left = Math.min(left, (c > 0 ? q + hw : hw - q) / Math.abs(c) - 1);
+        }
+      }
       if (left < 8 || right < 8) e.room = [Math.max(0, Math.min(8, left)), Math.max(0, Math.min(8, right))];
     }
   }

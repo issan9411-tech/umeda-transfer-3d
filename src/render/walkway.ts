@@ -625,6 +625,13 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
       if (!(h.y0 < yr - 0.3 && h.y1 > yr) || h.box[1] < bb[0] || h.box[0] > bb[1] || h.box[3] < bb[2] || h.box[2] > bb[3]) continue;
       pieces = pieces.flatMap((pc) => subtractConvex(pc, h.poly));
     }
+    // A walkway on a mezzanine above: the ceiling below it stops where it would cut through the
+    // people walking up there.
+    for (const w of space.query(bb[0], bb[1], bb[2], bb[3])) {
+      if (w.kind === 'flight' || w.kind === 'shaft' || Math.abs(w.fx) > 1e-3 || Math.abs(w.fz) > 1e-3) continue;
+      if (!(w.f0 > yr - w.clear && w.f0 < yr - 0.05)) continue;
+      pieces = pieces.flatMap((pc) => subtractConvex(pc, w.poly));
+    }
     const uvc = (p: THREE.Vector3): [number, number] => [gu(p, TX.CEIL_M), gv(p, TX.CEIL_M)];
     for (const pc of pieces) {
       const vs = pc.map(([x, z]) => V(x, yc, z));

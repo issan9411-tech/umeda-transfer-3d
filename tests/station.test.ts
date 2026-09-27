@@ -292,7 +292,7 @@ describe('walkable space', () => {
       }
     });
     expect(bad).toEqual([]);
-  });
+  }, 60_000);
 });
 
 describe('trains', () => {

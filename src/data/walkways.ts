@@ -10,9 +10,12 @@ export function addWalkways(b: NetBuilder): void {
   const D2 = { y: 6 }; // outdoor decks / pedestrian bridges
 
   // ------------------------------------------------------------------ JR大阪駅 1F (free concourses)
-  b.j('f_chuo_s', '中央南口', [34.70195, 135.4968], '1F', { label: true });
-  b.j('f_chuo_n', '中央北口', [34.70315, 135.49655], '1F', { label: true });
-  b.path(['f_chuo_s', 'jr_chuo_out', 'f_chuo_n'], { name: '中央コンコース', busy: 3, width: 25 });
+  // The 中央コンコース runs square to the tracks under the 南北連絡橋, from 中央南口 (大丸) to
+  // 暁の広場 under the ノースゲートビル atrium (中央北口).
+  b.j('f_chuo_s', '中央南口', [34.70195, 135.496247], '1F', { label: true });
+  b.j('f_chuo_mid', '中央コンコース（地下への階段上）', [34.70215, 135.496187], '1F');
+  b.j('f_chuo_n', '中央北口（暁の広場）', [34.70315, 135.495885], '1F', { label: true });
+  b.path(['f_chuo_s', 'f_chuo_mid', 'jr_chuo_out', 'f_chuo_n'], { name: '中央コンコース', busy: 3, width: 20 });
   b.j('f_mido_s', '御堂筋南口', [34.7023, 135.4976], '1F', { label: true });
   b.j('f_mido_n', '御堂筋北口', [34.70305, 135.4976], '1F', { label: true });
   b.path(['f_mido_s', 'jr_mido_out', 'f_mido_n'], { name: '御堂筋口コンコース', busy: 3, width: 15 });
@@ -33,7 +36,7 @@ export function addWalkways(b: NetBuilder): void {
 
   // Open-air 2F slope from 御堂筋北口 up to the Hankyu 2F central gate.
   b.j('f_deck_jr', '御堂筋北口 2階デッキ', [34.7034, 135.4977], '2F', D2);
-  b.vertical('f_mido_n', 'f_deck_jr', ['stairs', 'esc'], { indoor: false });
+  b.vertical('f_mido_n', 'f_deck_jr', ['stairs', 'esc'], { indoor: false, bearingUp: 13, anchor: 'bottom' });
   b.j('f_deck_mid', 'ヨドバシ前 2階デッキ', [34.7046, 135.49795], '2F', D2);
   b.path(['f_deck_jr', 'f_deck_mid'], { name: '2階歩道橋（屋根なし）', indoor: false, busy: 1 });
   b.walk('f_deck_mid', 'hk_2f_out', { name: '2階スロープ（屋根なし）', indoor: false, busy: 1 });
@@ -60,12 +63,14 @@ export function addWalkways(b: NetBuilder): void {
   b.walk('f_hs_n', 'f_hs_ne', { name: '阪神梅田本店前', indoor: false });
 
   // ------------------------------------------------------------------ JR大阪駅 north side (2F/3F decks)
-  b.j('f_br_n', '南北連絡橋 北端（ルクア3階）', [34.7032, 135.4955], '3F', { y: 15 });
-  b.j('f_br_s', '南北連絡橋 南端（大丸3階）', [34.70185, 135.4955], '3F', { y: 15 });
+  // The 3F 南北連絡橋 on the 中央 stack line: 大丸 4F in the south, the ルクア / ルクア1100
+  // boundary (the atrium) in the north. The アトリウム広場 is straight above 暁の広場.
+  b.j('f_br_n', '南北連絡橋 北端（ルクア3階）', [34.7032, 135.495765], '3F', { y: 15 });
+  b.j('f_br_s', '南北連絡橋 南端（大丸梅田店4階）', [34.70185, 135.496173], '3F', { y: 15 });
   b.path(['f_br_s', 'jr_br_out', 'f_br_n'], { name: '南北連絡橋', busy: 2, width: 12 });
-  b.j('f_atrium', 'アトリウム広場（ノースゲートビル2階）', [34.7033, 135.4959], '2F', { label: true });
-  b.vertical('f_br_n', 'f_atrium', ['stairs', 'esc', 'elev']);
-  b.vertical('f_chuo_n', 'f_atrium', ['esc', 'elev']);
+  b.j('f_atrium', 'アトリウム広場（ノースゲートビル2階）', [34.703305, 135.495825], '2F', { label: true, y: 7 });
+  b.vertical('f_br_n', 'f_atrium', ['stairs', 'esc', 'elev'], { bearingUp: 166, anchor: 'top' });
+  b.vertical('f_chuo_n', 'f_atrium', ['esc', 'elev'], { bearingUp: 346, anchor: 'bottom' });
   b.j('f_daimaru1', '大丸梅田店 1階', [34.70175, 135.4963], '1F');
   b.vertical('f_br_s', 'f_daimaru1', ['esc', 'elev'], { name: '大丸梅田店 店内' });
   b.walk('f_daimaru1', 'f_chuo_s', { name: '大丸梅田店前' });
@@ -88,14 +93,14 @@ export function addWalkways(b: NetBuilder): void {
   b.walk('f_gfo1', 'f_ugp1', { name: 'うめきた広場〜グリーンプレイス', indoor: false });
 
   // ------------------------------------------------------------------ B1: north (ルクア・グランフロント・阪急三番街)
-  b.j('f_lucua_b1', 'ルクア地下1階（バルチカ）', [34.7033, 135.4966], 'B1', B1);
+  b.j('f_lucua_b1', 'ルクア地下1階（バルチカ）', [34.703305, 135.495825], 'B1', B1);
   b.vertical('f_chuo_n', 'f_lucua_b1', ['stairs', 'esc']);
   b.j('f_gfo_b1', 'グランフロント大阪 南館地下1階', [34.7041, 135.4949], 'B1', B1);
   b.path(['f_lucua_b1', 'f_gfo_b1', 'uk_gate_out'], { name: 'ルクア〜グランフロント地下通路', busy: 1 });
   b.vertical('f_gfo1', 'f_gfo_b1', ['stairs', 'esc', 'elev']);
   b.j('f_midon_b1', 'JR御堂筋北口 地下', [34.7032, 135.4977], 'B1', B1);
   b.walk('f_lucua_b1', 'f_midon_b1', { name: 'ルクア地下通路', busy: 2 });
-  b.vertical('f_mido_n', 'f_midon_b1', ['stairs', 'esc', 'elev']);
+  b.vertical('f_mido_n', 'f_midon_b1', ['stairs', 'esc', 'elev'], { bearingUp: 209, anchor: 'top' });
   b.walk('f_midon_b1', 'm_n_out', { name: '御堂筋線北改札前通路', busy: 3 });
   b.j('f_hkd_b1', '阪急うめだ本店 地下1階前', [34.7033, 135.4989], 'B1', { ...B1, label: false });
   b.walk('m_n_out', 'f_hkd_b1', { busy: 3 });
@@ -107,12 +112,16 @@ export function addWalkways(b: NetBuilder): void {
 
   // ------------------------------------------------------------------ B1: JR大阪駅前 / 阪神 / ホワイティうめだ
   b.j('f_jrf_b1', 'JR大阪駅前 地下（御堂筋南口下）', [34.7021, 135.49775], 'B1', { ...B1, label: false });
-  b.vertical('f_mido_s', 'f_jrf_b1', ['stairs', 'esc', 'elev'], { busy: 3 });
+  b.vertical('f_mido_s', 'f_jrf_b1', ['stairs', 'esc', 'elev'], { busy: 3, bearingUp: 328, anchor: 'top' });
   b.walk('f_jrf_b1', 'm_c_out', { busy: 3 });
   b.j('f_hsne_b1', '阪神梅田本店 東側地下', [34.7012, 135.4981], 'B1', B1);
   b.path(['f_jrf_b1', 'f_hsne_b1', 'hs_e_out', 'm_s_out'], { name: '梅田地下街（阪神東口）', busy: 3 });
   b.j('f_chuo_b1', '阪神百貨店口前 地下', [34.70158, 135.4968], 'B1', B1);
-  b.vertical('f_chuo_s', 'f_chuo_b1', ['stairs', 'esc']);
+  // The stairs to B1 are in the 中央コンコース ≈50 m south of the gate, going down heading south
+  // into the passage under 大丸 towards 阪神.
+  b.j('f_chuo_s_b1', '中央南口 地下（大丸前）', [34.70201, 135.496229], 'B1', B1);
+  b.vertical('f_chuo_mid', 'f_chuo_s_b1', ['stairs', 'esc', 'elev'], { bearingUp: 346, anchor: 'top' });
+  b.walk('f_chuo_s_b1', 'f_chuo_b1', { name: '大丸梅田店 地下通路' });
   b.vertical('f_hs_n', 'f_chuo_b1', ['stairs']);
   b.j('f_hsnw_b1', '阪神梅田本店 西側地下', [34.70142, 135.4958], 'B1', B1);
   b.path(['f_hsnw_b1', 'f_chuo_b1', 'f_hsne_b1'], { name: '阪神梅田本店 北側地下通路', busy: 2 });
