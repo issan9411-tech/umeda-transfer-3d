@@ -1,5 +1,5 @@
 import type { EdgeKind, Footprint, Level, Line, NetEdge, NetNode, Network, NodeKind, Platform, Road, Station } from '../core/types';
-import { alongOf, corners, detour, inflate, lateralOf, rectFromFrame, rectsOverlap, segmentHitsRect, type ORect } from './flight-layout';
+import { alongOf, corners, detour, inflate, insideRect, lateralOf, rectFromFrame, rectsOverlap, segmentHitsRect, type ORect } from './flight-layout';
 
 /** Local tangent plane centred on JR Osaka Station (Mapion reference point 34.70249, 135.49567). */
 export const ORIGIN = { lat: 34.7025, lon: 135.4957 };
@@ -71,6 +71,50 @@ interface VerticalSpec {
   b: string;
   modes: VerticalMode[];
   o: EdgeOpts & FlightOpts;
+}
+
+/**
+ * A flight or shaft already laid out: its plan rectangle, the height of its walking surface along
+ * it (linear from y0 at s = 0 to y1 at s = len, along axis u from o), and the parts that other
+ * walkways must avoid on each level: `low` (less than head room above the lower floor) and `well`
+ * (the opening in the upper floor, where the flight is less than head room below it).
+ */
+interface Placed {
+  full: ORect;
+  low: ORect;
+  well: ORect;
+  o: XZ;
+  u: XZ;
+  len: number;
+  y0: number;
+  y1: number;
+  shaft: boolean;
+}
+
+/** Head room plus slab: an upper floor may run over a flight only this far above its surface. */
+export const WELL_HEADROOM = 2.6;
+
+/** Whether two flights / shafts would occupy the same space (surfaces closer than head room). */
+function clash(a: Placed, b: Placed): boolean {
+  if (!rectsOverlap(inflate(a.full, 0.2), b.full)) return false;
+  const n = { x: -a.u.z, z: a.u.x };
+  const hw = a.full.hn;
+  for (let s = 0; s <= a.len + 1e-6; s += 0.5) {
+    const ha = a.shaft ? null : a.y0 + ((a.y1 - a.y0) * s) / Math.max(a.len, 1e-6);
+    for (const t of [-hw, 0, hw]) {
+      const p = { x: a.o.x + a.u.x * s + n.x * t, z: a.o.z + a.u.z * s + n.z * t };
+      if (!insideRect(inflate(b.full, 0.2), p)) continue;
+      if (b.shaft || a.shaft) {
+        const [lo, hi] = a.shaft ? [a.y0, a.y1] : [ha as number, ha as number];
+        if (hi > b.y0 - WELL_HEADROOM && lo < b.y1 + WELL_HEADROOM) return true;
+        continue;
+      }
+      const sb = alongOf(b.o, b.u, p);
+      const hb = b.y0 + ((b.y1 - b.y0) * Math.max(0, Math.min(b.len, sb))) / Math.max(b.len, 1e-6);
+      if (Math.abs((ha as number) - hb) < WELL_HEADROOM) return true;
+    }
+  }
+  return false;
 }
 
 /** Stair going per metre of rise (30 cm treads, 16 cm risers ≈ 28°). */
@@ -245,7 +289,7 @@ export class NetBuilder {
 
   private readonly verticals: VerticalSpec[] = [];
   /** Footprints of flights already laid out (bundles must not overlap). */
-  private readonly placedFlights: { rect: ORect; y0: number; y1: number }[] = [];
+  private readonly placedFlights: Placed[] = [];
 
   private addVertical(a: string, b: string, modes: Omit<VerticalMode, 'o'>[], o: EdgeOpts & FlightOpts): this {
     this.get(a);
@@ -404,11 +448,21 @@ export class NetBuilder {
       // node()) must lie outside, or no walkway could leave them.
       return rectFromFrame(f.o, f.u, s0 + 0.2, sLow, (lat.get(k) as number) - w / 2 - 0.15, (lat.get(k) as number) + w / 2 + 0.15);
     };
+    // The upper floor opens only where the flight is less than head room below it.
     const well = (k: number, m: VerticalMode): ORect => {
       const [s0, s1] = span.get(k) as [number, number];
       const w = widthOf(m);
-      return rectFromFrame(f.o, f.u, s0 + 0.2, s1 - 0.2, (lat.get(k) as number) - w / 2 - 0.15, (lat.get(k) as number) + w / 2 + 0.15);
+      const sw = s1 - (s1 - s0) * Math.min(1, WELL_HEADROOM / rise);
+      return rectFromFrame(f.o, f.u, Math.max(s0 + 0.2, sw), s1 - 0.2, (lat.get(k) as number) - w / 2 - 0.15, (lat.get(k) as number) + w / 2 + 0.15);
     };
+    const placed = (k: number, m: VerticalMode): Placed => {
+      const [s0, s1] = span.get(k) as [number, number];
+      const w = widthOf(m);
+      const l = lat.get(k) as number;
+      const o = { x: f.o.x + f.u.x * s0 + f.n.x * l, z: f.o.z + f.u.z * s0 + f.n.z * l };
+      return { full: rectFromFrame(f.o, f.u, s0, s1, l - w / 2 - 0.15, l + w / 2 + 0.15), low: lowPart(k, m), well: well(k, m), o, u: f.u, len: s1 - s0, y0: L.y, y1: U.y, shaft: false };
+    };
+    const placedShaft = (r: ORect): Placed => ({ full: r, low: r, well: r, o: r.c, u: r.u, len: 0, y0: L.y, y1: U.y, shaft: true });
     // Slide the bundle along (and, off platforms, across) its line until no corridor centre line
     // on either level runs through a flight (its low end below, its well above) and it does not
     // overlap flights laid out before it.
@@ -423,20 +477,21 @@ export class NetBuilder {
         if (Math.abs(a.y - L.y) < 0.6 && Math.abs(b.y - L.y) < 0.6) lines.push({ a, b, level: 'low' });
         else if (Math.abs(a.y - U.y) < 0.6 && Math.abs(b.y - U.y) < 0.6) lines.push({ a, b, level: 'high' });
       }
-      const others = this.placedFlights.filter((p) => p.y0 < U.y + 2.3 && p.y1 > L.y - 2.3);
+      const others = this.placedFlights.filter((p) => p.y0 < U.y + WELL_HEADROOM && p.y1 > L.y - WELL_HEADROOM);
       const cost = () => {
         let c = 0;
         for (const { m, k } of flights) {
           const lo = inflate(lowPart(k, m), 0.6);
           const hi = inflate(well(k, m), 0.4);
           for (const ln of lines) if (segmentHitsRect(ln.level === 'low' ? lo : hi, ln.a, ln.b)) c++;
-          const w = well(k, m);
-          for (const o of others) if (rectsOverlap(w, o.rect)) c++;
+          const me = placed(k, m);
+          for (const o of others) if (clash(me, o)) c++;
         }
         for (const sh of shafts) {
           const r = inflate(sh.rect, 0.5);
           for (const ln of lines) if (segmentHitsRect(r, ln.a, ln.b)) c++;
-          for (const o of others) if (rectsOverlap(sh.rect, o.rect)) c++;
+          const me = placedShaft(sh.rect);
+          for (const o of others) if (clash(me, o)) c++;
         }
         return c;
       };
@@ -455,8 +510,8 @@ export class NetBuilder {
       }
       place(best.ds, best.dl);
       if (dry) return best.c;
-      for (const { m, k } of flights) this.placedFlights.push({ rect: well(k, m), y0: L.y, y1: U.y });
-      for (const sh of shafts) this.placedFlights.push({ rect: sh.rect, y0: L.y, y1: U.y });
+      for (const { m, k } of flights) this.placedFlights.push(placed(k, m));
+      for (const sh of shafts) this.placedFlights.push(placedShaft(sh.rect));
     }
     const lowObstacles = [...flights.map(({ m, k }) => lowPart(k, m)), ...shafts.map((x) => x.rect)];
     const highObstacles = [...flights.map(({ m, k }) => well(k, m)), ...shafts.map((x) => x.rect)];
@@ -650,7 +705,10 @@ export class NetBuilder {
       let right = Infinity;
       for (const f of this.placedFlights) {
         if (y < f.y0 - 0.3 || y > f.y1 + 0.3) continue;
-        const cs = corners(f.rect);
+        // On the lower floor the flight's low end is in the way, on the upper one its opening.
+        const rect = f.shaft ? f.full : Math.abs(y - f.y0) < 0.6 ? f.low : Math.abs(y - f.y1) < 0.6 ? f.well : null;
+        if (!rect) continue;
+        const cs = corners(rect);
         const ss = cs.map((p) => alongOf(a, u, p));
         if (Math.max(...ss) < -0.5 || Math.min(...ss) > len + 0.5) continue;
         const ts = cs.map((p) => lateralOf(a, u, p));

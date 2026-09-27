@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { Graph } from '../core/graph';
 import type { NetEdge, NetNode, Platform } from '../core/types';
 import { lateralRoom } from '../sim/crowd';
+import { WELL_HEADROOM } from '../data/builder';
 import { CLEARANCE, flightWidth, WalkSpace, type WalkPiece } from './walk-space';
 import * as TX from './walkway-tex';
 import { arrowFor, cabinCycle, destinationsVia, dominantAngle, hash01, isMallEdge, isVertical, laneOffsets, mouthTrims, subtractConvex, type P2, type SignTarget } from './walkway-util';
@@ -497,24 +498,47 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     const poly = pts.map((p) => [p.x, p.z] as P2);
     wells.push({ poly, y, box: boxOf(poly) });
   };
+  /**
+   * Distance along a flight (from its foot) where its opening in the upper floor starts: the
+   * upper floor can only run over the flight where there is head room under it.
+   */
+  const wellStart = (f: Flight, run: number) => {
+    const A = P(f.lo);
+    const dir = frame(A, P(f.hi)).dir;
+    const pts = [{ s: 0, y: f.lo.y }, ...f.segs.map((sg) => ({ s: Math.max(0, P(sg.b).sub(A).dot(dir)), y: sg.b.y }))];
+    const want = f.hi.y - WELL_HEADROOM;
+    for (let i = 1; i < pts.length; i++) {
+      if (pts[i].y < want) continue;
+      const p0 = pts[i - 1];
+      const p1 = pts[i];
+      if (p1.y - p0.y < 1e-6) return Math.max(0, p0.s);
+      return Math.max(0, Math.min(run, p0.s + ((want - p0.y) / (p1.y - p0.y)) * (p1.s - p0.s)));
+    }
+    return 0;
+  };
   for (const f of flights) {
     const A = P(f.lo);
     const B = P(f.hi);
     const { dir, left, run } = frame(A, B);
     const hw = f.w / 2 + 0.15;
+    // The well (the opening in the upper floor) covers the top part of the flight only; the
+    // lower levels' ceilings open over the whole flight.
     let pts: THREE.Vector3[];
+    let hole: THREE.Vector3[];
     if (f.kind === 'elevator' || run < 0.5) {
       const d = dir.clone().multiplyScalar(1.3);
       const l = left.clone().multiplyScalar(1.3);
-      pts = [A.clone().sub(d).sub(l), A.clone().add(d).sub(l), A.clone().add(d).add(l), A.clone().sub(d).add(l)];
+      pts = hole = [A.clone().sub(d).sub(l), A.clone().add(d).sub(l), A.clone().add(d).add(l), A.clone().sub(d).add(l)];
     } else {
-      const a0 = A.clone().sub(dir.clone().multiplyScalar(0.1));
+      const a0 = A.clone().add(dir.clone().multiplyScalar(Math.max(0, wellStart(f, run) - 0.1)));
       const b0 = B.clone().sub(dir.clone().multiplyScalar(0.05));
       const l = left.clone().multiplyScalar(hw);
       pts = [a0.clone().sub(l), b0.clone().sub(l), b0.clone().add(l), a0.clone().add(l)];
+      const f0 = A.clone().sub(dir.clone().multiplyScalar(0.1));
+      hole = [f0.clone().sub(l), b0.clone().sub(l), b0.clone().add(l), f0.clone().add(l)];
     }
     if (B.y - A.y >= 1) addWell(pts, B.y);
-    const poly = pts.map((p) => [p.x, p.z] as P2);
+    const poly = hole.map((p) => [p.x, p.z] as P2);
     ceilHoles.push({ poly, y0: f.lo.y, y1: f.hi.y + CLEARANCE, box: boxOf(poly) });
   }
 
@@ -1121,11 +1145,12 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
 
     // Balustrade around the opening in the upper floor (open at the top of the flight): glass
     // in concourses, solid panels on platforms. Clipped where a walkway meets the opening.
+    const sw = wellStart(f, run);
     const edge = (s: number, lat: number) => line(s, lat).setY(B.y);
     const sides: [THREE.Vector3, THREE.Vector3, THREE.Vector3][] = [
-      [edge(0, lmin - 0.08), edge(run, lmin - 0.08), left.clone().negate()],
-      [edge(0, lmax + 0.08), edge(run, lmax + 0.08), left],
-      [edge(0, lmin - 0.08), edge(0, lmax + 0.08), dir.clone().negate()],
+      [edge(sw, lmin - 0.08), edge(run, lmin - 0.08), left.clone().negate()],
+      [edge(sw, lmax + 0.08), edge(run, lmax + 0.08), left],
+      [edge(sw, lmin - 0.08), edge(sw, lmax + 0.08), dir.clone().negate()],
     ];
     for (const [p0, p1, out] of sides) {
       const t0 = p0.clone().setY(p0.y + rh);
@@ -1137,9 +1162,11 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
       for (const [a0, a1] of runs) boxes.beam(t0.clone().lerp(t1, a0), t0.clone().lerp(t1, a1), 0.08, 0.08, c.railLight);
     }
 
-    // One enclosure around the flight: a double-height well with a flat ceiling at the upper
-    // level's ceiling height (parapet height under an open platform) and a bulkhead over the
-    // lower opening. Walls are clipped wherever a walkway runs beside or across the well.
+    // One enclosure around the flight. Where the upper floor still runs over the flight (its
+    // lower part, s < sw) the walls stop under that floor and a soffit closes them; around the
+    // opening (s ≥ sw) the well is double height with a flat ceiling at the upper level's ceiling
+    // height (parapet height under an open platform). A bulkhead closes the gap over the lower
+    // opening. Walls are clipped wherever a walkway runs beside or across the well.
     if (!f.indoor) continue;
     const H = 3.0 * ex;
     const top = rise + (upperRoofed ? H : rh); // above the foot
@@ -1147,6 +1174,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     const flat = (s: number, lat: number, h: number) => line(s, lat).setY(A.y + h);
     const tint = c.wallStation;
     const low = tint.clone().multiplyScalar(0.8);
+    const swW = Math.min(run, sw);
     // Side walls stop at the lower level's ceiling: around the foot of the flight the lower
     // concourse stays open (people walk past it there).
     let sx = run;
@@ -1156,23 +1184,34 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
         break;
       }
     }
+    const cuts = [...new Set([0, sx, swW, run].map((v) => Math.round(v * 1000) / 1000))].sort((a, b) => a - b);
     for (const [lat, want] of [[lmin, left], [lmax, left.clone().negate()]] as const) {
-      if (sx > 0.05) {
-        const v0 = H / top;
-        vquad(geo.wall, flat(0, lat, H), flat(sx, lat, H), flat(sx, lat, top), flat(0, lat, top), [0, v0, sx / TX.WALL_M, v0, sx / TX.WALL_M, 1, 0, 1], want, tint, skipOwn);
-      }
-      if (sx < run - 0.05) {
-        vquad(geo.wall, line(sx, lat, below), line(run, lat, below), flat(run, lat, top), flat(sx, lat, top), uvRect(sx / TX.WALL_M, 0, run / TX.WALL_M, 1), want, [low, low, tint, tint], skipOwn);
+      for (let i = 1; i < cuts.length; i++) {
+        const s0 = cuts[i - 1];
+        const s1 = cuts[i];
+        if (s1 - s0 < 0.05) continue;
+        const cap = s0 >= swW - 1e-3 ? top : rise;
+        const hang = s1 <= sx + 1e-3; // hangs from the lower ceiling (open below)
+        const b0 = hang ? flat(s0, lat, H) : line(s0, lat, below);
+        const b1 = hang ? flat(s1, lat, H) : line(s1, lat, below);
+        if (Math.max(b0.y, b1.y) >= A.y + cap - 0.05) continue;
+        const v0 = hang ? H / top : 0;
+        vquad(geo.wall, b0, b1, flat(s1, lat, cap), flat(s0, lat, cap), [s0 / TX.WALL_M, v0, s1 / TX.WALL_M, v0, s1 / TX.WALL_M, cap / top, s0 / TX.WALL_M, cap / top], want, hang ? tint : [low, low, tint, tint], skipOwn);
       }
     }
-    const bulkTop = upperRoofed ? top : rise;
+    const bulkTop = swW > 0.05 ? rise : upperRoofed ? top : rise;
     if (bulkTop > H + 0.1) {
-      geo.wall.quad(flat(0, lmin, H), flat(0, lmax, H), flat(0, lmax, bulkTop), flat(0, lmin, bulkTop), uvRect(0, 0.85, (lmax - lmin) / TX.WALL_M, 1), dir, tint);
+      vquad(geo.wall, flat(0, lmin, H), flat(0, lmax, H), flat(0, lmax, bulkTop), flat(0, lmin, bulkTop), uvRect(0, 0.85, (lmax - lmin) / TX.WALL_M, 1), dir, tint, skipOwn);
     }
-    if (!upperRoofed) continue;
-    const q = [flat(0, lmin, top), flat(run, lmin, top), flat(run, lmax, top), flat(0, lmax, top)] as const;
+    if (swW > 0.05 && rise > H + 0.1) {
+      // Soffit of the upper floor over the covered part of the flight.
+      const q = [flat(0, lmin, rise - 0.02), flat(swW, lmin, rise - 0.02), flat(swW, lmax, rise - 0.02), flat(0, lmax, rise - 0.02)] as const;
+      geo.ceil.quad(q[0], q[1], q[2], q[3], gridUV(q[0], q[1], q[2], q[3], TX.CEIL_M), DOWN);
+    }
+    if (!upperRoofed || run - swW < 0.3) continue;
+    const q = [flat(swW, lmin, top), flat(run, lmin, top), flat(run, lmax, top), flat(swW, lmax, top)] as const;
     geo.ceil.quad(q[0], q[1], q[2], q[3], gridUV(q[0], q[1], q[2], q[3], TX.CEIL_M), DOWN);
-    for (let s = 0.8; s + 2.4 <= run - 0.4; s += 3.4) {
+    for (let s = swW + 0.8; s + 2.4 <= run - 0.4; s += 3.4) {
       geo.light.quad(flat(s, -0.13, top - 0.03), flat(s + 2.4, -0.13, top - 0.03), flat(s + 2.4, 0.13, top - 0.03), flat(s, 0.13, top - 0.03), uvRect(0, 0, 1, 1), DOWN);
     }
   }
