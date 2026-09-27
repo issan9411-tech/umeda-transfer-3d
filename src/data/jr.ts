@@ -318,19 +318,32 @@ export function addJrOsaka(b: NetBuilder): void {
 
 // ------------------------------------------------------------------------------------------------
 
-/** うめきたエリア: 2 island platforms (21/22, 23/24) on B2 ≈ −15 m, gate concourse B1 ≈ −7 m. */
+/**
+ * うめきたエリア (opened 2023-03-18): 2 island platforms (tracks 21–24) on B2 ≈ −15 m, ≈200 m long,
+ * with the うめきた地下口 gate concourse on B1 ≈ −7 m. The box lies under うめきたグリーンプレイス,
+ * just west of the N–S road through 梅田ランプ東 (lon ≈135.4939, Mapion/NAVITIME), on a gently
+ * curved NNE–SSW alignment.
+ *
+ * Islands from east to west: 21・22 | 23・24 (left-hand running on a N–S line: 21 = southbound はるか・
+ * くろしお, 24 = northbound). The gate is at the NORTH end of the paid concourse (you face south
+ * entering, north leaving). Each island has a stair+escalator pair at the gate end (手前) and one at
+ * the far end (奥), with a lift between them; the paid passage from 西口 arrives at the far end on the
+ * 21・22 side (station guides; travel.watch.impress.co.jp).
+ */
 export function addUmekita(b: NetBuilder): void {
   const st = 'umekita';
-  const center: LatLon = [34.70345, 135.4935];
-  const axis = 26; // NNE–SSW, on a sharp curve
+  const center: LatLon = [34.70345, 135.49345];
+  const axis = 10; // NNE–SSW
   const half = 100;
+  /** Point u m along the axis (north +) and v m across it (east +) from the box centre. */
+  const U = (u: number, v: number): XZ => offset(offset(center, axis, u), axis + 90, v);
   const islands = [
-    { id: 'uk-21-22', nameJa: '21・22番のりば', lines: ['jr-umekita', 'jr-higashi'], directions: '21番 はるか・くろしお（関西空港・和歌山）／22番 おおさか東線 直通快速・まほろば', side: -9 },
-    { id: 'uk-23-24', nameJa: '23・24番のりば', lines: ['jr-higashi', 'jr-umekita'], directions: '23番 おおさか東線 普通／24番 はるか・くろしお（新大阪・京都）', side: 9 },
+    { id: 'uk-21-22', nameJa: '21・22番のりば', lines: ['jr-umekita', 'jr-higashi'], directions: '21番 はるか・くろしお（関西空港・和歌山）／22番 おおさか東線 直通快速・まほろば', side: 9 },
+    { id: 'uk-23-24', nameJa: '23・24番のりば', lines: ['jr-higashi', 'jr-umekita'], directions: '23番 おおさか東線 普通／24番 はるか・くろしお（新大阪・京都）', side: -9 },
   ];
   const stops: Record<string, Record<string, string>> = {};
   for (const is of islands) {
-    const c = offset(center, axis + 90, is.side);
+    const c = U(0, is.side);
     stops[is.id] = b.platform({
       id: is.id,
       station: st,
@@ -344,45 +357,76 @@ export function addUmekita(b: NetBuilder): void {
       width: 9,
       busy: 1,
       stops: [
-        { key: 's', t: 0.2, name: '南寄り（新大阪方）' },
+        { key: 's', t: 0.2, name: '南寄り（西九条・関空方）' },
         { key: 'm', t: 0.5, name: '中ほど（うめきた地下口への階段付近）' },
-        { key: 'n', t: 0.8, name: '北寄り' },
+        { key: 'n', t: 0.8, name: '北寄り（新大阪方）' },
       ],
     });
   }
 
-  // B1 in-gate concourse above the platforms
-  b.node('uk_conc', 'junction', 'うめきた地下口 改札内コンコース', offset(center, axis + 180, 10), 'B1', { station: st, paid: true, y: -7 });
+  // B1 paid concourse: gate at the north end, the 西口 passage at the south-east corner.
+  const paid = { station: st, paid: true, y: -7 };
+  b.node('uk_conc', 'junction', 'うめきた地下口 改札内コンコース', [34.703397, 135.493439], 'B1', paid);
+  b.node('uk_conc_s', 'junction', 'うめきた地下口 改札内コンコース（西口連絡通路側）', [34.703166, 135.493389], 'B1', paid);
+  b.node('uk_gate_in', 'gate', 'うめきた地下口改札', [34.70369, 135.493501], 'B1', { ...paid, label: true });
+  b.walk('uk_conc', 'uk_gate_in');
+  b.walk('uk_conc', 'uk_conc_s');
   for (const is of islands) {
-    const land = `uk_land_${is.id}`;
-    b.node(land, 'vertical', `${is.nameJa}への階段上`, offset(offset(center, axis + 90, is.side * 0.6), axis + 180, 4), 'B1', { station: st, paid: true, y: -7 });
-    b.walk('uk_conc', land);
-    b.vertical(stops[is.id].m, land, ['stairs', 'esc', 'elev']);
+    const hN = `uk_land_${is.id}`;
+    const hS = `uk_landS_${is.id}`;
+    const ev = `uk_ev_${is.id}`;
+    b.node(hN, 'vertical', `${is.nameJa}への階段上（改札寄り）`, U(18, is.side), 'B1', paid);
+    b.node(hS, 'vertical', `${is.nameJa}への階段上（西口連絡通路寄り）`, U(-30, is.side), 'B1', paid);
+    b.node(ev, 'vertical', `${is.nameJa}へのエレベーター`, U(-6, is.side), 'B1', paid);
+    b.walk('uk_gate_in', hN);
+    b.walk('uk_conc_s', hS);
+    b.walk('uk_conc', ev);
+    // 手前 pair rises north toward the gate from the platform middle; 奥 pair rises south toward
+    // the 西口 passage, reached along the platform edge (clear of the lift between them).
+    const okuFoot = `uk_okuFoot_${is.id}`;
+    b.node(okuFoot, 'junction', `${is.nameJa} 西口連絡通路寄り階段下`, U(-11, is.side), 'B2', { station: st, paid: true, y: -15 });
+    b.platformWalk(stops[is.id].m, okuFoot, { busy: 1, width: 9 * 0.6 });
+    b.vertical(stops[is.id].m, hN, ['stairs', 'esc'], { bearingUp: axis, anchor: 'top' });
+    b.vertical(okuFoot, hS, ['stairs', 'esc'], { bearingUp: axis + 180, anchor: 'top' });
+    b.vertical(stops[is.id].m, ev, ['elev'], { anchor: 'top' });
   }
 
-  // Paid passage from JR 西口 (1F) down to B2 (≈ −11 m), ≈70 m north, then up to the B1 concourse
+  // Paid passage from JR 西口 (1F): a deep flight down to B2 (≈ −11 m, to pass under the sewer main
+  // of the E–W road), ≈60–70 m north-west, then up into the concourse (≈2 min, travel.watch.impress.co.jp).
   b.node('uk_pass_top', 'vertical', '西口 うめきた連絡通路入口', [34.70246, 135.49412], '1F', { station: 'jr', paid: true });
   b.walk('jr_nishi1_jr-9-10', 'uk_pass_top', { name: '西口改札内コンコース' });
   b.walk('jr_nishi_in', 'uk_pass_top', { name: '西口改札内コンコース' });
   b.node('uk_pass_s', 'vertical', 'うめきた連絡通路（南端）', [34.70262, 135.49398], 'B2', { station: 'jr', paid: true, y: -11 });
-  b.vertical('uk_pass_top', 'uk_pass_s', ['stairs', 'esc', 'elev'], { name: '西口連絡通路' });
-  b.node('uk_pass_n', 'vertical', 'うめきた連絡通路（北端）', [34.70323, 135.49378], 'B2', { station: 'jr', paid: true, y: -11 });
+  // Head in the north part of the 西口 concourse; it descends NNW, so going up you face SE.
+  b.vertical('uk_pass_top', 'uk_pass_s', ['stairs', 'esc', 'elev'], { name: '西口連絡通路', bearingUp: 144, anchor: 'top' });
+  b.node('uk_pass_n', 'vertical', 'うめきた連絡通路（北端）', [34.703055, 135.493623], 'B2', { station: 'jr', paid: true, y: -11 });
   b.walk('uk_pass_s', 'uk_pass_n', { name: 'うめきた地下連絡通路（改札内）', width: 8 });
   // The passage belongs to both paid areas; model the station boundary as open (same fare system).
-  b.node('uk_pass_up', 'vertical', 'うめきた地下口コンコース（連絡通路側）', [34.70335, 135.4938], 'B1', { station: st, paid: true, y: -7 });
-  b.vertical('uk_pass_n', 'uk_pass_up', ['stairs', 'esc', 'elev']);
-  b.walk('uk_pass_up', 'uk_conc');
+  b.node('uk_pass_up', 'vertical', 'うめきた地下口コンコース（連絡通路側）', [34.703129, 135.493581], 'B1', paid);
+  b.vertical('uk_pass_n', 'uk_pass_up', ['stairs', 'esc', 'elev'], { bearingUp: 335, anchor: 'top' });
+  b.walk('uk_pass_up', 'uk_conc_s');
+  b.walk('uk_pass_up', 'uk_landS_uk-21-22');
 
-  // Gate and outside connections
-  b.node('uk_gate_in', 'gate', 'うめきた地下口改札', [34.7036, 135.49385], 'B1', { station: st, paid: true, label: true, y: -7 });
-  b.walk('uk_conc', 'uk_gate_in');
-  b.node('uk_gate_out', 'junction', 'うめきた地下口前', [34.70372, 135.49392], 'B1', { station: st, y: -7 });
+  // Gate and the free B1 corridor in front of it (E–W): west to うめきた公園 and グラングリーン大阪
+  // 南館, east to the ground exit into うめきたグリーンプレイス and on to グランフロント大阪 B1.
+  b.node('uk_gate_out', 'junction', 'うめきた地下口前', [34.703761, 135.493516], 'B1', { station: st, y: -7 });
   b.gate('uk_gate_in', 'uk_gate_out', 'JR うめきた地下口改札', { busy: 1 });
+  b.node('uk_sp_b1', 'junction', 'うめきた地下口前（うめきた公園・南館方面）', [34.703761, 135.493243], 'B1', { station: st, y: -7 });
+  b.walk('uk_gate_out', 'uk_sp_b1', { name: 'うめきた地下口前通路' });
+  b.node('uk_b1_e', 'junction', 'うめきた地下口前通路（グランフロント・地上出口方面）', [34.703761, 135.493756], 'B1', { station: st, y: -7 });
+  b.walk('uk_gate_out', 'uk_b1_e', { name: 'うめきた地下口前通路' });
 }
 
 // ------------------------------------------------------------------------------------------------
 
-/** JR北新地: island platform ≈ −23 m under 曽根崎通 (bearing ≈100°), gates at both ends. */
+/**
+ * JR北新地: island platform ≈ −23 m under 曽根崎通 (国道2号, bearing ≈101°), gates at both ends.
+ * Both gates open NORTH onto one free E–W corridor along the north side of the box (at the level
+ * of the 大阪駅前ビル B2 floors): 西改札 just east of 四つ橋筋 with the 西梅田連絡口 beside it,
+ * 東改札 facing the 大阪駅前第2ビル B2 entrance, and the ディアモール spine arriving between them
+ * at the big 北新地駅 sign (ja.wikipedia.org, osaka-station.net). The platform stair banks rise
+ * outward, toward the end gates.
+ */
 export function addKitashinchi(b: NetBuilder): void {
   const st = 'kitashinchi';
   const center: LatLon = [34.69831, 135.49702];
@@ -400,28 +444,30 @@ export function addKitashinchi(b: NetBuilder): void {
     width: 9,
     busy: 2,
     stops: [
-      { key: 'w', t: 0.12, name: '西寄り（西改札・西梅田方面）' },
+      // At the feet of the end banks, so nobody doubles back under a well.
+      { key: 'w', t: 0.18, name: '西寄り（西改札・西梅田方面）' },
       { key: 'm', t: 0.5, name: '中ほど' },
-      { key: 'e', t: 0.88, name: '東寄り（東改札・東梅田方面）' },
+      { key: 'e', t: 0.82, name: '東寄り（東改札・東梅田方面）' },
     ],
   });
-  b.node('ks_wc', 'junction', '北新地 西改札内コンコース', offset(center, axis + 180, 70), 'B2', { station: st, paid: true, y: -10 });
-  b.node('ks_ec', 'junction', '北新地 東改札内コンコース', offset(center, axis, 70), 'B2', { station: st, paid: true, y: -10 });
-  b.vertical(s.w, 'ks_wc', ['stairs', 'esc']);
-  b.vertical(s.e, 'ks_ec', ['stairs', 'esc', 'elev']);
+  // Bank heads 3 m inside the platform ends; the 13 m rise needs ≈25–30 m of run.
+  b.node('ks_wc', 'junction', '北新地 西改札内コンコース', [34.698451, 135.49614], 'B2', { station: st, paid: true, y: -10 });
+  b.node('ks_ec', 'junction', '北新地 東改札内コンコース', [34.698169, 135.4979], 'B2', { station: st, paid: true, y: -10 });
+  b.vertical(s.w, 'ks_wc', ['stairs', 'esc'], { bearingUp: 281, anchor: 'top' });
+  b.vertical(s.e, 'ks_ec', ['stairs', 'esc', 'elev'], { bearingUp: 101, anchor: 'top' });
 
-  b.node('ks_w_in', 'gate', '北新地 西改札', [34.69852, 135.4959], 'B2', { station: st, paid: true, label: true, y: -10 });
+  b.node('ks_w_in', 'gate', '北新地 西改札', [34.69857, 135.495857], 'B2', { station: st, paid: true, label: true, y: -10 });
   b.walk('ks_wc', 'ks_w_in');
-  b.node('ks_w_out', 'junction', '北新地 西改札前', [34.6986, 135.49575], 'B2', { station: st, y: -10 });
+  b.node('ks_w_out', 'junction', '北新地 西改札前', [34.698632, 135.495871], 'B2', { station: st, y: -10 });
   b.gate('ks_w_in', 'ks_w_out', 'JR北新地 西改札', { busy: 2 });
 
-  b.node('ks_e_in', 'gate', '北新地 東改札', [34.69822, 135.4978], 'B2', { station: st, paid: true, label: true, y: -10 });
+  b.node('ks_e_in', 'gate', '北新地 東改札', [34.698246, 135.497932], 'B2', { station: st, paid: true, label: true, y: -10 });
   b.walk('ks_ec', 'ks_e_in');
   b.node('ks_e_out', 'junction', '北新地 東改札前（駅前第2ビル入口）', [34.69832, 135.49795], 'B2', { station: st, y: -10 });
   b.gate('ks_e_in', 'ks_e_out', 'JR北新地 東改札', { busy: 2 });
 
-  // Mid-concourse where the ディアモール N–S corridor arrives (outside the gates)
-  b.node('ks_mid_out', 'junction', '北新地駅 中央（ディアモール通路突き当たり）', lerp([34.6986, 135.49575], [34.69832, 135.49795], 0.55), 'B2', { station: st, y: -10 });
+  // Where the ディアモール N–S spine arrives (outside the gates): right to 西改札, left to 東改札.
+  b.node('ks_mid_out', 'junction', '北新地駅 中央（ディアモール通路突き当たり）', [34.698446, 135.49696], 'B2', { station: st, y: -10 });
   b.walk('ks_w_out', 'ks_mid_out', { name: '北新地駅 改札外通路', busy: 2 });
   b.walk('ks_mid_out', 'ks_e_out', { name: '北新地駅 改札外通路', busy: 2 });
 }
