@@ -202,7 +202,9 @@ export function addWalkways(b: NetBuilder): void {
   b.path(['f_chuo_b1', 'f_hs_psg_b1', 'hs_c_out', 'f_dm_c'], { name: '阪神梅田本店 地下南北通路', busy: 2, width: 8 });
   b.walk('f_dm_e', 'm_s_out', { busy: 2 });
   b.walk('f_dm_e', 'f_wh_sw', { name: 'ディアモール〜ホワイティ連絡' });
-  b.walk('f_dm_w', 'y_n_out', { busy: 2 });
+  // Along the east side of 西梅田, just outside its platform and track box.
+  b.j('f_yn_e_b1', '西梅田駅東側 地下通路（北）', [34.700757, 135.495613], 'B1', B1);
+  b.path(['f_dm_w', 'f_yn_e_b1', 'y_n_out'], { busy: 2 });
   b.walk('hs_w_out', 'y_n_out', { name: '西梅田・阪神西口連絡通路', busy: 1 });
   // The spine runs straight south from 円形広場 (≈200 m) and drops to the 北新地 concourse right at
   // its end, by the big 北新地 sign (西改札 to the right, 東改札 to the left).
@@ -226,7 +228,8 @@ export function addWalkways(b: NetBuilder): void {
   b.vertical('ks_w_out', 'f_ksw_b1', ['stairs', 'esc'], { name: '地下鉄（西梅田）連絡口', bearingUp: 281, anchor: 'top' });
   b.walk('f_ksw_b1', 'y_s_out', { name: '西梅田 南改札への連絡通路', busy: 1 });
   // Free passage along the east side of 西梅田 station north to ディアモール西 (阪神西口・ハービス方面).
-  b.walk('y_s_out', 'f_dm_w', { name: '西梅田駅東側 地下通路', busy: 1 });
+  b.j('f_ys_e_b1', '西梅田駅東側 地下通路（南）', [34.699183, 135.495773], 'B1', B1);
+  b.path(['y_s_out', 'f_ys_e_b1', 'f_dm_w'], { name: '西梅田駅東側 地下通路', busy: 1 });
 
   // 西梅田 北改札 ↔ JR 桜橋口 / KITTE大阪.
   b.j('f_sak_b1', 'JR桜橋口 地下', [34.7015, 135.4953], 'B1', B1);
