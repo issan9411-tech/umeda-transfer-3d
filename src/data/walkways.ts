@@ -17,7 +17,8 @@ export function addWalkways(b: NetBuilder): void {
   b.j('f_chuo_n', '中央北口（暁の広場）', [34.70315, 135.495885], '1F', { label: true });
   b.path(['f_chuo_s', 'f_chuo_mid', 'jr_chuo_out', 'f_chuo_n'], { name: '中央コンコース', busy: 3, width: 20 });
   b.j('f_mido_s', '御堂筋南口', [34.7023, 135.4976], '1F', { label: true });
-  b.j('f_mido_n', '御堂筋北口', [34.70305, 135.4976], '1F', { label: true });
+  // 御堂筋北口 is the north exit of the concourse, just north of the 11番 platform.
+  b.j('f_mido_n', '御堂筋北口', [34.70342, 135.49775], '1F', { label: true });
   b.path(['f_mido_s', 'jr_mido_out', 'f_mido_n'], { name: '御堂筋口コンコース', busy: 3, width: 15 });
 
   // South side along the bus terminal (canopy, but open to the street).
@@ -27,19 +28,35 @@ export function addWalkways(b: NetBuilder): void {
 
   // ------------------------------------------------------------------ 阪急方面 (1F / 2F)
   b.j('f_hk_w', '阪急うめだ本店 西側', [34.7032, 135.49865], '1F', { label: true });
-  b.cross('f_mido_n', 'f_hk_w', '阪急百貨店前 横断歩道', 40, { busy: 3, width: 12 });
-  // Japan's first moving walkway (1967): model the belts as a shorter effective length.
+  // The signalled crosswalk only spans 国道176号 (≈40 m): sidewalk at the JR end, the 東西コンコース
+  // (JR大阪駅 ↔ HEP NAVIO side) at the Hankyu end.
+  b.j('f_mido_n_x', '御堂筋北口前 横断歩道 西詰', [34.70338, 135.49792], '1F');
+  b.j('f_hk_x', '阪急前 横断歩道 東詰（東西コンコース西端）', [34.70331, 135.49836], '1F');
+  b.walk('f_mido_n', 'f_mido_n_x', { indoor: false, busy: 3, width: 12 });
+  b.cross('f_mido_n_x', 'f_hk_x', '阪急百貨店前 横断歩道', 40, { busy: 3, width: 12 });
+  b.walk('f_hk_x', 'f_hk_w', { name: '東西コンコース', busy: 3, width: 12 });
+  // Japan's first moving walkway (1967), north under the JR tracks to the 3F-gate escalators:
+  // model the belts as a shorter effective length.
   b.walk('f_hk_w', 'hk_1f_foot', { name: '阪急 動く歩道', length: 95, busy: 3, width: 10 });
-  b.walk('hk_1f_foot', 'hk_1f_sanbangai', { name: '阪急三番街 1階', busy: 2 });
+  // At the foot of the 3F escalators a side passage runs west (BIGMAN / 紀伊國屋), past the
+  // escalator down to the 阪急三番街 mall, then north to 三番街 1F.
+  b.walk('hk_1f_foot', 'hk_1f_w', { name: 'BIGMAN前', busy: 2 });
+  b.walk('hk_1f_w', 'hk_1f_sanbangai', { name: '阪急三番街 1階', busy: 2 });
+  // 南北コンコース (100 m × 16.5 m, 2012) along the store, with the way down to B1 at its south end.
   b.j('f_hk_sw', '阪急うめだ本店 南西角', [34.70268, 135.499], '1F');
-  b.walk('f_hk_w', 'f_hk_sw', { name: '阪急うめだ本店前', indoor: false });
+  b.walk('f_hk_w', 'f_hk_sw', { name: '南北コンコース（阪急うめだ本店）', indoor: true, width: 16, busy: 2 });
 
-  // Open-air 2F slope from 御堂筋北口 up to the Hankyu 2F central gate.
-  b.j('f_deck_jr', '御堂筋北口 2階デッキ', [34.7034, 135.4977], '2F', D2);
+  // Open-air 2F slope: the escalator right in front of 御堂筋北口 goes up to a straight slope past
+  // ヨドバシ梅田 that lands on the Hankyu complex at 2F (阪急三番街 side of the 2階中央改札).
+  b.j('f_deck_jr', '御堂筋北口 2階デッキ', [34.70356, 135.49779], '2F', D2);
   b.vertical('f_mido_n', 'f_deck_jr', ['stairs', 'esc'], { indoor: false, bearingUp: 13, anchor: 'bottom' });
   b.j('f_deck_mid', 'ヨドバシ前 2階デッキ', [34.7046, 135.49795], '2F', D2);
   b.path(['f_deck_jr', 'f_deck_mid'], { name: '2階歩道橋（屋根なし）', indoor: false, busy: 1 });
-  b.walk('f_deck_mid', 'hk_2f_out', { name: '2階スロープ（屋根なし）', indoor: false, busy: 1 });
+  b.j('hk_2f_w', '阪急三番街 2階 南西（歩道橋着地）', [34.70545, 135.498], '2F', { y: 5.5 });
+  b.walk('f_deck_mid', 'hk_2f_w', { name: '2階スロープ（屋根なし）', indoor: false, busy: 1 });
+  b.walk('hk_2f_w', 'hk_2f_out', { name: '2階通路' });
+  // 「スロープから1階に降りるポイント」 next to the foot of the 3F escalators.
+  b.stairs('f_deck_mid', 'hk_1f_w', { indoor: false, anchor: 'top' });
 
   // 梅田新歩道橋 (2F) over the 梅田 intersection.
   b.j('f_bridge', '梅田新歩道橋', [34.70205, 135.4986], '2F', { ...D2, label: true });
@@ -48,13 +65,14 @@ export function addWalkways(b: NetBuilder): void {
   b.j('f_bridge_sw', '梅田新歩道橋 南西', [34.7014, 135.49805], '2F', D2);
   b.j('f_bridge_se', '梅田新歩道橋 南東', [34.70155, 135.49945], '2F', D2);
   for (const leg of ['f_bridge_nw', 'f_bridge_ne', 'f_bridge_sw', 'f_bridge_se']) b.walk('f_bridge', leg, { name: '梅田新歩道橋', indoor: false, busy: 2 });
-  b.stairs('f_bridge_nw', 'f_mido_s', { indoor: false });
-  b.stairs('f_bridge_ne', 'f_hk_sw', { indoor: false });
+  // Each leg's stair head is at the deck end; which way it runs down is not documented.
+  b.stairs('f_bridge_nw', 'f_mido_s', { indoor: false, anchor: 'top' });
+  b.stairs('f_bridge_ne', 'f_hk_sw', { indoor: false, anchor: 'top' });
   b.esc('f_bridge_ne', 'f_hk_sw', 'both', { indoor: false });
   b.j('f_hs_ne', '阪神梅田本店 北東角', [34.70135, 135.4979], '1F');
-  b.stairs('f_bridge_sw', 'f_hs_ne', { indoor: false });
+  b.stairs('f_bridge_sw', 'f_hs_ne', { indoor: false, anchor: 'top' });
   b.j('f_umeda_se', '梅田交差点 南東（新御堂筋側）', [34.7015, 135.4996], '1F');
-  b.stairs('f_bridge_se', 'f_umeda_se', { indoor: false });
+  b.stairs('f_bridge_se', 'f_umeda_se', { indoor: false, anchor: 'top' });
 
   // Street crossings in front of the station.
   b.cross('f_mido_s', 'f_hs_ne', '大阪駅前 横断歩道（御堂筋南口→阪神）', 35, { busy: 2 });
@@ -117,47 +135,60 @@ export function addWalkways(b: NetBuilder): void {
 
   // ------------------------------------------------------------------ B1: north (ルクア・グランフロント・阪急三番街)
   b.j('f_lucua_b1', 'ルクア地下1階（バルチカ）', [34.703305, 135.495825], 'B1', B1);
-  b.vertical('f_chuo_n', 'f_lucua_b1', ['stairs', 'esc']);
+  b.vertical('f_chuo_n', 'f_lucua_b1', ['stairs', 'esc'], { anchor: 'top' });
   b.j('f_ucellar_b1', 'うめきたセラー（うめきた広場 地下1階）', [34.7044, 135.4959], 'B1', B1);
   b.vertical('f_gfo1', 'f_ucellar_b1', ['stairs', 'esc', 'elev'], { anchor: 'mid' });
   b.j('f_gfo_b1', 'グランフロント大阪 南館地下1階', [34.7041, 135.4949], 'B1', B1);
   b.path(['f_lucua_b1', 'f_ucellar_b1', 'f_gfo_b1', 'uk_b1_e'], { name: 'ルクア〜グランフロント〜うめきた地下通路', busy: 1 });
   b.j('f_midon_b1', 'JR御堂筋北口 地下', [34.7032, 135.4977], 'B1', B1);
   b.walk('f_lucua_b1', 'f_midon_b1', { name: 'ルクア地下通路', busy: 2 });
-  b.vertical('f_mido_n', 'f_midon_b1', ['stairs', 'esc', 'elev'], { bearingUp: 209, anchor: 'top' });
+  // Must stay clear of the 2F-slope escalator that rises NNE from the same exit.
+  b.vertical('f_mido_n', 'f_midon_b1', ['stairs', 'esc', 'elev'], { anchor: 'top' });
   b.walk('f_midon_b1', 'm_n_out', { name: '御堂筋線北改札前通路', busy: 3 });
   b.j('f_hkd_b1', '阪急うめだ本店 地下1階前', [34.7033, 135.4989], 'B1', { ...B1, label: false });
   b.walk('m_n_out', 'f_hkd_b1', { busy: 3 });
-  b.vertical('f_hk_w', 'f_hkd_b1', ['stairs', 'esc', 'elev'], { busy: 3 });
+  b.vertical('f_hk_w', 'f_hkd_b1', ['stairs', 'esc', 'elev'], { busy: 3, anchor: 'top' });
   b.j('f_3b_b1', '阪急三番街 地下1階', [34.7054, 135.4983], 'B1', B1);
-  b.vertical('hk_1f_sanbangai', 'f_3b_b1', ['stairs', 'esc', 'elev']);
+  b.vertical('hk_1f_sanbangai', 'f_3b_b1', ['stairs', 'esc', 'elev'], { anchor: 'top' });
   b.j('f_3b_s', '阪急三番街 南端（地下1階）', [34.7042, 135.49855], 'B1', B1);
   b.path(['f_3b_b1', 'f_3b_s', 'm_n_out'], { name: '阪急三番街', busy: 2 });
+  // 「地下街に続くエスカレーター」 beside the side passage at the foot of the 3F escalators: the
+  // short way from the 3F gate down to the 御堂筋線 北改札. Only the way down is documented (no
+  // stairs, no up escalator confirmed); an up escalator here would put 御堂筋線北改札→阪急3階改札
+  // at ≈3.4 min, well under the published 5〜10 min.
+  b.vertical('hk_1f_w', 'f_3b_s', ['esc-down'], { name: '阪急三番街（地下）へのエスカレーター', anchor: 'top' });
 
   // ------------------------------------------------------------------ B1: JR大阪駅前 / 阪神 / ホワイティうめだ
   b.j('f_jrf_b1', 'JR大阪駅前 地下（御堂筋南口下）', [34.7021, 135.49775], 'B1', { ...B1, label: false });
   b.vertical('f_mido_s', 'f_jrf_b1', ['stairs', 'esc', 'elev'], { busy: 3, bearingUp: 328, anchor: 'top' });
-  b.walk('f_jrf_b1', 'm_c_out', { busy: 3 });
-  b.j('f_hsne_b1', '阪神梅田本店 東側地下', [34.7012, 135.4981], 'B1', B1);
-  b.path(['f_jrf_b1', 'f_hsne_b1', 'hs_e_out', 'm_s_out'], { name: '梅田地下街（阪神東口）', busy: 3 });
-  b.j('f_chuo_b1', '阪神百貨店口前 地下', [34.70158, 135.4968], 'B1', B1);
+  // Free corridor along the west side of the 御堂筋線 station: JR御堂筋南口 → 中改札 → 阪神東口 →
+  // 南改札 (where ディアモール and ホワイティ branch off), one straight chain.
+  b.j('f_hsne_b1', '阪神梅田本店 東側地下', [34.70124, 135.49795], 'B1', B1);
+  b.j('f_hs_se_b1', '阪神梅田本店 南東角 地下（南改札・ディアモール・ホワイティ分岐）', [34.70048, 135.49815], 'B1', B1);
+  b.path(['f_jrf_b1', 'm_c_out', 'f_hsne_b1', 'hs_e_out', 'f_hs_se_b1', 'm_s_out'], { name: '梅田地下街（阪神東口）', busy: 3 });
+  b.j('f_chuo_b1', '阪神梅田本店前 地下（中央南口方面）', [34.70158, 135.4968], 'B1', B1);
   // The stairs to B1 are in the 中央コンコース ≈50 m south of the gate, going down heading south
   // into the passage under 大丸 towards 阪神.
   b.j('f_chuo_s_b1', '中央南口 地下（大丸前）', [34.70201, 135.496229], 'B1', B1);
   b.vertical('f_chuo_mid', 'f_chuo_s_b1', ['stairs', 'esc', 'elev'], { bearingUp: 346, anchor: 'top' });
   b.walk('f_chuo_s_b1', 'f_chuo_b1', { name: '大丸梅田店 地下通路' });
-  b.vertical('f_hs_n', 'f_chuo_b1', ['stairs']);
+  b.vertical('f_hs_n', 'f_chuo_b1', ['stairs'], { anchor: 'top' });
   b.j('f_hsnw_b1', '阪神梅田本店 西側地下', [34.70142, 135.4958], 'B1', B1);
   b.path(['f_hsnw_b1', 'f_chuo_b1', 'f_hsne_b1'], { name: '阪神梅田本店 北側地下通路', busy: 2 });
   b.walk('f_hsnw_b1', 'hs_w_out', { busy: 1 });
-  b.vertical('f_hs_ne', 'f_hsne_b1', ['stairs']);
+  // Sidewalk stair at the store's NE corner, parallel to the façade (up = east, towards 御堂筋).
+  b.vertical('f_hs_ne', 'f_hsne_b1', ['stairs'], { bearingUp: 97, anchor: 'top' });
 
   // ホワイティうめだ: north mall along the east side of the 御堂筋線, then east to 泉の広場.
   b.j('f_wh_n', 'ホワイティうめだ ノースモール', [34.7021, 135.49915], 'B1', { ...B1, label: true });
   b.j('f_wh_sw', 'ホワイティうめだ 御堂筋線南改札前', [34.70055, 135.4989], 'B1', B1);
   b.j('f_wh_c', 'ホワイティうめだ センターモール', [34.70075, 135.4998], 'B1', B1);
   b.j('f_izumi', '泉の広場', [34.70155, 135.5017], 'B1', { ...B1, label: true });
-  b.path(['f_hkd_b1', 'f_wh_n', 'f_wh_c'], { name: 'ホワイティうめだ', busy: 2 });
+  // B1 below the south end of the 南北コンコース (阪急うめだ本店 SW corner), on the way to the mall.
+  b.j('f_hksw_b1', '阪急うめだ本店 南西角 地下', [34.70253, 135.49903], 'B1', B1);
+  b.vertical('f_hk_sw', 'f_hksw_b1', ['stairs'], { anchor: 'top' });
+  b.walk('f_hkd_b1', 'f_hksw_b1', { name: '阪急うめだ本店 地下1階前', busy: 2 });
+  b.path(['f_hksw_b1', 'f_wh_n', 'f_wh_c'], { name: 'ホワイティうめだ', busy: 2 });
   b.path(['m_s_out', 'f_wh_sw', 'f_wh_c', 't_n_out', 'f_izumi'], { name: 'ホワイティうめだ', busy: 2 });
 
   // ディアモール大阪 (south of 阪神) and the corridor down to 北新地.
@@ -165,19 +196,21 @@ export function addWalkways(b: NetBuilder): void {
   b.j('f_dm_c', 'ディアモール 円形広場', [34.6999, 135.497], 'B1', { ...B1, label: true });
   b.j('f_dm_e', 'ディアモール大阪 東', [34.6999, 135.4983], 'B1', B1);
   b.path(['f_dm_w', 'f_dm_c', 'f_dm_e'], { name: 'ディアモール大阪', busy: 2, width: 12 });
-  b.walk('hs_c_out', 'f_dm_c', { busy: 2 });
+  // Public N–S passage from 中央南口 B1 through the store's B1 to 円形広場: the food floor opens on
+  // its east side, the 百貨店口 on its west side (osaka-station.net).
+  b.j('f_hs_psg_b1', '阪神梅田本店 地下1階 南北通路（食品売場前）', [34.7011, 135.49686], 'B1', B1);
+  b.path(['f_chuo_b1', 'f_hs_psg_b1', 'hs_c_out', 'f_dm_c'], { name: '阪神梅田本店 地下南北通路', busy: 2, width: 8 });
   b.walk('f_dm_e', 'm_s_out', { busy: 2 });
   b.walk('f_dm_e', 'f_wh_sw', { name: 'ディアモール〜ホワイティ連絡' });
   b.walk('f_dm_w', 'y_n_out', { busy: 2 });
   b.walk('hs_w_out', 'y_n_out', { name: '西梅田・阪神西口連絡通路', busy: 1 });
-  // The spine ends at the big 北新地駅 sign, one floor down on the 北新地 concourse (right to 西改札,
-  // left to 東改札): the flight drops southward right at its end.
+  // The spine runs straight south from 円形広場 (≈200 m) and drops to the 北新地 concourse right at
+  // its end, by the big 北新地 sign (西改札 to the right, 東改札 to the left).
   b.j('f_dm_s', 'ディアモール 南北通路（北新地方面）', [34.698554, 135.496965], 'B1', B1);
   b.walk('f_dm_c', 'f_dm_s', { name: 'ディアモール大阪（北新地方面）', busy: 2 });
   b.vertical('f_dm_s', 'ks_mid_out', ['stairs', 'esc'], { name: '北新地駅への階段', bearingUp: 1, anchor: 'bottom' });
 
-  // 大阪駅前ビル地下 (第2〜第4ビル) → 東梅田 南改札. JR北新地 東改札 opens straight onto the 第2ビル
-  // B2 entrance; the building's own stairs rise north into its B1.
+  // 大阪駅前ビル地下 (第2〜第4ビル) → 東梅田 南改札. The 第2ビル B2 entrance is 「東改札の目の前」.
   b.j('f_ek2_b2', '大阪駅前第2ビル 地下2階入口', [34.69846, 135.49796], 'B2', { y: -10 });
   b.walk('ks_e_out', 'f_ek2_b2', { name: '北新地駅 東口通路' });
   b.j('f_ek2_b1', '大阪駅前第2ビル 地下1階', [34.69925, 135.4982], 'B1', B1);
@@ -219,6 +252,6 @@ export function addWalkways(b: NetBuilder): void {
   ent('e_shindo', '梅田新道', [34.6985, 135.4999], 'f_ek4_b1', 'B1');
   ent('e_ohatsu', 'お初天神・曽根崎', [34.7015, 135.5029], 'f_izumi', 'B1');
   ent('e_hep', 'HEP FIVE・東通り', [34.7035, 135.5003], 'f_wh_n', 'B1');
-  ent('e_hanshin', '阪神梅田本店', [34.7007, 135.4972], 'f_hs_n');
+  ent('e_hanshin', '阪神梅田本店（地下1階 食品売場）', [34.70105, 135.49712], 'f_hs_psg_b1', 'B1');
   ent('e_daimaru', '大丸梅田店', [34.7015, 135.4962], 'f_daimaru1');
 }

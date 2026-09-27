@@ -79,7 +79,7 @@ export const STATION_META: (Omit<Station, 'anchor'> & { labelAt?: [number, numbe
     lineIds: ['hanshin'],
     badge: '阪神',
     color: '#0A5BAA',
-    note: '阪神百貨店（大阪梅田ツインタワーズ・サウス）の地下1階にある頭端式ホーム。',
+    note: '阪神梅田本店（大阪梅田ツインタワーズ・サウス）の地下にある頭端式ホーム。改札（東口・西口・百貨店口）は地下1階、ホームはその下の階（深さは推定）。',
   },
   {
     id: 'umeda',
