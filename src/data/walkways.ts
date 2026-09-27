@@ -103,6 +103,12 @@ export function addWalkways(b: NetBuilder): void {
   b.stairs('f_bridge_nw', 'f_mido_s', { indoor: false, bearingUp: 82, anchor: 'top' });
   b.stairs('f_bridge_ne', 'f_hk_sw', { indoor: false, anchor: 'top' });
   b.esc('f_bridge_ne', 'f_hk_sw', 'both', { indoor: false });
+  // No street stair down to B1 at this corner: an earlier model had one (from the station
+  // research, low confidence and without a quoted source: a sidewalk stair along the façade down
+  // to the B1 passage), but OSM maps no steps down here: only the stair up to the 梅田新歩道橋
+  // (next line) and, ≈65 m to the north, the street stair under the bridge (f_jrs_1f → f_jrs_b1,
+  // OSM steps at x 186.3, z 41.7–49.9), which is modelled. The corner is reached by the bridge
+  // stair and the sidewalk from 中央南口前.
   b.j('f_hs_ne', '阪神梅田本店 北東角', { x: 206.0, z: 108.0 }, '1F');
   b.stairs('f_bridge_sw', 'f_hs_ne', { indoor: false, bearingUp: 66, anchor: 'top' });
   // The covered sidewalk along 国道176号 from 御堂筋南口 under the bridge (OSM), with stairs up to the
@@ -301,7 +307,6 @@ export function addWalkways(b: NetBuilder): void {
   b.j('f_dm_e', 'ディアモール大阪 東', { x: 205.7, z: 261.5 }, 'B1', B1);
   b.j('f_dm_se', 'ディアモール大阪 南東（大阪駅前第2ビル前）', { x: 245.8, z: 336.8 }, 'B1', B1);
   b.path(['f_dm_c', 'f_dm_e', 'f_dm_se'], { name: 'ディアモール大阪', busy: 2, width: 10 });
-  b.walk('f_dm_sm', 'f_dm_se', { name: 'ディアモール大阪', busy: 1 });
   b.j('f_dm_ne', 'ディアモール大阪 北東（阪神梅田本店 東側）', { x: 285.7, z: 143.1 }, 'B1', B1);
   b.path(['f_dm_c', 'f_dm_ne', 't_n_out'], { name: 'ディアモール〜東梅田 連絡通路', busy: 2 });
   b.walk('f_dm_ne', 'f_hs_se_b1', { name: 'ディアモール〜御堂筋線南改札', busy: 2 });
@@ -322,9 +327,11 @@ export function addWalkways(b: NetBuilder): void {
   // 大阪駅前ビル地下 (第2〜第4ビル) → 東梅田 南改札. The 第2ビル B2 entrance is 「東改札の目の前」.
   b.j('f_ek2_b2', '大阪駅前第2ビル 地下2階入口', { x: 205.0, z: 432.0 }, 'B2', { y: -10 });
   b.walk('ks_e_out', 'f_ek2_b2', { name: '北新地駅 東口通路' });
-  b.j('f_ek2_b1', '大阪駅前第2ビル 地下1階', { x: 212.0, z: 375.0 }, 'B1', B1);
-  b.vertical('f_ek2_b2', 'f_ek2_b1', ['stairs', 'esc', 'elev'], { bearingUp: 7, anchor: 'bottom' });
-  b.walk('f_ek2_b1', 'f_dm_se', { name: '大阪駅前ビル〜ディアモール' });
+  b.j('f_ek2_b1', '大阪駅前第2ビル 地下1階', { x: 212.0, z: 352.0 }, 'B1', B1);
+  b.j('f_ek2_b1s', '大阪駅前第2ビル 地下1階（北新地駅への階段上）', { x: 207.0, z: 416.0 }, 'B1', B1);
+  b.vertical('f_ek2_b2', 'f_ek2_b1s', ['stairs', 'esc', 'elev'], { bearingUp: 7, anchor: 'bottom' });
+  b.walk('f_ek2_b1s', 'f_ek2_b1', { name: '大阪駅前第2ビル 地下1階' });
+  b.path(['f_dm_sm', 'f_ek2_b1', 'f_dm_se'], { name: 'ディアモール大阪', busy: 1 });
   b.j('f_ek3_b1', '大阪駅前第3ビル 地下1階', { x: 325.0, z: 395.0 }, 'B1', B1);
   b.j('f_ek4_b1', '大阪駅前第4ビル 地下1階', { x: 295.0, z: 300.0 }, 'B1', B1);
   b.path(['f_ek2_b1', 'f_ek3_b1', 't_s_out'], { name: '大阪駅前ビル地下', busy: 1 });

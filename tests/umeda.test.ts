@@ -4,6 +4,7 @@ import { buildGraph } from '../src/core/graph';
 import { transferMatrix } from '../src/core/matrix';
 import { planRoute } from '../src/core/planner';
 import { validateNetwork } from '../src/core/validate';
+import { JR_AXIS } from '../src/data/jr';
 import { umeda } from '../src/data/umeda';
 import { calibrationRows } from '../src/ui/about';
 
@@ -19,6 +20,18 @@ describe('Umeda network', () => {
       ['hankyu', 'hanshin', 'higashiumeda', 'jr', 'kitashinchi', 'nishiumeda', 'umeda', 'umekita'].sort(),
     );
     for (const s of umeda.network.stations) expect(umeda.network.platforms.some((p) => p.stationId === s.id)).toBe(true);
+  });
+
+  it('lays the JR 大屋根 along the tracks (station frame)', () => {
+    const roof = umeda.network.footprints.find((f) => f.id === 'jr:roof');
+    expect(roof?.poly.length).toBe(4);
+    const p = roof!.poly;
+    // Long side: the longer of two adjacent edges; its compass bearing, modulo 180°.
+    const sides = [0, 1].map((i) => ({ dx: p[i + 1][0] - p[i][0], dz: p[i + 1][1] - p[i][1] }));
+    const long = sides.reduce((a, b) => (Math.hypot(b.dx, b.dz) > Math.hypot(a.dx, a.dz) ? b : a));
+    const bearing = (((Math.atan2(long.dx, -long.dz) * 180) / Math.PI) % 180 + 180) % 180;
+    expect(Math.abs(bearing - (JR_AXIS % 180))).toBeLessThan(0.5);
+    expect(Math.hypot(long.dx, long.dz)).toBeGreaterThan(170);
   });
 
   it('reference bands contain their own quoted figure', () => {

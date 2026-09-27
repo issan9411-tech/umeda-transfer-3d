@@ -3,9 +3,9 @@ import type { Graph } from '../core/graph';
 import type { NetEdge, NetNode, Platform } from '../core/types';
 import { lateralRoom } from '../sim/crowd';
 import { WELL_HEADROOM } from '../data/builder';
-import { CLEARANCE, flightWidth, WalkSpace, type WalkPiece } from './walk-space';
+import { CLEARANCE, corridorWidth, flightWidth, WalkSpace, type WalkPiece } from './walk-space';
 import * as TX from './walkway-tex';
-import { arrowFor, cabinCycle, destinationsVia, dominantAngle, hash01, isMallEdge, isVertical, laneOffsets, mouthTrims, subtractConvex, type P2, type SignTarget } from './walkway-util';
+import { arrowFor, cabinCycle, destinationsVia, dominantAngle, gapWall, hash01, isMallEdge, isVertical, laneOffsets, mouthTrims, subtractConvex, type P2, type SignTarget } from './walkway-util';
 
 export { angleDelta } from './walkway-util';
 
@@ -695,6 +695,12 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     list.forEach((arm, k) => (arm.trim = Math.min(t[k], arm.run * 0.45)));
   }
   const trimAt = (nodeId: string, idx: number) => arms.get(nodeId)?.find((x) => x.idx === idx)?.trim ?? 0;
+  /** Radius of each junction's walkable floor disc (walk-space.ts: the widest corridor there). */
+  const reach = new Map<string, number>();
+  for (const e of g.edges) {
+    if (isVertical(e)) continue;
+    for (const id of [e.a, e.b]) reach.set(id, Math.max(reach.get(id) ?? 0, corridorWidth(e) / 2));
+  }
   const hasVertical = new Set<string>();
   for (const e of g.edges) if (isVertical(e) || e.kind === 'platform') hasVertical.add(e.a), hasVertical.add(e.b);
 
@@ -1010,19 +1016,34 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     }
 
     // Mouth corners, counter-clockwise by arm angle.
-    const poly: THREE.Vector3[] = [];
     const mouths = list.map((a) => {
       const m = C.clone().add(dirOf(a).multiplyScalar(a.trim));
       const p = perpOf(a).multiplyScalar(a.width / 2);
-      const lo = m.clone().sub(p);
-      const hi = m.clone().add(p);
-      poly.push(lo, hi);
-      return { lo, hi };
+      return { lo: m.clone().sub(p), hi: m.clone().add(p) };
+    });
+    // Where the straight wall between two enclosed mouths would cut into the junction's floor
+    // (a side with no corridor wider than 180°, a step in width), the room is closed round the
+    // back instead (walkway-util.ts gapWall); its floor and ceiling reach out to that wall.
+    const at2 = ([x, z]: P2) => V(C.x + x, C.y, C.z + z);
+    const backs = list.map((a, k) => {
+      const b = list[(k + 1) % list.length];
+      if (!roofed || !a.indoor || !b.indoor) return null;
+      const gw = gapWall(a, b, reach.get(id) ?? 0);
+      return gw && { poly: gw.poly.map(at2), wall: gw.wall.map(at2) };
+    });
+    const poly: THREE.Vector3[] = [];
+    // Corners on enclosed corridors' walls get the same contact shadow as the corridor floors.
+    const shade: number[] = [];
+    list.forEach((a, k) => {
+      poly.push(mouths[k].lo, mouths[k].hi);
+      shade.push(a.indoor ? AO : 1, a.indoor ? AO : 1);
+      for (const q of backs[k]?.poly ?? []) {
+        poly.push(q);
+        shade.push(AO);
+      }
     });
     const kind: FloorKind = n.paid ? 'tile' : list.some((a) => a.indoor) ? 'stone' : 'paver';
     const liftV = V(0, lift, 0);
-    // Corners on enclosed corridors' walls get the same contact shadow as the corridor floors.
-    const shade = list.flatMap((a) => (a.indoor ? [AO, AO] : [1, 1]));
     for (let i = 0; i < poly.length; i++) {
       const j = (i + 1) % poly.length;
       floorPoly(kind, [C.clone().add(liftV), poly[i].clone().add(liftV), poly[j].clone().add(liftV)], [1, shade[i], shade[j]]);
@@ -1037,16 +1058,21 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     }
     const lp = 0.8;
     geo.light.quad(C.clone().add(V(-lp, Hn - 0.03, -lp)), C.clone().add(V(lp, Hn - 0.03, -lp)), C.clone().add(V(lp, Hn - 0.03, lp)), C.clone().add(V(-lp, Hn - 0.03, lp)), uvRect(0, 0, 1, 1), DOWN);
+    const wallSeg = (p0: THREE.Vector3, p1: THREE.Vector3, fallback: THREE.Vector3) => {
+      const len = p0.distanceTo(p1);
+      if (len <= 0.05) return;
+      const mid = p0.clone().add(p1).multiplyScalar(0.5);
+      const inward = C.clone().sub(mid).setY(0);
+      if (inward.lengthSq() < 1e-6) inward.copy(fallback);
+      vquad(geo.wall, p0, p1, p1.clone().add(hv), p0.clone().add(hv), uvRect(0, 0, len / TX.WALL_M, 1), inward, c.wallStation, not(`node:${id}`));
+    };
     for (let k = 0; k < list.length; k++) {
       const next = (k + 1) % list.length;
-      const p0 = mouths[k].hi;
-      const p1 = mouths[next].lo;
-      const len = p0.distanceTo(p1);
-      if (len > 0.05 && list[k].indoor && list[next].indoor) {
-        const mid = p0.clone().add(p1).multiplyScalar(0.5);
-        const inward = C.clone().sub(mid).setY(0);
-        if (inward.lengthSq() < 1e-6) inward.copy(dirOf(list[k]));
-        vquad(geo.wall, p0, p1, p1.clone().add(hv), p0.clone().add(hv), uvRect(0, 0, len / TX.WALL_M, 1), inward, c.wallStation, not(`node:${id}`));
+      const back = backs[k];
+      if (back) {
+        for (let i = 0; i + 1 < back.wall.length; i++) wallSeg(back.wall[i], back.wall[i + 1], dirOf(list[k]));
+      } else if (list[k].indoor && list[next].indoor) {
+        wallSeg(mouths[k].hi, mouths[next].lo, dirOf(list[k]));
       }
       // Bulkhead above a lower corridor opening into a taller junction.
       const a = list[k];

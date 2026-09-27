@@ -95,6 +95,27 @@ export interface Platform {
   b: [number, number];
   y: number;
   width: number;
+  /**
+   * Further slab pieces of the same platform where it narrows or shifts sideways (JR大阪駅's
+   * screened walkways towards 西口): part of the platform people walk on, with no boarding
+   * positions and no tracks of their own.
+   */
+  sections?: PlatformSection[];
+}
+
+export interface PlatformSection {
+  a: [number, number];
+  b: [number, number];
+  width: number;
+}
+
+/**
+ * Every slab piece of a platform as a platform record of its own (the body first, then its
+ * sections, which carry the parent's id): for code that only needs where people can stand.
+ */
+export function platformPieces(p: Platform): Platform[] {
+  if (!p.sections?.length) return [p];
+  return [p, ...p.sections.map((s) => ({ ...p, a: s.a, b: s.b, width: s.width, sections: undefined }))];
 }
 
 export interface Station {

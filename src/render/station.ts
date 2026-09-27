@@ -169,6 +169,8 @@ export interface Surf {
   s1: number;
   /** Terminal concourse slab joining the platform ends. */
   head?: boolean;
+  /** A narrower or shifted piece of the platform (Platform.sections): a walkway, no stops. */
+  section?: boolean;
   /** Track index on each side (−1 = right/t0 side, 1 = left/t1 side). */
   track: { [side: number]: number | undefined };
 }
@@ -212,7 +214,7 @@ export function stationLayouts(net: Network): StationLayout[] {
   // Remember each platform's tracks so buildTrainModel can stand a train exactly on the rails.
   for (const l of out) {
     for (const s of l.surfs) {
-      if (s.head) continue;
+      if (s.head || s.section) continue;
       const [sa, ta] = toLocal(l.f, s.p.a[0], s.p.a[1]);
       const [sb, tb] = toLocal(l.f, s.p.b[0], s.p.b[1]);
       const centre = (ta + tb) / 2;
@@ -304,6 +306,22 @@ function layoutStation(net: Network, id: string, cfg: StationCfg): StationLayout
         last.surfs.push([c.surf, c.side]);
       } else tracks.push({ t: c.t, ...extend(c.s0, c.s1), lineId: c.lineId, label: c.label, surfs: [[c.surf, c.side]] });
       surfs[c.surf].track[c.side] = tracks.length - 1;
+    }
+    // Platform sections (narrow walkways beyond the stopping area) add no tracks: an edge faces
+    // the track that runs 1.65 m from it, if any.
+    for (const p of plats) {
+      for (const sec of p.sections ?? []) {
+        const [sa, ta] = toLocal(f, sec.a[0], sec.a[1]);
+        const [sb, tb] = toLocal(f, sec.b[0], sec.b[1]);
+        const t = (ta + tb) / 2;
+        const sf: Surf = { p, t0: t - sec.width / 2, t1: t + sec.width / 2, s0: Math.min(sa, sb), s1: Math.max(sa, sb), section: true, track: {} };
+        for (const side of [-1, 1] as const) {
+          const want = (side === 1 ? sf.t1 : sf.t0) + side * EDGE_TO_TRACK;
+          const i = tracks.findIndex((tr) => Math.abs(tr.t - want) < 0.6 && tr.s0 < sf.s0 && tr.s1 > sf.s1);
+          if (i >= 0) sf.track[side] = i;
+        }
+        surfs.push(sf);
+      }
     }
   }
   if (cfg.groups) tracks.forEach((tr, i) => surfs.forEach((s, si) => [-1, 1].forEach((side) => s.track[side] === i && tr.surfs.push([si, side as 1 | -1]))));
@@ -1135,6 +1153,16 @@ function drawPlatforms(ctx: Ctx, l: StationLayout, bottomY: number, underside: b
         if (entry !== 's0') parapet('t', { s0: h.s0 - th, s1: h.s0, t0: h.t0 - th, t1: h.t1 + th });
         if (entry !== 's1') parapet('t', { s0: h.s1, s1: h.s1 + th, t0: h.t0 - th, t1: h.t1 + th });
       });
+      // A section is a screened walkway: screens along both long sides, opened where a path crosses.
+      if (s.section) {
+        for (const side of [-1, 1] as const) {
+          const T = side === 1 ? r.t1 - 0.3 : r.t0 + 0.3;
+          const b: Rect = { s0: r.s0, s1: r.s1, t0: Math.min(T, T - side * 0.08), t1: Math.max(T, T - side * 0.08) };
+          for (const [u, v] of pathRuns(ctx, l, 's', b, l.py, 0.15, 0.6)) {
+            for (const q of rectMinusHoles({ ...b, s0: u, s1: v }, holes)) fBox(ctx.st, f, q.s0, q.s1, top, top + 1.3 * hs, q.t0, q.t1, c.parapet, 8);
+          }
+        }
+      }
       // Markings on edges that face a track: coping band, white line, yellow tactile strip.
       if (!s.head) {
         for (const side of [-1, 1] as const) {
@@ -1912,7 +1940,7 @@ function drawSigns(ctx: Ctx, l: StationLayout): void {
   const shedEnd = l.id === 'hankyu' ? Math.min(...l.surfs.map((s) => s.s0)) + 152 : -Infinity;
   const hangFrom = (s: number) => plat + (s < shedEnd ? 9.5 - 1.4 : l.cfg.ceil) * hs;
   for (const s of l.surfs) {
-    if (s.head) continue;
+    if (s.head || s.section) continue;
     const mid = (s.t0 + s.t1) / 2;
     const w = s.t1 - s.t0;
     const lineL = s.track[1] !== undefined ? l.tracks[s.track[1] as number].lineId : s.p.lineIds[0];

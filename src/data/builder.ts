@@ -1,4 +1,4 @@
-import type { EdgeKind, Footprint, Level, Line, NetEdge, NetNode, Network, NodeKind, Platform, Road, Station } from '../core/types';
+import { platformPieces, type EdgeKind, type Footprint, type Level, type Line, type NetEdge, type NetNode, type Network, type NodeKind, type Platform, type Road, type Station } from '../core/types';
 import { alongOf, corners, detour, inflate, insideRect, lateralOf, rectFromFrame, rectsOverlap, segmentHitsRect, type ORect } from './flight-layout';
 
 /** Local tangent plane centred on JR Osaka Station (Mapion reference point 34.70249, 135.49567). */
@@ -165,6 +165,8 @@ export interface PlatformSpec {
   /** Boarding positions as fractions along a→b with human-readable names. */
   stops: { key: string; t: number; name: string }[];
   busy?: number;
+  /** Further slab pieces where the platform narrows or shifts (no stops, no tracks). */
+  sections?: { a: Pos; b: Pos; width: number }[];
 }
 
 /**
@@ -722,7 +724,7 @@ export class NetBuilder {
       // and beyond its end they keep back from the ends of the tracks.
       if (e.kind !== 'gate') {
         const n = { x: -u.z, z: u.x }; // the edge's right-hand side
-        for (const plat of this.platforms) {
+        for (const plat of this.platforms.flatMap(platformPieces)) {
           if (Math.abs(plat.y - y) > 0.6) continue;
           const pl = Math.hypot(plat.b[0] - plat.a[0], plat.b[1] - plat.a[1]) || 1;
           const po = { x: plat.a[0], z: plat.a[1] };
@@ -756,10 +758,14 @@ export class NetBuilder {
     }
   }
 
-  /** The platform whose slab a node stands on (same height, inside its outline), if any. */
+  /**
+   * The platform slab a node stands on (same height, inside its outline), if any: the platform
+   * record itself or, on a section of it, that section as a record of its own.
+   */
   private platformUnder(n: NetNode): Platform | undefined {
     if (n.platformId) return this.platforms.find((p) => p.id === n.platformId);
-    return this.platforms.find((p) => {
+    if (this.pieceCache?.n !== this.platforms.length) this.pieceCache = { n: this.platforms.length, pieces: this.platforms.flatMap(platformPieces) };
+    return this.pieceCache.pieces.find((p) => {
       if (Math.abs(p.y - n.y) > 0.6) return false;
       const ax = p.b[0] - p.a[0];
       const az = p.b[1] - p.a[1];
@@ -769,6 +775,8 @@ export class NetBuilder {
       return t >= -2 && t <= al + 2 && lat <= p.width / 2 + 0.5;
     });
   }
+
+  private pieceCache: { n: number; pieces: Platform[] } | null = null;
 
   /** Adds a platform with boarding nodes along it, chained by platform edges. Returns node ids by key. */
   platform(s: PlatformSpec): Record<string, string> {
@@ -786,6 +794,15 @@ export class NetBuilder {
       b: [Math.round(b.x * 10) / 10, Math.round(b.z * 10) / 10],
       y,
       width: s.width,
+      ...(s.sections?.length
+        ? {
+            sections: s.sections.map((q) => {
+              const qa = toXZ(q.a);
+              const qb = toXZ(q.b);
+              return { a: [Math.round(qa.x * 10) / 10, Math.round(qa.z * 10) / 10] as [number, number], b: [Math.round(qb.x * 10) / 10, Math.round(qb.z * 10) / 10] as [number, number], width: q.width };
+            }),
+          }
+        : {}),
     });
     const out: Record<string, string> = {};
     const stops = [...s.stops].sort((p, q) => p.t - q.t);

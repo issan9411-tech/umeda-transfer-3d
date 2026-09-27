@@ -4,7 +4,7 @@ import { CSS2DObject, CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer
 import type { Graph } from '../core/graph';
 import { sampleKeyframes } from '../core/keyframes';
 import type { Keyframe, RouteSummary } from '../core/planner';
-import type { EdgeKind, NetNode, Platform } from '../core/types';
+import { platformPieces, type EdgeKind, type NetNode, type Platform } from '../core/types';
 import { buildCity, CITY_LAYER, type City } from './city';
 import { applyLook, createEnvironment, Lighting, setupRenderer } from './look';
 import { heatColor, KIND_COLORS, readPalette, type ScenePalette } from './palette';
@@ -727,7 +727,7 @@ export class UmedaView {
     }
 
     // Platforms (and a short run of track beyond each end).
-    for (const pl of this.g.net.platforms) {
+    for (const pl of this.g.net.platforms.flatMap(platformPieces)) {
       if (!this.levelVisible(pl.level)) continue;
       const line = this.g.net.lines.find((l) => l.id === pl.lineIds[0]);
       const color = new THREE.Color(line?.color ?? '#888');

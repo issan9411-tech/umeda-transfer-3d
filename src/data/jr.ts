@@ -32,6 +32,13 @@ export function jrAt(s: number, t: number): XZ {
   return offset(offset({ x: 0, z: 0 }, AXIS, s), ACROSS, t);
 }
 
+/**
+ * The 大屋根 over the tracks (OSM building:part: s −80…+100, t −69…+31 in the station frame):
+ * centre, long side along the tracks, short side across them, bearing of the long side. Built
+ * from the frame so the roof always stays square to the platforms.
+ */
+export const JR_ROOF = { center: jrAt(10, -19), long: 180, short: 100, bearing: JR_AXIS } as const;
+
 interface JrPlatform {
   id: string;
   nameJa: string;
@@ -44,15 +51,27 @@ interface JrPlatform {
   s1: number;
   width: number;
   busy: number;
+  /**
+   * The narrow screened walkway towards 西口 (OSM): the platform body (where trains stop) ends at
+   * `s`, and from there to s0 the platform is only `width` wide around `t`. The 西口 stairs stand
+   * on it.
+   */
+  west?: { s: number; t: number; width: number };
 }
 
 /**
  * Fitted to the OSM platform polygons and rails. Each island's edges sit 1.65 m from its two track
  * centre lines (OSM rails at t = −68.0, −49.9, −46.5, −32.4, −28.7, −15.1, −11.5, 5.5, 10.1, 22.7,
- * 27.3; tracks 2/3 and 6/7 are kept ≥ 3.6 m apart). The main bodies run s ≈ −130…+131; toward
- * 西口 each platform continues as a narrow screened walkway (OSM: 3・4 to −190, 5・6 −234, 7・8 −224,
- * 9・10 −237); 1・2 and 11 are carried a little past their mapped ends (−166, −169) to hold the
- * 西口 flights. The 1・2 record ends over the 御堂筋口 stair feet (OSM main body 104, narrow part 117).
+ * 27.3; tracks 2/3 and 6/7 are kept ≥ 3.6 m apart). The main bodies (where trains stop) end at
+ * s ≈ −125…−155; toward 西口 each island continues as a narrow screened walkway (`west`, OSM:
+ * 3・4 t −39.6…−33.1 to s −190, 5・6 −26.9…−20.0 to −234, 7・8 −9.5…−3.5 to −224, 9・10
+ * 14.8…21.5 to −237), with the 西口 stairs at its end. Each walkway keeps the edge that faces the
+ * track still running beside it 1.65 m from that track, as the body does. 1・2 tapers from s −145
+ * (track 1 curves in: t −65.5 / −64.2 / −62.5 at s −150 / −166 / −190); OSM maps it only to
+ * s −166, but every platform was extended west for 西口 (station research), so its walkway is
+ * carried on to the 西口 flights, 1.7 m clear of track 1. 11 (one track) is carried a little past
+ * its mapped end (−169) for its 西口 escalator and lift. The 1・2 record ends over the 御堂筋口 stair
+ * feet (OSM main body 104, narrow part 117).
  */
 export const JR_PLATFORMS: JrPlatform[] = [
   {
@@ -61,10 +80,11 @@ export const JR_PLATFORMS: JrPlatform[] = [
     lines: ['jr-loop'],
     directions: '1番 環状線内回り（西九条・天王寺）・ゆめ咲線・大和路快速・関空/紀州路快速／2番 環状線外回り（京橋・鶴橋）',
     t: -59.2,
-    s0: -192,
+    s0: -190,
     s1: 120,
     width: 14.4,
     busy: 3,
+    west: { s: -145, t: -56.4, width: 8.8 },
   },
   {
     id: 'jr-3-4',
@@ -72,10 +92,11 @@ export const JR_PLATFORMS: JrPlatform[] = [
     lines: ['jr-takarazuka', 'jr-kobe'],
     directions: 'JR宝塚線（丹波路快速・特急こうのとり）・JR神戸線（始発・一部列車）',
     t: -39.4,
-    s0: -192,
+    s0: -190,
     s1: 141,
     width: 10.8,
     busy: 2,
+    west: { s: -155, t: -36.8, width: 5.6 },
   },
   {
     id: 'jr-5-6',
@@ -87,6 +108,7 @@ export const JR_PLATFORMS: JrPlatform[] = [
     s1: 135,
     width: 10.2,
     busy: 3,
+    west: { s: -128, t: -23.45, width: 6.9 },
   },
   {
     id: 'jr-7-8',
@@ -98,6 +120,7 @@ export const JR_PLATFORMS: JrPlatform[] = [
     s1: 135,
     width: 13.7,
     busy: 3,
+    west: { s: -135, t: -6.5, width: 6 },
   },
   {
     id: 'jr-9-10',
@@ -109,6 +132,7 @@ export const JR_PLATFORMS: JrPlatform[] = [
     s1: 131,
     width: 9.4,
     busy: 2,
+    west: { s: -127, t: 17.95, width: 6.3 },
   },
   {
     id: 'jr-11',
@@ -202,8 +226,10 @@ export function addJrOsaka(b: NetBuilder): void {
   const stops: Record<string, Record<string, string>> = {};
   const p11 = JR_PLATFORMS[5];
 
+  /** Centre line of platform p (station frame t) at a bank: 西口 is on the narrow walkway. */
+  const tAt = (p: JrPlatform, bank: BankKey) => (bank === 'nishi' && p.west ? p.west.t : p.t);
   /** A point `along` metres east of a bank on platform p's centre line. */
-  const at = (p: JrPlatform, bank: BankKey, along: number): XZ => jrAt(BANK[bank] + along, p.t);
+  const at = (p: JrPlatform, bank: BankKey, along: number): XZ => jrAt(BANK[bank] + along, tAt(p, bank));
   /** Where a platform's boarding position for a bank is (station frame s). */
   const stopS = (p: JrPlatform, bank: BankKey): number => {
     if (bank === 'nishi') return BANK.nishi + NISHI_STOP;
@@ -214,6 +240,8 @@ export function addJrOsaka(b: NetBuilder): void {
 
   for (const p of JR_PLATFORMS) {
     const keys: BankKey[] = ['nishi', 'sakura', 'chuo', 'bridge', 'mido'];
+    // The record covers the body; the walkway towards 西口 is a section of it.
+    const s0 = p.west ? p.west.s : p.s0;
     stops[p.id] = b.platform({
       id: p.id,
       station: st,
@@ -222,11 +250,12 @@ export function addJrOsaka(b: NetBuilder): void {
       directions: p.directions,
       level: '2F',
       y: PLAT_Y,
-      a: jrAt(p.s0, p.t),
+      a: jrAt(s0, p.t),
       b: jrAt(p.s1, p.t),
       width: p.width,
       busy: p.busy,
-      stops: keys.map((k) => ({ key: k, t: (stopS(p, k) - p.s0) / (p.s1 - p.s0), name: STOP_NAMES[k] })),
+      stops: keys.map((k) => ({ key: k, t: (stopS(p, k) - s0) / (p.s1 - s0), name: STOP_NAMES[k] })),
+      sections: p.west ? [{ a: jrAt(p.s0, p.west.t), b: jrAt(p.west.s, p.west.t), width: p.west.width }] : undefined,
     });
   }
 
@@ -251,7 +280,7 @@ export function addJrOsaka(b: NetBuilder): void {
     const line: string[] = [];
     islands.forEach((p, i) => {
       const id = `jr_${bank}1_${p.id}`;
-      b.node(id, 'vertical', `${label}（${p.nameJa}への階段下）`, jrAt(BANK[bank] + along, p.t + footT), '1F', { station: st, paid: true });
+      b.node(id, 'vertical', `${label}（${p.nameJa}への階段下）`, jrAt(BANK[bank] + along, tAt(p, bank) + footT), '1F', { station: st, paid: true });
       b.vertical(bank === 'nishi' ? nishiTop(p) : stops[p.id][bank], id, ['stairs', 'esc', 'elev'], { busy: p.busy, ...flight });
       ids.push(id);
       line.push(id);

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { Footprint, Network, NetNode } from '../core/types';
+import { platformPieces, type Footprint, type Network, type NetNode } from '../core/types';
 import {
   analyseRoads,
   approach,
@@ -506,7 +506,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
   // station.ts draws (the hull of each station's platforms, 1.5 m beyond their edges).
   const cutters: { poly: P2[]; top: number }[] = [];
   const byStation = new Map<string, typeof net.platforms>();
-  for (const p of net.platforms) {
+  for (const p of net.platforms.flatMap(platformPieces)) {
     if (p.y < 0) continue;
     const l = byStation.get(p.stationId);
     if (l) l.push(p);

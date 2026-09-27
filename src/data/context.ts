@@ -1,5 +1,6 @@
 import type { NetBuilder } from './builder';
 import type { Footprint } from '../core/types';
+import { JR_ROOF } from './jr';
 import { decodeBuildings, decodeRoads, decodeViaducts } from './osm/codec';
 import { BUILDING_DATA, BUILDING_NAMES } from './osm/buildings';
 import { ROAD_DATA, ROAD_NAMES, VIADUCT_DATA, VIADUCT_NAMES } from './osm/roads';
@@ -14,7 +15,7 @@ import { ROAD_DATA, ROAD_NAMES, VIADUCT_DATA, VIADUCT_NAMES } from './osm/roads'
  */
 export function addContext(b: NetBuilder): void {
   // Stations
-  b.rect('jr:roof', 'JR大阪駅 大屋根', [34.702404, 135.495907], 180, 100, 58.4, 22, 23, 'deck'); // OSM: s −80…+100, t −69…+31 in the JR frame
+  b.rect('jr:roof', 'JR大阪駅 大屋根', JR_ROOF.center, JR_ROOF.long, JR_ROOF.short, JR_ROOF.bearing, 22, 23, 'deck'); // OSM: s −80…+100, t −69…+31 in the JR frame
   const osm = decodeBuildings(BUILDING_DATA, BUILDING_NAMES);
   // 阪急大阪梅田駅 (with 阪急三番街 below the 3F platforms): the mapped outline; the city draws its
   // concourse block and train shed. The 阪急ターミナルビル rising from its south end is a building

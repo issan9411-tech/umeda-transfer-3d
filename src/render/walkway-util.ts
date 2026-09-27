@@ -39,6 +39,8 @@ export interface Arm {
   /** Direction away from the junction, atan2(dz, dx). */
   angle: number;
   width: number;
+  /** Length of the corridor (its far node); a short stub only pushes its neighbours back as far as it reaches. */
+  run?: number;
 }
 
 /**
@@ -54,10 +56,72 @@ export function mouthTrims(arms: Arm[], cap: number): number[] {
       const phi = Math.abs(angleDelta(a.angle, b.angle));
       if (phi > (150 * Math.PI) / 180) return;
       const p = Math.max(phi, 0.2);
-      t = Math.max(t, (b.width / 2 + (a.width / 2) * Math.cos(p)) / Math.sin(p));
+      let tb = (b.width / 2 + (a.width / 2) * Math.cos(p)) / Math.sin(p);
+      // Past the far end of a short neighbour (a stair's approach step, say) there is nothing
+      // left to keep clear of: its strip reaches along a no further than this.
+      if (b.run !== undefined) tb = Math.min(tb, Math.max(0, b.run * Math.cos(phi)) + (b.width / 2) * Math.sin(phi) + 0.3);
+      t = Math.max(t, tb);
     });
     return Math.min(cap, Math.max(0, t));
   });
+}
+
+/** A corridor mouth at a junction: its arm and how far it stops short of the node. */
+export interface Mouth extends Arm {
+  trim: number;
+}
+
+/**
+ * The back wall of a junction between two neighbouring corridor mouths (`a`, then `b`
+ * counter-clockwise), relative to the node, where a straight wall from a's mouth corner to b's
+ * would cut into the junction's floor disc (radius `reach`, the widest corridor's half width):
+ * a gap wider than 180° with no corridor in it, or a step in width. The room is then closed
+ * around the outside of the disc — along each corridor's side line to a circle just outside the
+ * disc, and round the circle between them — so no part of the floor people may walk on is left
+ * open to the void behind it. Returns null when the straight wall is fine.
+ *
+ * `poly` is the outline to insert between a's mouth corner and b's (the floor and ceiling of the
+ * room reach out to it); `wall` the wall's corner points, from a's corridor wall to b's.
+ */
+export function gapWall(a: Mouth, b: Mouth, reach: number): { poly: P2[]; wall: P2[] } | null {
+  const ha = a.width / 2;
+  const hb = b.width / 2;
+  const da: P2 = [Math.cos(a.angle), Math.sin(a.angle)];
+  const db: P2 = [Math.cos(b.angle), Math.sin(b.angle)];
+  // Left-hand normals (towards increasing angle): a's corner on the gap side is +, b's is −.
+  const qa: P2 = [-da[1], da[0]];
+  const qb: P2 = [-db[1], db[0]];
+  const at = (d: P2, q: P2, s: number, l: number): P2 => [d[0] * s + q[0] * l, d[1] * s + q[1] * l];
+  const hi = at(da, qa, a.trim, ha);
+  const lo = at(db, qb, b.trim, -hb);
+  if (segmentDistance(hi, lo) >= reach - 0.4) return null;
+  // Just outside the walk-space disc (a 12-gon of circumradius (reach − 0.1) / cos 15°), with
+  // chords of ≤ 20° that stay outside it too.
+  const R = Math.max(0.5, reach - 0.1) / Math.cos(Math.PI / 12) + 0.15;
+  const sa = Math.sqrt(Math.max(0, R * R - ha * ha));
+  const sb = Math.sqrt(Math.max(0, R * R - hb * hb));
+  let gap = b.angle - a.angle;
+  while (gap <= 1e-9) gap += Math.PI * 2;
+  const span = gap - Math.atan2(ha, sa) - Math.atan2(hb, sb);
+  if (span <= 0.02) return null;
+  const ea = at(da, qa, sa, ha);
+  const eb = at(db, qb, sb, -hb);
+  const a0 = Math.atan2(ea[1], ea[0]);
+  const n = Math.max(1, Math.ceil(span / ((20 * Math.PI) / 180)));
+  const arc: P2[] = [];
+  for (let i = 1; i < n; i++) arc.push([R * Math.cos(a0 + (span * i) / n), R * Math.sin(a0 + (span * i) / n)]);
+  const poly: P2[] = [ea, ...arc, eb];
+  const wall: P2[] = [...(a.trim > sa + 0.05 ? [hi] : []), ...poly, ...(b.trim > sb + 0.05 ? [lo] : [])];
+  return { poly, wall };
+}
+
+/** Distance from the origin to the segment p–q. */
+function segmentDistance(p: P2, q: P2): number {
+  const dx = q[0] - p[0];
+  const dz = q[1] - p[1];
+  const l2 = dx * dx + dz * dz;
+  const t = l2 < 1e-12 ? 0 : Math.max(0, Math.min(1, -(p[0] * dx + p[1] * dz) / l2));
+  return Math.hypot(p[0] + dx * t, p[1] + dz * t);
 }
 
 /**

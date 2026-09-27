@@ -1,4 +1,4 @@
-import type { NetEdge, NetNode, Network } from '../core/types';
+import { platformPieces, type NetEdge, type NetNode, type Network } from '../core/types';
 
 /**
  * The space people actually walk through: every corridor, junction, platform, flight and lift
@@ -79,7 +79,7 @@ export class WalkSpace {
       for (let i = 0; i < k; i++) poly.push([n.x + rr * Math.cos((2 * Math.PI * i) / k), n.z + rr * Math.sin((2 * Math.PI * i) / k)]);
       this.push({ id: `node:${id}`, kind: 'junction', poly, f0: n.y, fx: 0, fz: 0, clear: CLEARANCE, indoor: true });
     }
-    for (const p of net.platforms) {
+    for (const p of net.platforms.flatMap(platformPieces)) {
       const ax = p.b[0] - p.a[0];
       const az = p.b[1] - p.a[1];
       const len = Math.hypot(ax, az) || 1;
