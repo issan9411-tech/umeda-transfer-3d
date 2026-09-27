@@ -1,38 +1,69 @@
-import { lerp, NetBuilder, offset, toXZ, type FlightOpts, type LatLon, type XZ } from './builder';
+import { lerp, NetBuilder, offset, type FlightOpts, type LatLon, type XZ } from './builder';
 
 /**
  * JR大阪駅 (ground platforms 1–11), the うめきたエリア underground platforms (21–24)
  * and JR北新地 (JR東西線).
  *
- * Geometry follows the research notes: the elevated platforms run ENE–WSW (bearing ≈76°),
- * ≈340 m long, numbered 1 (south) to 11 (north). Stair banks from west to east:
- * 西口, 桜橋口 (via 中2階), 中央口, 連絡橋口 (up to 3F), 御堂筋口・南口.
+ * JR大阪駅 is laid out in a station frame fitted to OpenStreetMap (via Overture Maps): the 11
+ * tracks run straight through the station at bearing 58.4° (least-squares fit of the rails between
+ * the 西口 and 御堂筋口 ends, residual < 0.3°), and the ノースゲートビル south face (t ≈ +32) and
+ * the サウスゲートビル north face (t ≈ −80) are parallel to them. Platforms are numbered 1 (south)
+ * to 11 (north). Stair banks from west to east: 西口, 桜橋口 (via 中2階), 中央口, 連絡橋口 (up to
+ * 3F), 御堂筋口・南口; every bank lies square to the tracks.
  */
 
 const PLAT_Y = 7.5;
 const MEZZ_Y = 3.8;
 const BRIDGE_Y = 15;
 
+/** Bearing of the tracks through JR大阪駅 (OSM rails, 58.4°). */
+export const JR_AXIS = 58.4;
+const AXIS = JR_AXIS;
+/** Square to the tracks, pointing to the north side (ノースゲートビル). */
+const ACROSS = AXIS - 90;
+
+/**
+ * JR大阪駅 station frame: the point `s` m along the tracks (+ = ENE, towards 御堂筋口) and `t` m
+ * across them (+ = NNW, towards the ノースゲートビル) from the model origin (34.7025 N, 135.4957 E).
+ * On the OSM map the ノースゲートビル south face is at t ≈ +32, the サウスゲートビル (大丸・グランヴィア)
+ * north face at t ≈ −80 and its south face at t ≈ −142, the 大屋根 spans s −80…+100, t −69…+31.
+ */
+export function jrAt(s: number, t: number): XZ {
+  return offset(offset({ x: 0, z: 0 }, AXIS, s), ACROSS, t);
+}
+
 interface JrPlatform {
   id: string;
   nameJa: string;
   lines: string[];
   directions: string;
-  W: LatLon;
-  E: LatLon;
+  /** Centre line across the tracks (station frame t, m). */
+  t: number;
+  /** West (神戸方) and east (京都方) ends along the tracks (station frame s, m). */
+  s0: number;
+  s1: number;
   width: number;
   busy: number;
 }
 
+/**
+ * Fitted to the OSM platform polygons and rails. Each island's edges sit 1.65 m from its two track
+ * centre lines (OSM rails at t = −68.0, −49.9, −46.5, −32.4, −28.7, −15.1, −11.5, 5.5, 10.1, 22.7,
+ * 27.3; tracks 2/3 and 6/7 are kept ≥ 3.6 m apart). The main bodies run s ≈ −130…+131; toward
+ * 西口 each platform continues as a narrow screened walkway (OSM: 3・4 to −190, 5・6 −234, 7・8 −224,
+ * 9・10 −237); 1・2 and 11 are carried a little past their mapped ends (−166, −169) to hold the
+ * 西口 flights. The 1・2 record ends over the 御堂筋口 stair feet (OSM main body 104, narrow part 117).
+ */
 export const JR_PLATFORMS: JrPlatform[] = [
   {
     id: 'jr-1-2',
     nameJa: '1・2番のりば',
     lines: ['jr-loop'],
     directions: '1番 環状線内回り（西九条・天王寺）・ゆめ咲線・大和路快速・関空/紀州路快速／2番 環状線外回り（京橋・鶴橋）',
-    W: [34.70176, 135.4942],
-    E: [34.7025, 135.49781],
-    width: 10,
+    t: -59.2,
+    s0: -192,
+    s1: 120,
+    width: 14.4,
     busy: 3,
   },
   {
@@ -40,9 +71,10 @@ export const JR_PLATFORMS: JrPlatform[] = [
     nameJa: '3・4番のりば',
     lines: ['jr-takarazuka', 'jr-kobe'],
     directions: 'JR宝塚線（丹波路快速・特急こうのとり）・JR神戸線（始発・一部列車）',
-    W: [34.70193, 135.49415],
-    E: [34.70267, 135.49776],
-    width: 10,
+    t: -39.4,
+    s0: -192,
+    s1: 141,
+    width: 10.8,
     busy: 2,
   },
   {
@@ -50,9 +82,10 @@ export const JR_PLATFORMS: JrPlatform[] = [
     nameJa: '5・6番のりば',
     lines: ['jr-kobe', 'jr-takarazuka'],
     directions: '5番 JR神戸線 新快速・快速（三ノ宮・姫路）／6番 JR神戸線 普通・JR宝塚線（宝塚・新三田）',
-    W: [34.70209, 135.4941],
-    E: [34.70283, 135.49771],
-    width: 11,
+    t: -21.9,
+    s0: -233,
+    s1: 135,
+    width: 10.2,
     busy: 3,
   },
   {
@@ -60,9 +93,10 @@ export const JR_PLATFORMS: JrPlatform[] = [
     nameJa: '7・8番のりば',
     lines: ['jr-kyoto'],
     directions: '7番 JR京都線 普通（高槻・京都）／8番 JR京都線 新快速・快速（京都・米原）',
-    W: [34.70226, 135.49405],
-    E: [34.703, 135.49766],
-    width: 11,
+    t: -2.95,
+    s0: -223,
+    s1: 135,
+    width: 13.7,
     busy: 3,
   },
   {
@@ -70,9 +104,10 @@ export const JR_PLATFORMS: JrPlatform[] = [
     nameJa: '9・10番のりば',
     lines: ['jr-kyoto'],
     directions: '9番 JR京都線（朝夕の新快速）／10番 特急らくラクびわこ・始発列車',
-    W: [34.70243, 135.494],
-    E: [34.70317, 135.49761],
-    width: 10,
+    t: 16.4,
+    s0: -236,
+    s1: 131,
+    width: 9.4,
     busy: 2,
   },
   {
@@ -80,102 +115,104 @@ export const JR_PLATFORMS: JrPlatform[] = [
     nameJa: '11番のりば',
     lines: ['jr-ltd'],
     directions: '特急サンダーバード（敦賀）・ひだ（高山）・サンライズ瀬戸/出雲（東京）',
-    W: [34.70259, 135.49394],
-    E: [34.70333, 135.49755],
-    width: 8,
+    t: 33.9,
+    s0: -192,
+    s1: 131,
+    width: 10,
     busy: 1,
   },
 ];
 
 /**
- * Longitudes of the stair banks that line up N–S across all islands (西口, 桜橋口, 御堂筋口).
- * 連絡橋口 and 中央口 hang off the 中央 stack line instead (see STACK).
+ * The 中央 stack: the 1F 中央コンコース, the 3F 南北連絡橋 and, at its north end, the ノースゲートビル
+ * アトリウム広場 over 暁の広場 lie on one line square to the tracks. OSM: the 中央南口 stairs down to
+ * B1 and the B1 passage under 大丸 at s ≈ 9, the 暁の広場 escalators at s ≈ −2 and +18, the 2F deck
+ * leaving the atrium northward at s ≈ 16, the 大屋根's centre at s ≈ 10.
  */
-const BANK = {
-  nishi: 135.4944,
-  sakura: 135.4953,
-  mido: 135.49693,
-} as const;
+export const JR_STACK_S = 10;
 
 /**
- * The 中央 stack: the 3F 南北連絡橋, the 連絡橋口 and 中央口 gates and, at its north end, the
- * ノースゲートビル atrium over 暁の広場 lie on one line square to the tracks (bearing 346)
- * through 連絡橋口前.
+ * Where each stair bank lies along the tracks (station frame s, m). 連絡橋口 and 中央口 hang off the
+ * 中央 stack line; the others are placed from the map:
+ *  - 西口: the free N–S passage in front of the gate joins KITTE大阪's north door and the passage
+ *    through イノゲート大阪 1F at s ≈ −204 (both mapped); the 西口 station building spans s −227…−162,
+ *    west of the 市道梅田線 underpass (s −163…−130). The platform stair heads are at s −166.
+ *  - 桜橋口: the gate at the south face ≈ s −100 (NAVITIME 大阪駅桜橋口), next to the bus stops under
+ *    the viaduct (大阪駅前(桜橋口JR線高架下), s −135…−161).
+ *  - 御堂筋口: the free concourse runs along the east end at s ≈ 150 (between the platform ends and
+ *    国道176号), from 御堂筋南口 (station SE corner) to 御堂筋北口 (the plaza north-east of the
+ *    ノースゲートビル). The platform stair heads are at s 100, their feet 19 m east.
  */
-const STACK: LatLon = [34.702561, 135.495958];
-const STACK_BEARING = 346;
+const BANK = {
+  nishi: -166,
+  sakura: -81,
+  chuo: JR_STACK_S,
+  bridge: JR_STACK_S,
+  mido: 100,
+} as const;
 
-type BankKey = 'nishi' | 'sakura' | 'bridge' | 'chuo' | 'mido';
+type BankKey = keyof typeof BANK;
 
 const STOP_NAMES: Record<BankKey, string> = {
-  nishi: '西寄り（西口・うめきた方面の階段まで約60m）',
+  nishi: '西寄り（西口・うめきた方面の階段まで約40m）',
   sakura: '西寄り（桜橋口階段付近）',
   chuo: '中ほど（中央口階段付近）',
   bridge: '中ほど東寄り（連絡橋口エスカレーター付近）',
   mido: '東寄り（御堂筋口・南口階段付近）',
 };
 
-/** Point on a platform axis at the given longitude. */
-function atLon(p: JrPlatform, lon: number): LatLon {
-  const t = (lon - p.W[1]) / (p.E[1] - p.W[1]);
-  return [p.W[0] + (p.E[0] - p.W[0]) * t, lon];
-}
-
-/** Where a platform's axis crosses the 中央 stack line. */
-function onStack(p: JrPlatform): XZ {
-  const a = toXZ(p.W);
-  const b = toXZ(p.E);
-  const s = toXZ(STACK);
-  const r = (STACK_BEARING * Math.PI) / 180;
-  const d = { x: Math.sin(r), z: -Math.cos(r) };
-  const ux = b.x - a.x;
-  const uz = b.z - a.z;
-  const t = ((s.x - a.x) * d.z - (s.z - a.z) * d.x) / (ux * d.z - uz * d.x);
-  return { x: a.x + ux * t, z: a.z + uz * t };
-}
-
-const AXIS = 76; // bearing of the platforms (ENE)
-/** ≈60 m along the platform axis, in degrees of longitude. */
-const NISHI_DOOR_DLON = 0.00064;
-
 /**
- * Stair layout per bank, as distances along the platform axis (m, + = east) from the bank's
- * line: where the train stop (the stair head on the platform) and the 1F / 3F end are.
+ * Stair layout per bank, as distances along the tracks (m, + = east) from the bank's line: where
+ * the train stop (the stair head on the platform) and the 1F / 3F end are.
  *  - 西口: stairs go DOWN heading west from the platform's west end; the gate is straight ahead.
+ *    The westmost boarding position is ≈40 m short of them (the train's west end).
  *  - 桜橋口: stairs go down heading west to the 中2階 passage, then on down to the gate.
- *  - 中央口: the escalator up to the platform starts just inside the gate (which faces east onto
- *    the 中央コンコース) and rises heading west.
+ *  - 中央口: the gate is on the west side of the 中央コンコース (facing east); the escalator up to
+ *    the platform starts just inside it and rises heading west.
  *  - 連絡橋口: escalators come down from the 3F concourse (east of the gate) heading west, landing
  *    mid-platform just east of the 中央口 stair heads.
  *  - 御堂筋口: stairs go down heading east towards the gate (「降りて右へ進むと南口」).
  */
-const CHUO_FOOT = -5;
-const CHUO_STOP = -24;
+const NISHI_STOP = 41;
+const NISHI_FOOT = -18.5;
+/**
+ * The 西口 concourse runs N–S along the stair feet on their north side (t + 4.5, just clear of each
+ * bundle): the うめきた passage is to the right (north) of the feet.
+ */
+const NISHI_FOOT_T = 4.5;
+const SAKURA_MEZZ = -10;
+const CHUO_GATE = -8;
+const CHUO_FOOT = -11;
+const CHUO_STOP = -30;
+const BRIDGE_GATE = 7;
 const BRIDGE_STOP = -6.5;
 const BRIDGE_TOP = 12;
-const NISHI_FOOT = -18.5;
-const SAKURA_MEZZ = -10;
 const MIDO_FOOT = 19;
+/** The 御堂筋口 gate (facing east onto the free concourse) and that concourse. */
+const MIDO_GATE = 142;
+const MIDO_CONC = 150;
+/** The 西口 gate (facing west onto the free N–S passage; OSM footways at s ≈ −204) and that passage. */
+const NISHI_GATE = -196;
+const NISHI_PASSAGE = -203;
+/** South face of the station building west of the サウスゲートビル (OSM t ≈ −69; sidewalk outside). */
+const SOUTH_FACE = -69;
 
 export function addJrOsaka(b: NetBuilder): void {
   const st = 'jr';
   const stops: Record<string, Record<string, string>> = {};
   const p11 = JR_PLATFORMS[5];
 
-  /** A point `along` metres east of a bank on platform p's axis. */
-  const at = (p: JrPlatform, bank: BankKey, along: number): XZ =>
-    offset(bank === 'chuo' || bank === 'bridge' ? onStack(p) : atLon(p, BANK[bank]), AXIS, along);
-  const stopAt = (p: JrPlatform, bank: BankKey): XZ => {
-    if (bank === 'nishi') return toXZ(atLon(p, BANK.nishi + NISHI_DOOR_DLON)); // ≈60 m short of the 西口 stairs
-    if (bank === 'chuo') return at(p, 'chuo', p === p11 ? CHUO_FOOT - 10 : CHUO_STOP);
-    if (bank === 'bridge') return at(p, 'bridge', BRIDGE_STOP);
-    return at(p, bank, 0);
+  /** A point `along` metres east of a bank on platform p's centre line. */
+  const at = (p: JrPlatform, bank: BankKey, along: number): XZ => jrAt(BANK[bank] + along, p.t);
+  /** Where a platform's boarding position for a bank is (station frame s). */
+  const stopS = (p: JrPlatform, bank: BankKey): number => {
+    if (bank === 'nishi') return BANK.nishi + NISHI_STOP;
+    if (bank === 'chuo') return BANK.chuo + (p === p11 ? CHUO_FOOT - 10 : CHUO_STOP);
+    if (bank === 'bridge') return BANK.bridge + BRIDGE_STOP;
+    return BANK[bank];
   };
 
   for (const p of JR_PLATFORMS) {
-    const a = toXZ(p.W);
-    const e = toXZ(p.E);
-    const len = Math.hypot(e.x - a.x, e.z - a.z);
     const keys: BankKey[] = ['nishi', 'sakura', 'chuo', 'bridge', 'mido'];
     stops[p.id] = b.platform({
       id: p.id,
@@ -185,39 +222,36 @@ export function addJrOsaka(b: NetBuilder): void {
       directions: p.directions,
       level: '2F',
       y: PLAT_Y,
-      a: p.W,
-      b: p.E,
+      a: jrAt(p.s0, p.t),
+      b: jrAt(p.s1, p.t),
       width: p.width,
       busy: p.busy,
-      stops: keys.map((k) => {
-        const q = stopAt(p, k);
-        const t = ((q.x - a.x) * (e.x - a.x) + (q.z - a.z) * (e.z - a.z)) / (len * len);
-        return { key: k, t, name: STOP_NAMES[k] };
-      }),
+      stops: keys.map((k) => ({ key: k, t: (stopS(p, k) - p.s0) / (p.s1 - p.s0), name: STOP_NAMES[k] })),
     });
   }
 
-  // 西口 stair heads at the far west end of each platform (not a boarding position).
+  // 西口 stair heads at the west end of each platform's walkway (not a boarding position).
   const nishiTop = (p: JrPlatform) => `jr_nishiTop_${p.id}`;
   for (const p of JR_PLATFORMS) {
-    b.node(nishiTop(p), 'junction', `${p.nameJa} 西口階段上`, atLon(p, BANK.nishi), '2F', { station: st, paid: true, y: PLAT_Y });
+    b.node(nishiTop(p), 'junction', `${p.nameJa} 西口階段上`, at(p, 'nishi', 0), '2F', { station: st, paid: true, y: PLAT_Y });
     b.platformWalk(stops[p.id].nishi, nishiTop(p), { busy: p.busy, width: p.width * 0.6 });
   }
 
   const islands = JR_PLATFORMS.filter((p) => p.id !== 'jr-11');
   /** Midway between two neighbouring platforms: under the tracks, clear of both islands' flights. */
   const gap = (p: JrPlatform, q: JrPlatform, bank: BankKey, along: number): XZ => lerp(at(p, bank, along), at(q, bank, along), 0.5);
-  const gapAtLon = (p: JrPlatform, q: JrPlatform, lon: number): XZ => lerp(atLon(p, lon), atLon(q, lon), 0.5);
+  /** Across-track position midway between two neighbouring platforms. */
+  const gapT = (p: JrPlatform, q: JrPlatform) => (p.t + q.t) / 2;
 
   // --- 1F paid concourses under the tracks (one per stair bank) --------------------------------
   /** Stair feet under each island, joined N–S by the paid concourse (through the gaps between islands). */
-  const chain = (bank: 'nishi' | 'chuo' | 'mido', along: number, label: string, flight: FlightOpts) => {
+  const chain = (bank: 'nishi' | 'chuo' | 'mido', along: number, label: string, flight: FlightOpts, footT = 0) => {
     const ids: string[] = [];
     const gaps: string[] = [];
     const line: string[] = [];
     islands.forEach((p, i) => {
       const id = `jr_${bank}1_${p.id}`;
-      b.node(id, 'vertical', `${label}（${p.nameJa}への階段下）`, at(p, bank, along), '1F', { station: st, paid: true });
+      b.node(id, 'vertical', `${label}（${p.nameJa}への階段下）`, jrAt(BANK[bank] + along, p.t + footT), '1F', { station: st, paid: true });
       b.vertical(bank === 'nishi' ? nishiTop(p) : stops[p.id][bank], id, ['stairs', 'esc', 'elev'], { busy: p.busy, ...flight });
       ids.push(id);
       line.push(id);
@@ -234,34 +268,39 @@ export function addJrOsaka(b: NetBuilder): void {
 
   const { ids: chuo, gaps: chuoGaps } = chain('chuo', CHUO_FOOT, '中央口', { bearingUp: AXIS + 180, anchor: 'bottom' });
   const { ids: mido } = chain('mido', MIDO_FOOT, '御堂筋口', { bearingUp: AXIS + 180, anchor: 'bottom' });
-  const { ids: nishi } = chain('nishi', NISHI_FOOT, '西口', { bearingUp: AXIS, anchor: 'top' });
+  const { ids: nishi, gaps: nishiGaps } = chain('nishi', NISHI_FOOT, '西口', { bearingUp: AXIS, anchor: 'top' }, NISHI_FOOT_T);
 
-  // 中央口 gate (west side of the free 中央コンコース, facing east): the paid concourse and the
-  // escalators up to the platforms are straight inside it.
-  b.node('jr_chuo_in', 'gate', '中央口改札', gap(JR_PLATFORMS[2], JR_PLATFORMS[3], 'chuo', -2), '1F', { station: st, paid: true, label: true });
+  // 中央口 gate (west side of the free 中央コンコース, facing east) between the 5・6 and 7・8 islands:
+  // the paid concourse and the escalators up to the platforms are straight inside it.
+  const tChuo = gapT(JR_PLATFORMS[2], JR_PLATFORMS[3]);
+  b.node('jr_chuo_in', 'gate', '中央口改札', jrAt(JR_STACK_S + CHUO_GATE, tChuo), '1F', { station: st, paid: true, label: true });
   b.walk(chuoGaps[2], 'jr_chuo_in', { busy: 3, width: 10 });
-  b.node('jr_chuo_out', 'junction', '中央口前（中央コンコース）', [34.702629, 135.496042], '1F', { station: st });
+  b.node('jr_chuo_out', 'junction', '中央口前（中央コンコース）', jrAt(JR_STACK_S, tChuo), '1F', { station: st });
   b.gate('jr_chuo_in', 'jr_chuo_out', 'JR 中央口改札', { busy: 3, width: 14 });
 
-  // エキマルシェ大阪口 (west end of the 中央口 paid area, next to 桜橋口)
-  b.node('jr_ekim_in', 'gate', 'エキマルシェ大阪口改札', gapAtLon(JR_PLATFORMS[0], JR_PLATFORMS[1], 135.4955), '1F', { station: st, paid: true });
+  // エキマルシェ大阪口 (west end of the 中央口 paid area, next to 桜橋口): the gate opens south into
+  // エキマルシェ大阪 under the 1・2 platform.
+  const t12 = gapT(JR_PLATFORMS[0], JR_PLATFORMS[1]);
+  b.node('jr_ekim_in', 'gate', 'エキマルシェ大阪口改札', jrAt(-66, t12), '1F', { station: st, paid: true });
   b.walk(chuoGaps[0], 'jr_ekim_in', { name: '中央口改札内コンコース', width: 8 });
-  b.node('jr_ekim_out', 'junction', 'エキマルシェ大阪', [34.70198, 135.49535], '1F', { station: st });
+  b.node('jr_ekim_out', 'junction', 'エキマルシェ大阪', jrAt(-68, -58), '1F', { station: st });
   b.gate('jr_ekim_in', 'jr_ekim_out', 'JR エキマルシェ大阪口改札', { busy: 1 });
 
-  // 御堂筋口 gate (east) and 南口 gate (south end of the same paid concourse)
-  b.node('jr_mido_in', 'gate', '御堂筋口改札', [34.7027, 135.49728], '1F', { station: st, paid: true, label: true });
+  // 御堂筋口 gate (east, facing the free concourse at the east end) and 南口 gate (south end of the
+  // same paid concourse, opening onto the bus terminal sidewalk).
+  const tMido = gapT(JR_PLATFORMS[2], JR_PLATFORMS[3]);
+  b.node('jr_mido_in', 'gate', '御堂筋口改札', jrAt(MIDO_GATE, tMido), '1F', { station: st, paid: true, label: true });
   b.walk(mido[2], 'jr_mido_in', { busy: 2 });
   b.walk(mido[3], 'jr_mido_in', { busy: 2 });
-  b.node('jr_mido_out', 'junction', '御堂筋口前', [34.7027, 135.4975], '1F', { station: st });
+  b.node('jr_mido_out', 'junction', '御堂筋口前', jrAt(MIDO_CONC, tMido), '1F', { station: st });
   b.gate('jr_mido_in', 'jr_mido_out', 'JR 御堂筋口改札', { busy: 3, width: 14 });
-  b.node('jr_minami_in', 'gate', '南口改札', [34.70222, 135.49705], '1F', { station: st, paid: true });
+  b.node('jr_minami_in', 'gate', '南口改札', jrAt(BANK.mido + MIDO_FOOT - 3, SOUTH_FACE + 2), '1F', { station: st, paid: true });
   b.walk(mido[0], 'jr_minami_in');
-  b.node('jr_minami_out', 'junction', '南口前（バスターミナル側）', [34.70205, 135.49708], '1F', { station: st });
+  b.node('jr_minami_out', 'junction', '南口前（バスターミナル側）', jrAt(BANK.mido + MIDO_FOOT - 3, -75.5), '1F', { station: st });
   b.gate('jr_minami_in', 'jr_minami_out', 'JR 南口改札', { busy: 2 });
 
-  // 桜橋口: platform stairs → paid 中2階 N–S passage → stairs → 1F gate. Stairs only: the
-  // 中2階's escalator leads down into the 中央口 paid concourse instead.
+  // 桜橋口: platform stairs → paid 中2階 N–S passage → stairs → 1F gate at the south face. Stairs
+  // only: the 中2階's escalator leads down into the 中央口 paid concourse instead.
   const sak: string[] = [];
   for (const p of JR_PLATFORMS) {
     const id = `jr_sakM_${p.id}`;
@@ -272,32 +311,45 @@ export function addJrOsaka(b: NetBuilder): void {
   const sakGap = `jr_sakM_g0`;
   b.node(sakGap, 'junction', '桜橋口中2階通路', gap(JR_PLATFORMS[0], JR_PLATFORMS[1], 'sakura', SAKURA_MEZZ), 'M2', { station: st, paid: true, y: MEZZ_Y });
   b.path([sak[0], sakGap, ...sak.slice(1)], { name: '桜橋口中2階通路', busy: 1, width: 8 });
-  b.node('jr_sak_in', 'gate', '桜橋口改札', [34.70188, 135.4951], '1F', { station: st, paid: true, label: true });
+  const sakS = BANK.sakura + SAKURA_MEZZ - 10;
+  b.node('jr_sak_in', 'gate', '桜橋口改札', jrAt(sakS, SOUTH_FACE + 3), '1F', { station: st, paid: true, label: true });
   b.stairs(sak[0], 'jr_sak_in', { name: '桜橋口階段', bearingUp: AXIS, anchor: 'top' });
-  b.node('jr_sak_out', 'junction', '桜橋口前', [34.70172, 135.4951], '1F', { station: st });
+  b.node('jr_sak_out', 'junction', '桜橋口前', jrAt(sakS, SOUTH_FACE - 3.5), '1F', { station: st });
   b.gate('jr_sak_in', 'jr_sak_out', 'JR 桜橋口改札', { busy: 2 });
   // The 中2階's escalator goes down heading east into the 中央口 paid concourse (under the tracks).
   b.node('jr_c1_w', 'junction', '中央口改札内（桜橋口中2階エスカレーター下）', gap(JR_PLATFORMS[0], JR_PLATFORMS[1], 'sakura', SAKURA_MEZZ + 12), '1F', { station: st, paid: true });
   b.esc(sakGap, 'jr_c1_w', 'both', { name: '桜橋口中2階エスカレーター', bearingUp: AXIS + 180, anchor: 'top' });
   b.walk('jr_c1_w', 'jr_ekim_in', { name: '中央口改札内コンコース', width: 8 });
 
-  // 西口 gate (straight ahead of the stair feet) and the paid passage to うめきた
-  b.node('jr_nishi_in', 'gate', '西口改札', [34.70215, 135.49405], '1F', { station: st, paid: true, label: true });
-  b.walk(nishi[2], 'jr_nishi_in');
-  b.walk(nishi[1], 'jr_nishi_in');
-  b.node('jr_nishi_out', 'junction', '西口前（イノゲート・KITTE連絡通路）', [34.70212, 135.49388], '1F', { station: st });
+  // 西口 gate (straight ahead of the stair feet, facing west onto the free N–S passage between
+  // KITTE大阪 and イノゲート大阪; 「改札を出て右側へ歩くとイノゲート大阪へ続くエスカレーターがすぐそこ」,
+  // so it stands in the north part, in line with the 9・10 island) and the paid passage to うめきた
+  // (see addUmekita). The lifts stand behind the stairs, west of each island's feet, so the way to
+  // the gate leaves the concourse between the 7・8 and 9・10 feet and passes south of the 9・10 lift.
+  const tNishi = JR_PLATFORMS[4].t - 2.4;
+  b.node('jr_nishi_in', 'gate', '西口改札', jrAt(NISHI_GATE, tNishi), '1F', { station: st, paid: true, label: true });
+  b.walk(nishiGaps[3], 'jr_nishi_in', { busy: 2, width: 10 });
+  b.node('jr_nishi_out', 'junction', '西口前（イノゲート・KITTE連絡通路）', jrAt(NISHI_PASSAGE, tNishi), '1F', { station: st });
   b.gate('jr_nishi_in', 'jr_nishi_out', 'JR 西口改札', { busy: 1 });
 
-  // 11番のりば: escalator and elevator only at 西口 (2024), and 中2階 links from 中央口 and 御堂筋口.
+  // 11番のりば: escalator and elevator only at 西口 (2024), and 中2階 links from 中央口 and 御堂筋口:
+  // from the north end of each paid concourse (under track 10, clear of the 9・10 flights) a flight
+  // rises north to the 中2階 under the 11番 platform, then turns west up onto the platform.
   b.node('jr_11_nishi', 'vertical', '西口（11番のりばへのES・EV下）', at(p11, 'nishi', NISHI_FOOT), '1F', { station: st, paid: true });
   b.vertical(nishiTop(p11), 'jr_11_nishi', ['esc', 'elev'], { bearingUp: AXIS, anchor: 'top' });
   b.walk(nishi[nishi.length - 1], 'jr_11_nishi', { name: '西口改札内コンコース' });
-  b.node('jr_11_mc', 'vertical', '11番のりば連絡中2階（中央口側）', at(p11, 'chuo', CHUO_FOOT), 'M2', { station: st, paid: true, y: MEZZ_Y });
-  b.vertical(chuo[chuo.length - 1], 'jr_11_mc', ['stairs', 'esc', 'elev'], { bearingUp: STACK_BEARING, anchor: 'mid' });
-  b.vertical('jr_11_mc', stops['jr-11'].chuo, ['stairs', 'esc', 'elev'], { bearingUp: AXIS + 180, anchor: 'bottom' });
-  b.node('jr_11_mm', 'vertical', '11番のりば連絡中2階（御堂筋口側）', at(p11, 'mido', MIDO_FOOT), 'M2', { station: st, paid: true, y: MEZZ_Y });
-  b.vertical(mido[mido.length - 1], 'jr_11_mm', ['stairs', 'esc'], { bearingUp: STACK_BEARING, anchor: 'mid' });
-  b.vertical('jr_11_mm', stops['jr-11'].mido, ['stairs', 'esc'], { bearingUp: AXIS + 180, anchor: 'bottom' });
+  const t11 = JR_PLATFORMS[4].t + 6;
+  const link11 = (bank: 'chuo' | 'mido', along: number, from: string, modes: ('stairs' | 'esc' | 'elev')[], label: string) => {
+    const foot = `jr_${bank}1_n`;
+    b.node(foot, 'junction', `${label}改札内コンコース（北端）`, jrAt(BANK[bank] + along, t11), '1F', { station: st, paid: true });
+    b.walk(from, foot, { name: `${label}改札内コンコース` });
+    const mid = bank === 'chuo' ? 'jr_11_mc' : 'jr_11_mm';
+    b.node(mid, 'vertical', `11番のりば連絡中2階（${label}側）`, jrAt(BANK[bank] + along, p11.t - 2), 'M2', { station: st, paid: true, y: MEZZ_Y });
+    b.vertical(foot, mid, modes, { bearingUp: ACROSS, anchor: 'bottom' });
+    b.vertical(mid, stops['jr-11'][bank], modes, { bearingUp: AXIS + 180, anchor: 'bottom' });
+  };
+  link11('chuo', CHUO_FOOT, chuo[chuo.length - 1], ['stairs', 'esc', 'elev'], '中央口');
+  link11('mido', MIDO_FOOT, mido[mido.length - 1], ['stairs', 'esc'], '御堂筋口');
 
   // 3F 橋上駅舎 (連絡橋口): the paid concourse lies east of the gate, over the 中央口 stair heads;
   // escalators, stairs and elevators come down from it heading west to mid-platform.
@@ -308,11 +360,13 @@ export function addJrOsaka(b: NetBuilder): void {
     b.vertical(stops[p.id].bridge, id, ['stairs', 'esc', 'elev'], { busy: p.busy, bearingUp: AXIS, anchor: 'top' });
     br.push(id);
   }
-  b.path(br, { name: '連絡橋口改札内コンコース', busy: 2, width: 20 });
-  b.node('jr_br_in', 'gate', '連絡橋口改札', [34.702599, 135.496042], '3F', { station: st, paid: true, label: true, y: BRIDGE_Y });
-  b.walk(br[2], 'jr_br_in');
-  b.walk(br[3], 'jr_br_in');
-  b.node('jr_br_out', 'junction', '連絡橋口前（南北連絡橋）', STACK, '3F', { station: st, y: BRIDGE_Y });
+  // The gate is reached from the concourse between the 5・6 and 7・8 flights.
+  const brGap = 'jr_br_g';
+  b.node(brGap, 'junction', '連絡橋口改札内コンコース', jrAt(JR_STACK_S + BRIDGE_TOP, tChuo), '3F', { station: st, paid: true, y: BRIDGE_Y });
+  b.path([...br.slice(0, 3), brGap, ...br.slice(3)], { name: '連絡橋口改札内コンコース', busy: 2, width: 20 });
+  b.node('jr_br_in', 'gate', '連絡橋口改札', jrAt(JR_STACK_S + BRIDGE_GATE, tChuo), '3F', { station: st, paid: true, label: true, y: BRIDGE_Y });
+  b.walk(brGap, 'jr_br_in');
+  b.node('jr_br_out', 'junction', '連絡橋口前（南北連絡橋）', jrAt(JR_STACK_S, tChuo), '3F', { station: st, y: BRIDGE_Y });
   b.gate('jr_br_in', 'jr_br_out', 'JR 連絡橋口改札', { busy: 2 });
 }
 

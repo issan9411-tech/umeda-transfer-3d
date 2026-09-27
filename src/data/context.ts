@@ -6,7 +6,7 @@ import type { NetBuilder } from './builder';
  */
 export function addContext(b: NetBuilder): void {
   // Stations
-  b.rect('jr:roof', 'JR大阪駅 大屋根', [34.70255, 135.4959], 180, 100, 76, 22, 23, 'deck');
+  b.rect('jr:roof', 'JR大阪駅 大屋根', [34.702404, 135.495907], 180, 100, 58.4, 22, 23, 'deck'); // OSM: s −80…+100, t −69…+31 in the JR frame
   // Along the platforms (350.6°), from the 1F BIGMAN plaza and the 3F gate concourse (south) to
   // the 茶屋町口 (north).
   b.rect('hankyu:bldg', '阪急大阪梅田駅・阪急三番街', [34.70581, 135.49858], 320, 150, 351, 0, 11, 'station');
