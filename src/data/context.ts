@@ -7,8 +7,11 @@ import type { NetBuilder } from './builder';
 export function addContext(b: NetBuilder): void {
   // Stations
   b.rect('jr:roof', 'JR大阪駅 大屋根', [34.70255, 135.4959], 180, 100, 76, 22, 23, 'deck');
-  b.rect('hankyu:bldg', '阪急大阪梅田駅・阪急三番街', [34.7061, 135.4984], 230, 140, 355, 0, 11, 'station');
-  b.rect('hanshin:bldg', '阪神梅田本店（大阪梅田ツインタワーズ・サウス）', [34.70085, 135.49705], 210, 75, 97, -7, 14, 'station');
+  // Along the platforms (350.6°), from the 1F BIGMAN plaza and the 3F gate concourse (south) to
+  // the 茶屋町口 (north).
+  b.rect('hankyu:bldg', '阪急大阪梅田駅・阪急三番街', [34.70581, 135.49858], 320, 150, 351, 0, 11, 'station');
+  // The terminus platforms lie a floor below the B1 malls.
+  b.rect('hanshin:bldg', '阪神梅田本店（大阪梅田ツインタワーズ・サウス）', [34.70085, 135.49705], 210, 75, 97, -13, 14, 'station');
 
   // Buildings
   const bl = (id: string, name: string, c: [number, number], l: number, w: number, bearing: number, h = 14) =>
@@ -36,7 +39,8 @@ export function addContext(b: NetBuilder): void {
 
   // Roads
   b.road('midosuji', '御堂筋', [[34.6935, 135.5003], [34.6977, 135.4998], [34.7018, 135.4988]], 40);
-  b.road('r176', '国道176号', [[34.7018, 135.4988], [34.7042, 135.4973], [34.7078, 135.4957]], 28);
+  // Passes between JR 御堂筋北口 and 阪急うめだ本店, where the 阪急百貨店前 crosswalk spans it.
+  b.road('r176', '国道176号', [[34.7018, 135.4988], [34.70335, 135.49814], [34.7042, 135.4976], [34.7078, 135.4957]], 28);
   b.road('shinmidosuji', '新御堂筋', [[34.7018, 135.4988], [34.7035, 135.5009], [34.7080, 135.5022]], 36);
   b.road('ekimae', '大阪駅前（バスターミナル前）', [[34.7018, 135.4935], [34.70175, 135.4960], [34.7019, 135.4985]], 26);
   b.road('sonezaki', '国道2号（曽根崎通）', [[34.6988, 135.4925], [34.69849, 135.49556], [34.698055, 135.498509], [34.6977, 135.4998], [34.6972, 135.5035]], 36);
