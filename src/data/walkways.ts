@@ -70,29 +70,53 @@ export function addWalkways(b: NetBuilder): void {
   b.vertical('f_br_s', 'f_daimaru1', ['esc', 'elev'], { name: '大丸梅田店 店内' });
   b.walk('f_daimaru1', 'f_chuo_s', { name: '大丸梅田店前' });
   b.j('f_gfo2', 'グランフロント大阪 南館2階デッキ', [34.704, 135.4951], '2F');
-  b.walk('f_atrium', 'f_gfo2', { name: 'ノースゲート〜グランフロント 2階デッキ', indoor: false, busy: 2 });
+  // The deck crosses うめきた広場 (in front of 中央北口) before turning west to GFO 南館.
+  b.j('f_gfo2p', 'うめきた広場 2階デッキ', [34.7041, 135.4959], '2F');
+  b.path(['f_atrium', 'f_gfo2p', 'f_gfo2'], { name: 'ノースゲート〜グランフロント 2階デッキ', indoor: false, busy: 2 });
   b.j('f_inogate2', 'イノゲート大阪 2階', [34.7029, 135.49385], '2F');
   b.walk('f_atrium', 'f_inogate2', { name: 'ノースゲート〜イノゲート 2階デッキ', indoor: false });
 
   // ------------------------------------------------------------------ 西口 / うめきた (1F)
+  // The 西口 free passage runs N–S through イノゲート 1F (KITTE to the south); across the street to
+  // the north stands うめきたグリーンプレイス (UGP), built over the うめきた地下口 concourse.
   b.j('f_inogate1', 'イノゲート大阪 1階', [34.7028, 135.4938], '1F');
   b.walk('jr_nishi_out', 'f_inogate1', { name: '西口 南北通路' });
   b.vertical('f_inogate1', 'f_inogate2', ['esc', 'elev']);
-  b.j('f_ugp1', 'うめきたグリーンプレイス 1階', [34.7033, 135.4934], '1F');
-  b.walk('f_inogate1', 'f_ugp1', { name: 'うめきたグリーンプレイス前', indoor: false });
-  b.vertical('f_ugp1', 'uk_gate_out', ['stairs', 'esc', 'elev'], { name: 'うめきた地上出口' });
+  b.j('f_uk_x', 'うめきた側 横断歩道北詰（イノゲート北）', [34.70318, 135.49376], '1F');
+  b.cross('f_inogate1', 'f_uk_x', 'イノゲート前 横断歩道（梅田ランプ東方面）', 40, { busy: 1 });
+  b.j('f_ugp1', 'うめきたグリーンプレイス 1階', [34.70359, 135.493756], '1F');
+  b.walk('f_uk_x', 'f_ugp1', { name: 'うめきたグリーンプレイス 1階（公共広場）', indoor: false });
+  // 大阪駅（うめきたエリア）地上出口: from the B1 corridor east of the gate, on its south side, up
+  // into UGP 1F (rises southward; f_ugp1 is just past the head of the 7 m stair, ≈19 m south).
+  b.vertical('uk_b1_e', 'f_ugp1', ['stairs', 'esc', 'elev'], { name: '大阪駅（うめきたエリア）地上出口', bearingUp: 180, anchor: 'bottom' });
+  // 2F decks: イノゲート 2F → UGP 2F → グラングリーン大阪 南館 2F (opened 2024-12 and 2025-04-11).
+  b.j('f_ugp2', 'うめきたグリーンプレイス 2階（歩行者デッキ）', [34.70325, 135.49368], '2F', D2);
+  b.walk('f_inogate2', 'f_ugp2', { name: 'イノゲート〜うめきたグリーンプレイス 歩行者デッキ', indoor: false });
+  b.vertical('f_ugp1', 'f_ugp2', ['esc', 'elev'], { anchor: 'top' });
+  b.j('f_ggo2', 'グラングリーン大阪 南館 2階', [34.7033, 135.4923], '2F', D2);
+  b.walk('f_ugp2', 'f_ggo2', { name: '歩行者デッキ（グラングリーン大阪 南館方面）', indoor: false });
+  // うめきた公園 サウスパーク: turn left (west) out of the gate; the escalator ahead rises west to
+  // the park under the 大屋根, and the B1 corridor carries straight on into GGO 南館.
+  b.j('f_sp1', 'うめきた公園 サウスパーク（大屋根下）', [34.703761, 135.493101], '1F', { label: true });
+  b.vertical('uk_sp_b1', 'f_sp1', ['esc'], { name: 'うめきた公園への出口', bearingUp: 270, anchor: 'bottom' });
+  b.walk('f_sp1', 'f_ugp1', { name: 'うめきた公園〜グリーンプレイス', indoor: false });
+  // Level with the gate-front corridor (a sloping corridor would roof over the park escalator).
+  b.j('f_ggo_b1', 'グラングリーン大阪 南館 地下1階（タイムアウトマーケット）', [34.7034, 135.4922], 'B1', { y: -7 });
+  b.walk('uk_sp_b1', 'f_ggo_b1', { name: 'うめきた地下通路（グラングリーン大阪 南館方面）', busy: 1 });
   b.j('f_kitte1', 'KITTE大阪 1階', [34.7013, 135.4942], '1F');
   b.walk('jr_nishi_out', 'f_kitte1', { name: '西口 南北通路' });
-  b.j('f_gfo1', 'グランフロント大阪 うめきた広場', [34.70348, 135.49455], '1F', { label: true });
-  b.vertical('f_gfo2', 'f_gfo1', ['stairs', 'esc']);
+  // GFO うめきた広場: directly in front of JR 中央北口, with うめきたセラー on B1 beneath it.
+  b.j('f_gfo1', 'グランフロント大阪 うめきた広場', [34.70425, 135.4959], '1F', { label: true });
+  b.vertical('f_gfo2p', 'f_gfo1', ['stairs', 'esc'], { anchor: 'bottom' });
   b.walk('f_gfo1', 'f_ugp1', { name: 'うめきた広場〜グリーンプレイス', indoor: false });
 
   // ------------------------------------------------------------------ B1: north (ルクア・グランフロント・阪急三番街)
   b.j('f_lucua_b1', 'ルクア地下1階（バルチカ）', [34.7033, 135.4966], 'B1', B1);
   b.vertical('f_chuo_n', 'f_lucua_b1', ['stairs', 'esc']);
+  b.j('f_ucellar_b1', 'うめきたセラー（うめきた広場 地下1階）', [34.7044, 135.4959], 'B1', B1);
+  b.vertical('f_gfo1', 'f_ucellar_b1', ['stairs', 'esc', 'elev'], { anchor: 'mid' });
   b.j('f_gfo_b1', 'グランフロント大阪 南館地下1階', [34.7041, 135.4949], 'B1', B1);
-  b.path(['f_lucua_b1', 'f_gfo_b1', 'uk_gate_out'], { name: 'ルクア〜グランフロント地下通路', busy: 1 });
-  b.vertical('f_gfo1', 'f_gfo_b1', ['stairs', 'esc', 'elev']);
+  b.path(['f_lucua_b1', 'f_ucellar_b1', 'f_gfo_b1', 'uk_b1_e'], { name: 'ルクア〜グランフロント〜うめきた地下通路', busy: 1 });
   b.j('f_midon_b1', 'JR御堂筋北口 地下', [34.7032, 135.4977], 'B1', B1);
   b.walk('f_lucua_b1', 'f_midon_b1', { name: 'ルクア地下通路', busy: 2 });
   b.vertical('f_mido_n', 'f_midon_b1', ['stairs', 'esc', 'elev']);
@@ -137,22 +161,27 @@ export function addWalkways(b: NetBuilder): void {
   b.walk('f_dm_e', 'f_wh_sw', { name: 'ディアモール〜ホワイティ連絡' });
   b.walk('f_dm_w', 'y_n_out', { busy: 2 });
   b.walk('hs_w_out', 'y_n_out', { name: '西梅田・阪神西口連絡通路', busy: 1 });
-  b.j('f_dm_s', 'ディアモール 南北通路（北新地方面）', [34.6991, 135.4969], 'B1', B1);
+  // The spine ends at the big 北新地駅 sign, one floor down on the 北新地 concourse (right to 西改札,
+  // left to 東改札): the flight drops southward right at its end.
+  b.j('f_dm_s', 'ディアモール 南北通路（北新地方面）', [34.698554, 135.496965], 'B1', B1);
   b.walk('f_dm_c', 'f_dm_s', { name: 'ディアモール大阪（北新地方面）', busy: 2 });
-  b.vertical('f_dm_s', 'ks_mid_out', ['stairs', 'esc'], { name: '北新地駅への階段' });
+  b.vertical('f_dm_s', 'ks_mid_out', ['stairs', 'esc'], { name: '北新地駅への階段', bearingUp: 1, anchor: 'bottom' });
 
-  // 大阪駅前ビル地下 (第2〜第4ビル) → 東梅田 南改札.
-  b.j('f_ek2_b2', '大阪駅前第2ビル 地下2階入口', [34.6988, 135.4981], 'B2', { y: -10 });
+  // 大阪駅前ビル地下 (第2〜第4ビル) → 東梅田 南改札. JR北新地 東改札 opens straight onto the 第2ビル
+  // B2 entrance; the building's own stairs rise north into its B1.
+  b.j('f_ek2_b2', '大阪駅前第2ビル 地下2階入口', [34.69846, 135.49796], 'B2', { y: -10 });
   b.walk('ks_e_out', 'f_ek2_b2', { name: '北新地駅 東口通路' });
   b.j('f_ek2_b1', '大阪駅前第2ビル 地下1階', [34.69925, 135.4982], 'B1', B1);
-  b.vertical('f_ek2_b2', 'f_ek2_b1', ['stairs', 'esc', 'elev']);
+  b.vertical('f_ek2_b2', 'f_ek2_b1', ['stairs', 'esc', 'elev'], { bearingUp: 7, anchor: 'bottom' });
   b.walk('f_ek2_b1', 'f_dm_e', { name: '大阪駅前ビル〜ディアモール' });
+  b.j('f_ek3_b1', '大阪駅前第3ビル 地下1階', [34.69925, 135.499], 'B1', B1);
   b.j('f_ek4_b1', '大阪駅前第4ビル 地下1階', [34.6993, 135.4999], 'B1', B1);
-  b.path(['f_ek2_b1', 'f_ek4_b1', 't_s_out'], { name: '大阪駅前ビル地下', busy: 1 });
+  b.path(['f_ek2_b1', 'f_ek3_b1', 'f_ek4_b1', 't_s_out'], { name: '大阪駅前ビル地下', busy: 1 });
 
-  // 北新地 西改札 ↔ 西梅田 南改札 (1–3 min).
+  // 北新地 西改札 ↔ 西梅田 南改札 (1–3 min): the 地下鉄（西梅田）連絡口 right outside 西改札 climbs west
+  // to the B1 passage under 四つ橋筋 (西梅田 南改札 to the north, ドーチカ to the south).
   b.j('f_ksw_b1', '地下鉄（西梅田）連絡口 地下1階', [34.69866, 135.4957], 'B1', B1);
-  b.vertical('ks_w_out', 'f_ksw_b1', ['stairs', 'esc'], { name: '地下鉄（西梅田）連絡口' });
+  b.vertical('ks_w_out', 'f_ksw_b1', ['stairs', 'esc'], { name: '地下鉄（西梅田）連絡口', bearingUp: 281, anchor: 'top' });
   b.walk('f_ksw_b1', 'y_s_out', { name: '西梅田 南改札への連絡通路', busy: 1 });
   // Free passage along the east side of 西梅田 station north to ディアモール西 (阪神西口・ハービス方面).
   b.walk('y_s_out', 'f_dm_w', { name: '西梅田駅東側 地下通路', busy: 1 });
@@ -172,11 +201,12 @@ export function addWalkways(b: NetBuilder): void {
   };
   ent('e_yodobashi', 'ヨドバシ梅田', [34.7044, 135.4968], 'f_deck_mid', '2F');
   ent('e_hkdept', '阪急うめだ本店', [34.703, 135.4994], 'f_hk_sw');
-  ent('e_gfo', 'グランフロント大阪', [34.7047, 135.4944], 'f_gfo1');
-  ent('e_park', 'うめきた公園', [34.70351, 135.49263], 'f_ugp1');
+  ent('e_gfo', 'グランフロント大阪', [34.7047, 135.4944], 'f_gfo_b1', 'B1');
+  ent('e_park', 'うめきた公園', [34.70351, 135.49263], 'f_sp1');
   ent('e_kitte', 'KITTE大阪・JPタワー', [34.70105, 135.4938], 'f_kitte1');
   ent('e_herbis', 'ハービスOSAKA', [34.7003, 135.4944], 'f_dm_w', 'B1');
-  ent('e_sakurabashi', '桜橋（北新地西）', [34.6982, 135.4953], 'f_ksw_b1', 'B1');
+  // Inside ドーチカ (堂島地下センター) under 四つ橋筋, ≈65 m south of 桜橋交差点.
+  ent('e_sakurabashi', 'ドーチカ（堂島地下センター）・桜橋', [34.6979, 135.49559], 'f_ksw_b1', 'B1');
   ent('e_shindo', '梅田新道', [34.6985, 135.4999], 'f_ek4_b1', 'B1');
   ent('e_ohatsu', 'お初天神・曽根崎', [34.7015, 135.5029], 'f_izumi', 'B1');
   ent('e_hep', 'HEP FIVE・東通り', [34.7035, 135.5003], 'f_wh_n', 'B1');
