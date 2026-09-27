@@ -1429,9 +1429,11 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
   }
 
   const meshes: (THREE.Mesh | null)[] = [
-    geo.tile.mesh(lambert(tex.tile, '#d8cfc2', { vertexColors: true }), 'floor-tile'),
-    geo.stone.mesh(lambert(tex.stone, '#cfc6b8', { vertexColors: true }), 'floor-stone'),
-    geo.paver.mesh(lambert(tex.paver, '#a39e96', { vertexColors: true }), 'floor-paver'),
+    // Where floors of different finishes overlap (junctions, corridor ends), a fixed depth
+    // priority decides which one shows: station tiles over terrazzo over pavers over asphalt.
+    geo.tile.mesh(lambert(tex.tile, '#d8cfc2', { vertexColors: true, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }), 'floor-tile'),
+    geo.stone.mesh(lambert(tex.stone, '#cfc6b8', { vertexColors: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }), 'floor-stone'),
+    geo.paver.mesh(lambert(tex.paver, '#a39e96', { vertexColors: true, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }), 'floor-paver'),
     geo.asphalt.mesh(lambert(tex.asphalt, '#4c4f53', { vertexColors: true }), 'floor-asphalt'),
     geo.marks.mesh(withCut(new THREE.MeshLambertMaterial({ vertexColors: true }), cut), 'markings'),
     geo.tactile.mesh(lambert(tex.tactile, '#e9b400'), 'tactile'),
