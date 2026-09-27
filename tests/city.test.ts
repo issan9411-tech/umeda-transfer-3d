@@ -48,7 +48,7 @@ import {
   type Vehicle,
   type WallRect,
 } from '../src/render/city-layout';
-import type { Footprint, NetEdge, NetNode, Network, Road } from '../src/core/types';
+import type { Footprint, NetEdge, NetNode, Network } from '../src/core/types';
 
 const net = umeda.network;
 const centroid = (p: P2[]): P2 => [p.reduce((s, q) => s + q[0], 0) / p.length, p.reduce((s, q) => s + q[1], 0) / p.length];
@@ -153,23 +153,27 @@ describe('OpenStreetMap context data', () => {
   });
 
   it('models streets as mapped carriageways: one-way pairs that never overlap', () => {
-    const roads = net.roads.filter((r) => r.source === 'osm');
+    const roads = net.roads.filter((r) => r.source === 'osm' && !r.deck);
     const oneway = roads.filter((r) => r.oneway);
     expect(oneway.length).toBeGreaterThan(100);
     // 御堂筋 runs one way southbound from 梅田新道.
     const mido = roads.filter((r) => r.nameJa === '御堂筋' && r.oneway);
     expect(mido.length).toBeGreaterThan(0);
-    const south = mido.find((r) => Math.min(...r.points.map((p) => p[1])) > 400);
-    expect(south, 'southbound 御堂筋 below 梅田新道').toBeDefined();
-    const s = south as Road;
-    expect(s.points[s.points.length - 1][1]).toBeGreaterThan(s.points[0][1]);
+    // (梅田新道, where it crosses 曽根崎通, is at z ≈ 470–485.)
+    const south = mido.filter((r) => Math.min(...r.points.map((p) => p[1])) > 480);
+    expect(south.length, 'southbound 御堂筋 below 梅田新道').toBeGreaterThan(0);
+    for (const s of south) expect(s.points[s.points.length - 1][1], s.id).toBeGreaterThan(s.points[0][1]);
+    // North of it the two carriageways run both ways.
+    const north = mido.filter((r) => Math.max(...r.points.map((p) => p[1])) < 480 && Math.min(...r.points.map((p) => p[1])) > 60);
+    expect(north.some((r) => r.points[r.points.length - 1][1] < r.points[0][1])).toBe(true);
+    expect(north.some((r) => r.points[r.points.length - 1][1] > r.points[0][1])).toBe(true);
     // Twin carriageways (side by side, opposite directions) keep their asphalt apart.
     const infos = analyseRoads(roads).infos;
     let pairs = 0;
     let overlaps = 0;
     for (let i = 0; i < infos.length; i++) {
       const a = infos[i];
-      if (!a.road.oneway || a.len < 80) continue;
+      if (!a.road.oneway || a.len < 50) continue;
       for (let k = 20; k < a.len - 20; k += 10) {
         const t = { x: 0, z: 0, dx: 1, dz: 0, seg: 0 };
         const p = (pa: typeof a, s: number) => {
@@ -205,19 +209,49 @@ describe('OpenStreetMap context data', () => {
           }
           if (best < 3 || best > 30 || bd > -0.95) continue; // not an opposite twin here
           pairs++;
-          if (best < (a.road.width + b.road.width) / 2 - 1.5) overlaps++;
+          if (best < (a.road.width + b.road.width) / 2 - 0.5) overlaps++;
         }
       }
     }
-    expect(pairs).toBeGreaterThan(100);
-    expect(overlaps / pairs).toBeLessThan(0.15);
+    expect(pairs).toBeGreaterThan(1000);
+    expect(overlaps / pairs).toBeLessThan(0.01);
+  });
+
+  it('lifts expressways and flyovers onto decks, keeps river bridges as streets', () => {
+    const decks = net.roads.filter((r) => r.deck);
+    expect(decks.length).toBeGreaterThan(20);
+    const names = new Set(decks.map((d) => d.nameJa));
+    for (const n of ['新御堂筋', '阪神高速11号池田線', '国道176号']) expect(names.has(n), n).toBe(true);
+    // 大江橋 (御堂筋) and 渡辺橋 (四つ橋筋) cross the 堂島川 at street level.
+    expect(names.has('御堂筋')).toBe(false);
+    expect(names.has('四つ橋筋')).toBe(false);
+    for (const d of decks) {
+      const h = d.deck as number[];
+      expect(h.length).toBe(d.points.length);
+      for (let i = 0; i < h.length; i++) {
+        expect(h[i]).toBeGreaterThanOrEqual(0);
+        expect(h[i]).toBeLessThanOrEqual(18.5);
+        if (i === 0) continue;
+        // Ramps no steeper than 6 % (heights are rounded to 0.1 m).
+        const run = Math.hypot(d.points[i][0] - d.points[i - 1][0], d.points[i][1] - d.points[i - 1][1]);
+        expect(Math.abs(h[i] - h[i - 1]), d.id).toBeLessThanOrEqual(0.06 * run + 0.11);
+      }
+    }
+    // Most of the decks are well above the street.
+    const high = decks.filter((d) => Math.max(...(d.deck as number[])) >= 6);
+    expect(high.length / decks.length).toBeGreaterThan(0.7);
+  });
+
+  it('credits OpenStreetMap in the data sources', () => {
+    expect(umeda.sources.some((s) => /OpenStreetMap/.test(s.title) && /ODbL/.test(s.note ?? ''))).toBe(true);
+    expect(umeda.caveats.some((c) => /OpenStreetMap/.test(c) && /Overture/.test(c))).toBe(true);
   });
 
   it('puts the mapped crosswalks on the carriageways they cross', () => {
     const roads = net.roads.filter((r) => r.crosswalks?.length);
     const all = roads.flatMap((r) => r.crosswalks ?? []);
     expect(all.length).toBeGreaterThan(100);
-    const index = new RoadIndex(analyseRoads(net.roads).infos);
+    const index = new RoadIndex(analyseRoads(net.roads.filter((r) => !r.deck)).infos);
     let on = 0;
     for (const [x0, z0, x1, z1] of all) if (index.onRoad((x0 + x1) / 2, (z0 + z1) / 2)) on++;
     expect(on / all.length).toBeGreaterThan(0.95);
@@ -381,7 +415,7 @@ describe('camera cut-away', () => {
 });
 
 describe('streets', () => {
-  const { infos, junctions } = analyseRoads(net.roads);
+  const { infos, junctions } = analyseRoads(net.roads.filter((r) => !r.deck));
 
   it('finds the 梅田 junction where 御堂筋, 国道176号 and the others meet', () => {
     const umedaX = junctions.filter((j) => Math.hypot(j.x - 250, j.z - 75) < 30);
@@ -615,6 +649,17 @@ describe('buildCity', () => {
     expect(city.object.parent).toBeNull();
   }, 30_000);
 
+  it('keeps the overview readable: landmarks semi-solid, small low blocks fainter', () => {
+    const city = buildCity(net, { dark: false, night: false, ex: 4, walk: false });
+    const ngb = city.buildingFade((byName('ノースゲートビルディング') as Footprint).id) as number;
+    expect(ngb).toBeCloseTo(OVERVIEW_OPACITY, 2);
+    // Low blocks near the stations (within 100 m of a network node) sit well below that.
+    const low = osm.filter((f) => f.y1 < 20 && !f.parts && f.use !== 'roof' && net.nodes.some((n) => Math.hypot(n.x - f.poly[0][0], n.z - f.poly[0][1]) < 100)).slice(0, 20);
+    expect(low.length).toBeGreaterThan(5);
+    for (const f of low) expect(city.buildingFade(f.id) as number).toBeLessThan(OVERVIEW_OPACITY * 0.6);
+    city.dispose();
+  }, 30_000);
+
   it('fades thousands of buildings: the one between camera and walker ghosts, drawn in the blended pass only', () => {
     const city = buildCity(net, { dark: false, night: false, ex: 1.5, walk: true });
     const yodo = (byName('ヨドバシ梅田タワー') as Footprint).id;
@@ -724,7 +769,7 @@ describe('buildCity in walkable space', () => {
   }
 
   it('never stands a facade, roof, canopy, frame or street surface in the walker’s way', () => {
-    const solid = soup(/^city-((curtain|grid|band|stone|roofs)-solid|ground|roads|sidewalks|markings|wheel)$/);
+    const solid = soup(/^city-((curtain|grid|band|stone|roofs)-solid|ground|roads|sidewalks|markings|wheel|viaducts)$/);
     const g = buildGraph(net);
     const lanes = verticalLaneOffsets(g);
     const bad: string[] = [];
@@ -794,6 +839,48 @@ describe('buildCity in walkable space', () => {
     }
     expect(tops).toBeGreaterThan(1000);
     expect(inside / tops).toBeLessThan(0.005);
+  });
+
+  it('keeps traffic off walking lines and pavements out of street-level concourses', () => {
+    const crossingIds = new Set(net.edges.filter((e) => e.kind === 'crossing').map((e) => e.id));
+    /** Is (x, z) on a street-level walking line other than a crossing (indoor ones only)? */
+    const onWalk = (x: number, z: number, indoorOnly: boolean) =>
+      space.query(x, x, z, z).some((p) => {
+        if (p.kind !== 'corridor' || crossingIds.has(p.id) || (indoorOnly && !p.indoor)) return false;
+        const f = p.f0 + p.fx * x + p.fz * z;
+        return f > -0.6 && f < 1.2 && insideConvex(p.poly, x, z);
+      });
+    const cam = new THREE.PerspectiveCamera();
+    cam.position.set(200, 10, 0);
+    cam.updateMatrixWorld();
+    const m = new THREE.Matrix4();
+    const p = new THREE.Vector3();
+    let shown = 0;
+    const bad: string[] = [];
+    for (let step = 0; step < 4; step++) {
+      for (let i = 0; i < 30; i++) city.update(cam, new THREE.Vector3(230, 0, 0), 1 / 10);
+      for (const name of ['city-cars', 'city-buses']) {
+        const mesh = city.object.getObjectByName(name) as THREE.InstancedMesh;
+        for (let i = 0; i < mesh.count; i++) {
+          mesh.getMatrixAt(i, m);
+          if (Math.abs(m.determinant()) < 1e-9) continue;
+          shown++;
+          p.setFromMatrixPosition(m);
+          if (onWalk(p.x, p.z, false)) bad.push(`${name} ${i} at ${p.x.toFixed(1)},${p.z.toFixed(1)}`);
+        }
+      }
+    }
+    expect(shown).toBeGreaterThan(500);
+    expect(bad).toEqual([]);
+    const walks = soup(/^city-sidewalks$/);
+    let inConcourse = 0;
+    for (let t = 0; t < walks.tri.length / 9; t++) {
+      if (Math.abs(walks.tri[t * 9 + 1] - 0.15) > 1e-3) continue;
+      const x = (walks.tri[t * 9] + walks.tri[t * 9 + 3] + walks.tri[t * 9 + 6]) / 3;
+      const z = (walks.tri[t * 9 + 2] + walks.tri[t * 9 + 5] + walks.tri[t * 9 + 8]) / 3;
+      if (onWalk(x, z, true)) inConcourse++;
+    }
+    expect(inConcourse).toBe(0);
   });
 
   it('keeps trees, lamps and the Ferris wheel off walking lines', () => {

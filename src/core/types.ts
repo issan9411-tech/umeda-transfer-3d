@@ -154,7 +154,7 @@ export interface FootprintPart {
   estimated?: boolean;
 }
 
-export type RoadClass = 'trunk' | 'primary' | 'secondary' | 'tertiary' | 'unclassified' | 'residential' | 'service';
+export type RoadClass = 'motorway' | 'trunk' | 'primary' | 'secondary' | 'tertiary' | 'unclassified' | 'residential' | 'service';
 
 export interface Road {
   id: string;
@@ -172,6 +172,11 @@ export interface Road {
   terminal?: boolean;
   /** Where the centreline comes from, e.g. 'osm'. */
   source?: string;
+  /**
+   * An elevated carriageway (expressway, viaduct, flyover), not a street: the deck's top at each
+   * point, real metres above the street (ramps come down to 0 where they meet a street).
+   */
+  deck?: number[];
 }
 
 export interface Network {

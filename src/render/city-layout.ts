@@ -302,6 +302,8 @@ export interface MassPart {
   y0: number;
   y1: number;
   look: PartLook;
+  /** A helicopter landing pad is mapped on this (the building's tallest) roof. */
+  helipad?: boolean;
 }
 
 /**
@@ -334,6 +336,13 @@ export function massing(fp: Footprint, seed: number): { parts: MassPart[]; landm
     const look: PartLook = lm ? toLook(isTower ? (lm.tower as Look) : lm.podium) : genericLook(fp.use, p.y1, area, r);
     return { poly: p.poly, holes: p.holes, y0: p.y0, y1, look };
   });
+  if (fp.helipad && parts.length) {
+    const t = parts.reduce((a, b) => (b.y1 > a.y1 ? b : a));
+    if (t.look.roof !== 'canopy') {
+      t.look = { ...t.look, roof: 'heli' };
+      t.helipad = true;
+    }
+  }
   return { parts, landmark: lm };
 }
 
@@ -946,7 +955,7 @@ export function sidewalkWidth(width: number, road?: Road): number {
 
 /** Ginkgo avenues (御堂筋, 新御堂筋). */
 export function isGinkgoAvenue(road: Road): boolean {
-  return road.id === 'midosuji' || road.id === 'shinmidosuji' || road.nameJa === '御堂筋' || road.nameJa === '新御堂筋';
+  return road.nameJa === '御堂筋' || road.nameJa === '新御堂筋';
 }
 
 // ---------------------------------------------------------------- building plan index
@@ -1076,7 +1085,7 @@ export function placeStreetFurniture(
         }
       }
     };
-    if (!info.road.terminal && info.road.id !== 'ekimae') place(ginkgo ? 10 : 18, Math.min(1.4, sw * 0.3), trees, 'tree', ginkgo ? 1 : 0, 4);
+    if (!info.road.terminal) place(ginkgo ? 10 : 18, Math.min(1.4, sw * 0.3), trees, 'tree', ginkgo ? 1 : 0, 4);
     place(30, 0.5, lamps, 'lamp', 0, 15);
   });
   const best = (l: (Placement & { rk: number })[], max: number | undefined) => {

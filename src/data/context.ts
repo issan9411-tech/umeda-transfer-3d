@@ -1,15 +1,16 @@
 import type { NetBuilder } from './builder';
 import type { Footprint } from '../core/types';
-import { decodeBuildings, decodeRoads } from './osm/codec';
+import { decodeBuildings, decodeRoads, decodeViaducts } from './osm/codec';
 import { BUILDING_DATA, BUILDING_NAMES } from './osm/buildings';
-import { ROAD_DATA, ROAD_NAMES } from './osm/roads';
+import { ROAD_DATA, ROAD_NAMES, VIADUCT_DATA, VIADUCT_NAMES } from './osm/roads';
 
 /**
  * Map context (not routable): the stations' own blocks, the underground malls, and every
  * building and street around them as mapped in OpenStreetMap (via Overture Maps; see
  * tools/overture/gen_osm.py). Building heights are real metres (roof height; storeys × 3.5 m
  * where only a floor count is mapped, else estimated and flagged); streets are carriageway
- * centrelines at ground level with their mapped crosswalks.
+ * centrelines at ground level with their mapped crosswalks; expressways and flyovers are roads
+ * with a deck height at every point.
  */
 export function addContext(b: NetBuilder): void {
   // Stations
@@ -38,4 +39,6 @@ export function addContext(b: NetBuilder): void {
   const buildings: Footprint[] = osm.buildings;
   b.footprints.push(...buildings);
   b.roads.push(...decodeRoads(ROAD_DATA, ROAD_NAMES));
+  // Expressways and flyovers above the streets (阪神高速, the 新御堂筋 viaduct): decks on piers.
+  b.roads.push(...decodeViaducts(VIADUCT_DATA, VIADUCT_NAMES));
 }

@@ -88,6 +88,7 @@ export const umeda: DataSet = {
     { title: '大阪駅.net：北新地→御堂筋線梅田', url: 'https://osaka-station.net/archives/1200' },
     { title: 'おにぎりフェイス：北新地⇔西梅田', url: 'https://onigiriface.jp/jr-kitashinchi-yotsubashi-nishiumeda.html' },
     { title: '旅シーズン：御堂筋線梅田→うめきた地下口', url: 'https://www.tabiseason.com/accsnr/asnrossri.html' },
+    { title: 'OpenStreetMap（Overture Maps 経由）', url: 'https://www.openstreetmap.org/copyright', note: '周辺の建物・道路：© OpenStreetMap contributors（ODbL）' },
   ],
   caveats: [
     '位置・高さ・通路長は公開情報と推定に基づく概略モデルです（誤差は数十m程度）。実際の構内図・案内表示を優先してください。',
@@ -95,6 +96,7 @@ export const umeda: DataSet = {
     'エレベーターは主要なものだけをモデル化しています。「段差なし」のルートは目安で、営業時間外の商業施設内ルート（大丸店内など）も含みます。',
     '工事による一時的な通路閉鎖（阪急茶屋町口付近 2026年9月〜など）は反映していません。',
     '乗換時間は歩行のみで、列車の待ち時間や改札内での乗車券購入などは含みません。',
+    '3D表示の周辺の建物と道路は OpenStreetMap（© OpenStreetMap contributors、ODbL）を Overture Maps 経由で取得したものです。高さが登録されていない建物は階数×3.5 m または推定値です。',
   ],
   defaultRoute: { from: 'station:hankyu', to: 'station:higashiumeda' },
 };

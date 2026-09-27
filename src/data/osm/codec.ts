@@ -110,6 +110,33 @@ export function decodeBuildings(data: string, names: string[]): Pick<OsmContext,
   return { buildings, hankyu, hanshin };
 }
 
+const DECK_CLASSES: RoadClass[] = ['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'unclassified', 'residential'];
+
+/** Elevated carriageways (roads.ts VIADUCT_DATA): Road records with a deck height per point. */
+export function decodeViaducts(data: string, names: string[]): Road[] {
+  const r = new Reader(data);
+  const n = r.u();
+  const out: Road[] = [];
+  for (let k = 0; k < n; k++) {
+    const cls = DECK_CLASSES[r.u()];
+    const flags = r.u();
+    const name = flags & 2 ? names[r.u()] : '';
+    const width = r.u() / 4;
+    const np = r.u();
+    const points: [number, number][] = [];
+    const deck: number[] = [];
+    for (let i = 0; i < np; i++) {
+      points.push(r.pt());
+      deck.push(r.u() / 10);
+    }
+    const road: Road = { id: `osm-deck:${k}`, nameJa: name, points, width, cls, source: 'osm', deck };
+    if (flags & 1) road.oneway = true;
+    out.push(road);
+  }
+  if (!r.done) throw new Error('osm viaducts: trailing data');
+  return out;
+}
+
 export function decodeRoads(data: string, names: string[]): Road[] {
   const r = new Reader(data);
   const n = r.u();
