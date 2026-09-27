@@ -818,6 +818,9 @@ const SLOPE_PITCHES = [0.05, 0.2];
 const PITCH_COST = 2.2;
 const SWING_COST = 1.8;
 const KEEP_BONUS = 0.6;
+/** After a cut to another arm, it is kept with this much more bonus, fading over COMMIT s. */
+const COMMIT_BONUS = 3;
+const COMMIT = 1.5;
 /** Arm lengths where the walker fades out (FADE_TO → FADE_FROM) and the camera moves to the eye (FADE_FROM → EYE_FROM). */
 const FADE_TO = 2.1;
 const FADE_FROM = 1.4;
@@ -875,6 +878,9 @@ export interface CameraRig {
   hold: THREE.Vector3;
   /** Ride progress at the last search for a spot that found none. */
   tried: number;
+  /** Seconds of camera time, and when the arm last cut to another side. */
+  clock: number;
+  cutAt: number;
 }
 
 export interface WalkCameraPose {
@@ -892,7 +898,7 @@ export interface WalkCameraPose {
 }
 
 export function createRig(): CameraRig {
-  return { ready: false, swing: 0, pitch: ARM_PITCH, len: ARM_LEN, choice: 0, target: new THREE.Vector3(), cam: new THREE.Vector3(), placed: false, ride: 0, hold: new THREE.Vector3(), tried: -1 };
+  return { ready: false, swing: 0, pitch: ARM_PITCH, len: ARM_LEN, choice: 0, target: new THREE.Vector3(), cam: new THREE.Vector3(), placed: false, ride: 0, hold: new THREE.Vector3(), tried: -1, clock: 0, cutAt: -Infinity };
 }
 
 export function createPose(): WalkCameraPose {
@@ -1010,9 +1016,14 @@ function outOfShafts(p: THREE.Vector3, d: THREE.Vector3, len: number, r: number)
   return exit > 0 && len < exit + 0.02 ? 0 : len;
 }
 
+/** Is p outside the plan circle kept around shaft s (or above or below the shaft)? */
+function outsideShaft(s: Shaft, p: THREE.Vector3): boolean {
+  return p.y <= s.y0 - CAMERA_RADIUS || p.y >= s.y1 + CAMERA_RADIUS || Math.hypot(p.x - s.x, p.z - s.z) >= shaftKeep(s);
+}
+
 /** Is p outside every nearby lift shaft (with room for the camera sphere)? */
 function outsideShafts(p: THREE.Vector3): boolean {
-  for (const s of nearShafts) if (p.y > s.y0 - CAMERA_RADIUS && p.y < s.y1 + CAMERA_RADIUS && Math.hypot(p.x - s.x, p.z - s.z) < shaftKeep(s)) return false;
+  for (const s of nearShafts) if (!outsideShaft(s, p)) return false;
   return true;
 }
 
@@ -1176,6 +1187,7 @@ function placed(rig: CameraRig, out: WalkCameraPose): WalkCameraPose {
  * Chase camera: spring arm behind the walker that never passes through solids.
  * `dt` ≤ 0 (or a fresh rig) snaps; otherwise pull-in is immediate and release eases out.
  */
+export const __dbg: Record<string, number | boolean> = ((globalThis as any).__camDbg = {});
 export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: CameraRig, dt: number, out: WalkCameraPose = createPose()): WalkCameraPose {
   const snap = !rig.ready || dt <= 0;
   const pivot = out.pivot;
@@ -1215,13 +1227,17 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
     else rSoon = Math.min(r, cs * 0.95);
     if (soon && inShaft && Math.hypot(soon.x - inShaft.x, soon.z - inShaft.z) < inShaft.half) soonGlass = pass;
   }
+  // (Just after a cut the new arm is kept a while longer: no second cut straight after.)
+  const sinceCut = rig.clock + Math.max(0, dt) - rig.cutAt;
+  const commit = sinceCut < COMMIT ? COMMIT_BONUS * (1 - sinceCut / COMMIT) : 0;
   const consider = (id: number) => {
     if (id >= nPitch && id < nStraight && !onFlight) return;
     const swing = id < nStraight ? 0 : id < nSide ? SWINGS[Math.floor((id - nStraight) / SWING_PITCHES.length)] : FRONT_SWINGS[id - nSide];
     const dp = id < nPitch ? PITCHES[id] : id < nStraight ? sb + SLOPE_PITCHES[id - nPitch] - basePitch : id < nSide ? SWING_PITCHES[(id - nStraight) % SWING_PITCHES.length] : FRONT_PITCH;
     const pitch = Math.min(1.5, Math.max(-0.9, basePitch + dp));
     const flight = id >= nPitch && id < nStraight ? 0.5 : 1;
-    const cost = PITCH_COST * flight * Math.abs(dp) + SWING_COST * Math.abs(swing) - (id === rig.choice && !snap ? KEEP_BONUS : 0);
+    const kept = id === rig.choice && !snap;
+    const cost = PITCH_COST * flight * Math.abs(dp) + SWING_COST * Math.abs(swing) - (kept ? KEEP_BONUS + commit : 0);
     const d = armDir(back + swing, pitch, _d);
     let free = freeArm(world, pivot, d, ARM_LEN, r);
     if (free - cost <= bestScore) return;
@@ -1230,7 +1246,8 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
       if (free - cost <= bestScore) return;
     }
     free = flooredArm(world, pivot, d, free, check);
-    const score = free - cost - (free < 1.2 ? 2 : 0);
+    // (A kept arm about to collapse loses its extra hold.)
+    const score = free - cost - (free < 1.2 ? 2 : 0) - (kept && free < FADE_TO + 1 ? commit : 0);
     if (score > bestScore) {
       bestScore = score;
       bestSwing = swing;
@@ -1249,6 +1266,7 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
   // In a lift with no way out past its glass: wait on the landing outside (never in the shaft).
   if (world && inShaft && bestLen < FADE_TO && ridePose(world, inp.walker, inp.heading, { from: inp.walker.y, to: inp.walker.y }, inp.fov, inp.aspect, rig, dt, snap, r, out)) return placed(rig, out);
   rig.choice = bestId;
+  __dbg.bestLen = bestLen; __dbg.bestId = bestId; __dbg.bestSwing = bestSwing; __dbg.bestPitch = bestPitch; __dbg.inShaft = !!inShaft; __dbg.near = nearShafts.length;
 
   // Ease the arm toward the choice, then keep it clear along the eased direction.
   if (snap) {
@@ -1258,8 +1276,8 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
     rig.swing += wrap(bestSwing - rig.swing) * smooth(3, dt);
     rig.pitch += (bestPitch - rig.pitch) * smooth(2.5, dt);
   }
-  const dir = armDir(back + rig.swing, rig.pitch, _d);
-  const free = allowedArm(world, pivot, dir, ARM_LEN, r, check);
+  let dir = armDir(back + rig.swing, rig.pitch, _d);
+  let free = allowedArm(world, pivot, dir, ARM_LEN, r, check);
   let want = free;
   if (world && !snap) {
     // Where the arm is about to point (turning at a corner, easing to another choice)...
@@ -1271,14 +1289,33 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
     // ...from where the walker is about to be.
     if (soon) want = Math.min(want, allowedArm(world, soon, turn, ARM_LEN, rSoon, check, soonGlass));
   }
+  rig.clock += Math.max(0, dt);
+  let cut = false;
+  if (world && !snap && !inShaft) {
+    // The arm collapsing into the head (a U-turn by a wall, a lobby just out of a lift): cut
+    // to a free arm if there is one (not twice in a row), else stay where the camera is while
+    // it still sees him, rather than slide into his head.
+    const poor = bestLen < FADE_TO + 0.5;
+    const canCut = free < FADE_TO && !poor && rig.clock - rig.cutAt > CUT_GAP;
+    if (!canCut && (free < FADE_TO || want < FADE_TO) && stayPose(world, inp, rig, r, check, dt, out)) return placed(rig, out);
+    if (canCut) {
+      rig.swing = bestSwing;
+      rig.pitch = bestPitch;
+      dir = armDir(back + rig.swing, rig.pitch, _d);
+      free = want = allowedArm(world, pivot, dir, ARM_LEN, r, check);
+      cut = true;
+    }
+  }
   // Pull in at once where something already cuts the arm, quickly where it is about to, and
   // let it out slowly.
-  let len = snap || free < rig.len ? free : rig.len + (want - rig.len) * (want < rig.len ? smooth(9, dt) : smooth(1 / 0.55, dt));
+  let len = snap || cut || free < rig.len ? free : rig.len + (want - rig.len) * (want < rig.len ? smooth(9, dt) : smooth(1 / 0.55, dt));
   // Floors are not monotonic along the arm: check the eased length too.
   if (len < free) len = flooredArm(world, pivot, dir, len, check);
   // (Still in the lift that way, e.g. easing out from the eye: wait on the landing instead.)
   if (world && inShaft && len < shaftExit(pivot, dir, inShaft) + 0.05 && ridePose(world, inp.walker, inp.heading, { from: inp.walker.y, to: inp.walker.y }, inp.fov, inp.aspect, rig, dt, snap, r, out)) return placed(rig, out);
   rig.ride = 0;
+  if (cut) rig.cutAt = rig.clock;
+  __dbg.cut = cut; __dbg.free = free; __dbg.want = want; __dbg.len = len; __dbg.swing = rig.swing; __dbg.pitch = rig.pitch;
   rig.len = len;
   const eyeBlend = 1 - smoothstep(EYE_FROM, FADE_FROM, rig.len);
   if (eyeBlend > 0) {
@@ -1299,7 +1336,7 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
   const tx = inp.walker.x + Math.sin(inp.heading) * 7;
   const ty = inp.walker.y + 1.0 + ahead * 7 * 0.6;
   const tz = inp.walker.z + Math.cos(inp.heading) * 7;
-  if (snap) rig.target.set(tx, ty, tz);
+  if (snap || cut) rig.target.set(tx, ty, tz);
   else {
     const k = smooth(5, dt);
     rig.target.x += (tx - rig.target.x) * k;
@@ -1312,6 +1349,51 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
   out.figure = smoothstep(FADE_FROM, FADE_TO, rig.len);
   rig.ready = true;
   return placed(rig, out);
+}
+
+// ---------------------------------------------------------------- staying put
+
+/** A camera left where it was sees the walker from at most this far. */
+const STAY_MAX = ARM_LEN * 1.5;
+/** At most one cut from a collapsing arm to another free one per this many seconds. */
+const CUT_GAP = 0.4;
+
+/** Outside every lift shaft of the world (with room for the camera sphere)? */
+function outsideAllShafts(world: CollisionWorld, p: THREE.Vector3): boolean {
+  for (const s of world.shafts) if (!outsideShaft(s, p)) return false;
+  return true;
+}
+
+/**
+ * Leaves the camera where it was last placed, turned toward the walker, if it still sees his
+ * upper body and waist over a clear sight line from not too close and not too far, with room
+ * and a floor, out of the lift shafts. The spring arm keeps easing toward its choice meanwhile.
+ */
+function stayPose(world: CollisionWorld, inp: ChaseInput, rig: CameraRig, r: number, check: boolean, dt: number, out: WalkCameraPose): boolean {
+  if (!rig.placed) return false;
+  const c = rig.cam;
+  const pivot = out.pivot;
+  const d = c.distanceTo(pivot);
+  if (d < FADE_TO + 0.3 || d > STAY_MAX) return false;
+  const waist = _waist.set(inp.walker.x, inp.walker.y + 1.0, inp.walker.z);
+  if (world.clearance(c.x, c.y, c.z, r + 0.01) < r * 0.9) return false;
+  if (!clearLine(world, pivot, c) || !clearLine(world, c, waist)) return false;
+  if (!outsideAllShafts(world, c) || !floorUnder(world, c.x, c.y, c.z, check)) return false;
+  out.pos.copy(c);
+  out.near = safeNear(world.clearance(c.x, c.y, c.z, 1), inp.fov, inp.aspect);
+  const k = smooth(6, dt);
+  rig.target.x += (inp.walker.x - rig.target.x) * k;
+  rig.target.y += (inp.walker.y + 1.3 - rig.target.y) * k;
+  rig.target.z += (inp.walker.z - rig.target.z) * k;
+  out.target.copy(rig.target);
+  keepInFrame(out, inp.walker, inp.fov);
+  out.figure = 1;
+  out.arm = d;
+  // (When the arm takes over again it starts no longer than this.)
+  rig.len = d;
+  rig.ride = 0;
+  rig.ready = true;
+  return true;
 }
 
 // ---------------------------------------------------------------- lift rides

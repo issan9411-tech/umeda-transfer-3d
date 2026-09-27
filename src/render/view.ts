@@ -581,15 +581,20 @@ export class UmedaView {
       focus.y += ORBIT_FOCUS_H;
       this.controls.target.add(focus.sub(this.controls.target).multiplyScalar(Math.min(1, dt * 3)));
       this.camera.position.copy(this.controls.target).add(this.orbitWanted);
+      const asked = this.orbitWanted.length();
       this.controls.update();
       this.orbitWanted.subVectors(this.camera.position, this.controls.target);
+      // Zooming in where walls hold the camera closer than asked: zoom from where it is, so the
+      // wheel answers at once (the asked-for distance is kept otherwise, and comes back once
+      // nothing stands in the way).
+      const zoomed = this.orbitWanted.length();
+      const held = this.rig.ready ? this.pose.reach : asked;
+      if (zoomed < asked - 1e-4 && held < asked) {
+        const to = Math.max(this.controls.minDistance, Math.min(zoomed, held * (zoomed / asked)));
+        this.orbitWanted.multiplyScalar(to / zoomed);
+        this.camera.position.copy(this.controls.target).add(this.orbitWanted);
+      }
       orbitPose(this.collide, this.walker.position, this.camera.position, this.rig, dt, this.camera.fov, this.camera.aspect, this.pose, this.liftRide(), this.heading);
-      // Zoomed out where walls stop the camera: keep the asked-for distance near what it can
-      // reach, so zooming back in answers at once.
-      const reach = this.pose.reach;
-      const cap = Math.max(reach + 4, reach * 1.5, this.controls.minDistance);
-      const asked = this.orbitWanted.length();
-      if (asked > cap) this.orbitWanted.multiplyScalar(cap / asked);
       this.camera.position.copy(this.pose.pos);
       this.camera.lookAt(this.controls.target);
       this.setNear(this.pose.near);

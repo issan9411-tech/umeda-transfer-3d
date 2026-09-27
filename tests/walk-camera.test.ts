@@ -1,6 +1,9 @@
 import * as THREE from 'three';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { DEFAULT_OPTIONS } from '../src/core/cost';
 import { buildGraph } from '../src/core/graph';
+import { sampleKeyframes } from '../src/core/keyframes';
+import { planRoute } from '../src/core/planner';
 import type { Footprint } from '../src/core/types';
 import { umeda } from '../src/data/umeda';
 import { buildCity } from '../src/render/city';
@@ -19,7 +22,8 @@ import {
   type Shaft,
   type WalkCameraPose,
 } from '../src/render/walk-camera';
-import { buildWalkway, liftShafts, verticalLaneOffsets } from '../src/render/walkway';
+import { buildWalkway, headingBetween, liftShafts, verticalLaneOffsets } from '../src/render/walkway';
+import { angleDelta } from '../src/render/walkway-util';
 import { segTri, Soup, type Tri } from './support/soup';
 
 /**
@@ -73,9 +77,16 @@ interface Stats {
 const newStats = (): Stats => ({ samples: 0, body: 0, arm: 0, lens: 0, ceiling: 0, shaft: 0, occluded: 0, fadedLift: 0, faded: 0, armLen: 0 });
 
 const g = buildGraph(umeda.network);
+/** Routes played frame after frame: lifts (lobbies, doors, rides), the GFO deck stairs, the long underground walks. */
+const PLAYED = [
+  { name: 'JR7-8→うめきた段差なし', from: { stationId: 'jr', platformId: 'jr-7-8' }, to: { stationId: 'umekita' }, profile: 'stepfree' as const },
+  { name: 'うめきた→阪急', from: { stationId: 'umekita' }, to: { stationId: 'hankyu' }, profile: 'standard' as const },
+];
 let world: CollisionWorld;
 let after: Stats;
 let before: Stats;
+/** The chase camera played frame after frame along whole routes. */
+let played: Stats;
 let firstFail = 0;
 let orbitFail = 0;
 let orbitSamples = 0;
@@ -295,6 +306,75 @@ beforeAll(() => {
       }
     }
   });
+
+  // Whole routes played the way the view plays them (×4 at 60 fps): the arm keeps its state
+  // from one edge to the next, so corners, lift doors, rides and U-turns come as they come.
+  played = newStats();
+  const RATE = 4;
+  const FPS = 60;
+  for (const q of PLAYED) {
+    const r = planRoute(g, { from: q.from, to: q.to, options: { ...DEFAULT_OPTIONS, profile: q.profile, congestion: false }, boarding: 'best', alternatives: 1 }).routes[0];
+    const kf = r.keyframes;
+    // Keyframe segment → edge (waits have none), as the view maps them.
+    const segEdge = new Int32Array(Math.max(0, kf.length - 1)).fill(-1);
+    for (let i = 0, s = 0; i + 1 < kf.length; i++) {
+      const a = kf[i];
+      const b = kf[i + 1];
+      if ((a.x !== b.x || a.y !== b.y || a.z !== b.z) && s < r.path.steps.length) segEdge[i] = r.path.steps[s++].edge;
+    }
+    const segAt = (t: number) => {
+      let k = 0;
+      while (k + 2 < kf.length && kf[k + 1].t <= t) k++;
+      return k;
+    };
+    const at = (t: number) => sampleKeyframes(kf, t);
+    const lookahead = (t: number): number | null => {
+      const p0 = at(t);
+      for (const d of [2, 5, 10, 20]) {
+        const h = headingBetween(p0, at(t + d));
+        if (h !== null) return h;
+      }
+      return headingBetween(at(t - 5), p0);
+    };
+    const prig = createRig();
+    const off = { x: 0, z: 0 };
+    let flight = 0;
+    let heading = lookahead(0) ?? 0;
+    const step = RATE / FPS;
+    const ahead = new THREE.Vector3();
+    for (let t = 0, f = 0; t <= r.timeS; t += step, f++) {
+      const p = at(t);
+      const k = segAt(t);
+      const ei = segEdge[k];
+      const kind = ei >= 0 ? g.edges[ei].kind : null;
+      const e = f === 0 ? 1 : 1 - Math.exp(-step / 0.6);
+      off.x += ((ei >= 0 ? lanes[ei * 2] : 0) - off.x) * e;
+      off.z += ((ei >= 0 ? lanes[ei * 2 + 1] : 0) - off.z) * e;
+      flight += ((kind === 'stairs' ? 0.09 * EX : kind === 'escalator' ? 0.35 : 0) - flight) * (f === 0 ? 1 : 1 - Math.exp(-step / 0.25));
+      const base = FLOOR_LIFT + flight;
+      w.set(p.x + off.x, Y(p.y) + base, p.z + off.z);
+      const h = lookahead(t);
+      if (h !== null) heading += angleDelta(heading, h) * Math.min(1, (1 / FPS) * 2.4);
+      const headingSoon = h === null ? heading : heading + angleDelta(heading, h) * (1 - Math.exp(-0.35 * 2.4));
+      const p0 = p;
+      const pb = at(t - 2.5);
+      const pa = at(t + 2.5);
+      const rb = Math.hypot(pb.x - p0.x, pb.z - p0.z);
+      const ra = Math.hypot(pa.x - p0.x, pa.z - p0.z);
+      const slopeBehind = rb > 0.4 ? (Y(pb.y) - Y(p0.y)) / rb : 0;
+      const slopeAhead = ra > 0.4 ? (Y(pa.y) - Y(p0.y)) / ra : 0;
+      const sn = at(t + RATE * 0.4);
+      ahead.set(sn.x + off.x, Y(sn.y) + base, sn.z + off.z);
+      const ride = kind === 'elevator' ? { from: Y(kf[k].y) + base, to: Y(kf[k + 1].y) + base } : null;
+      chasePose(world, { walker: w, heading, headingSoon, slopeBehind, slopeAhead, aspect: ASPECT, fov: FOV, ahead, ride }, prig, f === 0 ? 0 : 1 / FPS, pose);
+      if (f % 2) continue;
+      bodyBlocked = !!hit(feet.copy(w).setY(w.y + 0.5), crown.copy(w).setY(w.y + 2.2));
+      pivot.copy(w).setY(w.y + PIVOT_H);
+      own = shafts.find((s) => pivot.y > s.y0 && pivot.y < s.y1 && Math.hypot(pivot.x - s.x, pivot.z - s.z) < s.half) ?? null;
+      inLift = kind === 'elevator';
+      measure(played, w, pose, `${q.name}@${t.toFixed(1)}`);
+    }
+  }
   own = null;
   const pct = (s: Stats, k: number) => `${((100 * k) / s.samples).toFixed(2)}%`;
   const line = (name: string, s: Stats) =>
@@ -302,6 +382,7 @@ beforeAll(() => {
   console.log(`[walk-camera] world ${world.triangles} triangles, built in ${world.buildMs.toFixed(0)} ms; ${shafts.length} lift shafts; chase solve ${((solveMs / solves) * 1000).toFixed(0)} µs`);
   console.log(`[walk-camera] ${line('before', before)}`);
   console.log(`[walk-camera] ${line('after', after)}`);
+  console.log(`[walk-camera] ${line('played along routes', played)}`);
   console.log(`[walk-camera] ${rideSamples} samples riding a lift; first person fails ${firstFail}, orbit fails ${orbitFail}/${orbitSamples}`);
   if (examples.length) console.log(`[walk-camera] e.g. ${examples.join(' | ')}`);
 }, 300_000);
@@ -322,6 +403,15 @@ describe('walk-through camera', () => {
     // (something opaque in between, the figure faded at the eye fallback, riding a lift).
     expect((after.occluded + after.faded + after.fadedLift) / after.samples).toBeLessThanOrEqual(0.01);
     expect(rideSamples).toBeGreaterThan(200);
+  });
+
+  it('keeps it all up frame after frame along whole routes', () => {
+    expect(played.samples).toBeGreaterThan(4000);
+    expect(played.arm).toBe(0);
+    expect(played.lens).toBe(0);
+    expect(played.ceiling).toBe(0);
+    expect(played.shaft).toBe(0);
+    expect((played.occluded + played.faded + played.fadedLift) / played.samples).toBeLessThanOrEqual(0.01);
   });
 
   it('keeps the first-person eye and the orbit view clear of walls too', () => {
