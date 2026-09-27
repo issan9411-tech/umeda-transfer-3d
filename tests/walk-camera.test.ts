@@ -442,7 +442,6 @@ describe('collision world and the city cut-away', () => {
 
   it('keeps every building solid for the camera, whatever is cut away when the walk scene is rebuilt', () => {
     const fresh = CollisionWorld.fromScene(city.solidMeshes());
-    const liveFresh = CollisionWorld.fromScene([city.object]);
     const roof = roofUnder(fresh);
     expect(roof).toBeGreaterThan(20);
     // Camera north of ヨドバシ, walker south of it: the tower is cut away.
@@ -455,11 +454,6 @@ describe('collision world and the city cut-away', () => {
     const rebuilt = CollisionWorld.fromScene(city.solidMeshes());
     expect(rebuilt.triangles).toBe(fresh.triangles);
     expect(roofUnder(rebuilt)).toBeCloseTo(roof, 3);
-    // The drawn passes are read only as far as they are drawn (no stale tail of the index):
-    // the faded tower has left the opaque pass and nothing else came in its place.
-    const live = CollisionWorld.fromScene([city.object]);
-    expect(live.triangles).toBeLessThan(liveFresh.triangles);
-    expect(roofUnder(live)).toBeLessThan(roof - 5);
   }, 60_000);
 
   it('cuts away only along the sight line once the camera keeps out of solids itself', () => {

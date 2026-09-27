@@ -96,7 +96,7 @@ export const umeda: DataSet = {
     'エレベーターは主要なものだけをモデル化しています。「段差なし」のルートは目安で、営業時間外の商業施設内ルート（大丸店内など）も含みます。',
     '工事による一時的な通路閉鎖（阪急茶屋町口付近 2026年9月〜など）は反映していません。',
     '乗換時間は歩行のみで、列車の待ち時間や改札内での乗車券購入などは含みません。',
-    '3D表示の周辺の建物と道路は OpenStreetMap（© OpenStreetMap contributors、ODbL）を Overture Maps 経由で取得したものです。高さが登録されていない建物は階数×3.5 m または推定値です。',
+    '3D表示の周辺の建物と道路は OpenStreetMap（© OpenStreetMap contributors、ODbL）を Overture Maps 経由で取得したものです。高さが登録されていない建物は階数×3.5 m（事務所・商業は4 m）または推定値で、地図の値が明らかに違う一部のランドマークは公表されている高さに合わせています。',
   ],
   defaultRoute: { from: 'station:hankyu', to: 'station:higashiumeda' },
 };

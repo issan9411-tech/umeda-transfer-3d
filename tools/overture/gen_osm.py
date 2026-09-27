@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Generates src/data/osm/{buildings,roads}.ts — the city context of 梅田のりかえ3D — from
+Generates src/data/osm/{buildings,roads,malls}.ts — the city context of 梅田のりかえ3D — from
 OpenStreetMap data as distributed by Overture Maps (© OpenStreetMap contributors, ODbL):
 buildings (outlines, heights, building:parts, landmark names), street-level carriageways (widths,
-one-way, crosswalks) and the elevated decks of expressways and flyovers (height per vertex).
+one-way, crosswalks), the elevated decks of expressways and flyovers (height per vertex) and the
+outlines of the underground malls.
 
 Input: a directory of JSON files already converted to the app's local metres (x = east,
 z = south, origin 34.7025 N 135.4957 E, exactly builder.ts ll()), as written by fetch.py in this
@@ -14,6 +15,7 @@ directory (see README.md here):
   segments.json   transportation segments incl. road_flags, level_rules, width_rules and
                   access_restrictions (one-way streets)
   infra.json      base/infrastructure (platform polygons, helipads)
+  landuse.json    base/land_use polygons (the underground malls' outlines)
 
 Usage:  python3 tools/overture/gen_osm.py DATA_DIR [--out src/data/osm] [--bbox X0 X1 Z0 Z1]
 
@@ -33,11 +35,18 @@ from shapely.geometry.polygon import orient
 from shapely.ops import substring, unary_union
 from shapely.strtree import STRtree
 
-# The walk-mode ground square is the network's extent + 320 m (city.ts); a little margin on top
-# lets the network move a few tens of metres without regenerating.
+# The city draws a fixed square (city-layout.ts CITY_SQUARE: centre x 160, z −10, half 850 m,
+# i.e. x −690…1010, z −860…840); the data covers it with a margin of 20–30 m.
 DEFAULT_BBOX = (-720.0, 1030.0, -890.0, 870.0)
 
-FLOOR_H = 3.5  # metres per storey when only a floor count is known
+# Metres per storey when only a floor count is known (or the mapped height is implausibly low
+# for it): offices and shops have taller floors than flats.
+FLOOR_H = 3.5
+FLOOR_H_COMMERCIAL = 4.0
+COMMERCIAL = {'commercial', 'retail', 'office'}
+# A mapped height below this per mapped storey is a mistake (e.g. a 48-storey tower drawn 100 m
+# tall): the floor count wins.
+MIN_STOREY = 2.6
 SIMPLIFY_BLD = 0.4
 SIMPLIFY_ROAD = 0.3
 
@@ -166,6 +175,10 @@ def sliver(poly):
     return a < 12 or a / max(poly.length, 1e-6) < 0.55
 
 
+# Smallest canopy (building=roof, m²) kept; the city stands larger ones on thin posts.
+MIN_CANOPY = 20.0
+
+
 # ----------------------------------------------------------------------------- buildings
 
 BUILDING_CLASS = {
@@ -179,10 +192,43 @@ BUILDING_CLASS = {
     'train_station': 7, 'transportation': 7,
 }
 
-# Station footprints context.ts keeps under its own ids (with their own massing).
-ROLES = {'大阪梅田': 1, '大阪梅田ツインタワーズ・サウス': 2}
+# Station footprints context.ts keeps under their own ids (with their own massing): mapped name
+# and where the outline's centroid is (names are matched only within ROLE_RADIUS of it, as the
+# area is 2.4 km across).
+ROLES = {'大阪梅田': (1, 245.0, -301.0), '大阪梅田ツインタワーズ・サウス': (2, 236.0, 164.0)}
+ROLE_RADIUS = 120.0
 # The JR 大阪駅 station building itself is drawn by station.ts.
 SKIP_NAMES = {'大阪駅'}
+
+# Published roof heights (m) of landmarks OpenStreetMap has wrong — usually tagged with a floor
+# count only, which at 3.5–4 m per storey falls well short of an office tower's 4.5 m storeys
+# and crown. Matched by name within 60 m of the spot; the tower parts (and the outline) are
+# scaled so the tallest reaches the height. Sources: the owners' and operators' building data
+# (as listed by the Japanese high-rise databases, e.g. skyskysky.net, blue-style.com).
+HEIGHTS = {
+    'ブリーゼタワー': (-159.0, 428.0, 175.0),  # 34F; OSM: 33 levels only (115.5 m)
+    'グランフロント大阪 オーナーズタワー': (-155.0, -529.0, 174.2),  # 48F; OSM part: 100 m with 48 levels
+    '南館': (-94.0, -193.0, 179.5),  # グランフロント大阪 タワーA, 38F; OSM: 166 m
+    '大阪梅田ツインタワーズ・ノース': (274.0, -23.0, 187.0),  # 梅田阪急ビル, 41F; OSM: levels only
+    'サウスゲートビルディング': (79.0, 91.0, 122.0),  # 27F; OSM: levels only
+    'ハービスOSAKA': (-261.0, 433.0, 190.0),  # 40F; OSM: levels only
+    'ハービスENT': (-115.0, 313.0, 133.0),  # 28F; OSM: levels only
+    '梅田センタービル': (555.0, -368.0, 134.7),  # 32F; OSM: 125.45 m
+    '阪急グランドビル': (310.0, -61.0, 127.0),  # 32F; OSM: 31 levels only (108.5 m)
+}
+
+
+def role_of(b, poly):
+    """Station role (1 = 阪急大阪梅田, 2 = 阪神) of a building by name and place, else 0."""
+    r = ROLES.get((b.get('names') or {}).get('primary'))
+    if not r:
+        return 0
+    c = poly.centroid
+    return r[0] if math.hypot(c.x - r[1], c.y - r[2]) < ROLE_RADIUS else 0
+
+
+def floor_height(cls):
+    return FLOOR_H_COMMERCIAL if cls in COMMERCIAL else FLOOR_H
 
 
 def estimate_height(b, area):
@@ -203,38 +249,54 @@ def estimate_height(b, area):
 
 
 def building_heights(b, area):
-    """(y0, y1, estimated) in real metres for a whole building."""
+    """(y0, y1, estimated) in real metres for a whole building: the mapped height, unless it is
+    implausibly low for the mapped floor count (then, like a floor count alone, storeys ×
+    floor_height of its use)."""
     h = b.get('height')
     fl = b.get('num_floors')
     y0 = b.get('min_height') or 0.0
-    if h:
+    if h and not (fl and h / fl < MIN_STOREY):
         return y0, float(h), False
     if fl:
-        return y0, fl * FLOOR_H, False
+        return y0, fl * floor_height(b.get('class')), False
     return y0, estimate_height(b, area), True
 
 
 def storey(parent):
     """Storey height of a building: its measured height over its floor count when both are
-    mapped (and plausible), else FLOOR_H."""
+    mapped (and plausible), else floor_height of its use."""
     h, fl = parent.get('height'), parent.get('num_floors')
     if h and fl and 2.8 <= h / fl <= 6.0:
         return h / fl
-    return FLOOR_H
+    return floor_height(parent.get('class'))
 
 
-def part_heights(p, parent, area):
+def part_heights(p, parent, area, bases):
+    """(y0, y1, estimated) of a building:part. `bases` are the min_heights of the building's other
+    parts: a part whose low height is where another part starts (a podium under a tower) keeps
+    it even when its floor count says otherwise."""
     st = storey(parent)
     h = p.get('height')
     fl = p.get('num_floors')
     y0 = p.get('min_height')
     if y0 is None:
         y0 = (p.get('min_floor') or 0) * st
+    if h and fl and h / fl < MIN_STOREY and not any(abs(h - m) < 0.5 for m in bases):
+        h = None
     if h:
         return y0, float(h), False
     if fl:
         return y0, max(y0 + st, fl * st), False
     return y0, max(y0 + FLOOR_H, min(14.0, estimate_height(parent, area))), True
+
+
+def published_height(name, poly):
+    """HEIGHTS override for a named building at this place, or None."""
+    if name not in HEIGHTS:
+        return None
+    x, z, h = HEIGHTS[name]
+    c = poly.centroid
+    return h if math.hypot(c.x - x, c.y - z) < 60 else None
 
 
 def load_jr_exclusion(data):
@@ -283,7 +345,7 @@ def gen_buildings(data, bbox, names_keep):
     tree = STRtree([p for _, p in cands])
     drop = set()
     for i, (b, p) in enumerate(cands):
-        if ROLES.get((b.get('names') or {}).get('primary'), 0) or b.get('class') in ('roof', 'train_station'):
+        if role_of(b, p) or b.get('class') in ('roof', 'train_station'):
             continue
         for j in tree.query(p):
             ob, op = cands[j]
@@ -299,7 +361,7 @@ def gen_buildings(data, bbox, names_keep):
         if i in drop:
             continue
         name = (b.get('names') or {}).get('primary')
-        role = ROLES.get(name, 0)
+        role = role_of(b, poly)
         # Canopies over the JR platforms belong to the station (station.ts draws them).
         if jr is not None and b.get('class') == 'roof' and poly.intersection(jr).area > 0.3 * poly.area:
             stats['canopy-over-jr-platforms'] += 1
@@ -311,6 +373,10 @@ def gen_buildings(data, bbox, names_keep):
         canopy = cls == 'roof'
         y0, y1, est = building_heights(b, poly.area)
         if canopy:
+            # Shelters this small (a bus stop's, a doorway's) would only be a floating slab.
+            if poly.area < MIN_CANOPY:
+                stats['tiny-canopy'] += 1
+                continue
             top = float(b['height']) if b.get('height') else 4.5
             y0, y1, est = (b.get('min_height') or max(0.0, top - 0.6)), top, not b.get('height')
             if y1 - y0 > 1.2:
@@ -323,14 +389,16 @@ def gen_buildings(data, bbox, names_keep):
             stats['degenerate'] += 1
             continue
         parts = []
-        for p in parts_by.get(b['id'], []):
+        mine = parts_by.get(b['id'], [])
+        for p in mine:
+            bases = [q['min_height'] for q in mine if q is not p and q.get('min_height')]
             for pp in to_polys(p['geom']):
                 if pp.area < 4:
                     continue
                 r = prepare(pp)
                 if not r:
                     continue
-                py0, py1, pest = part_heights(p, b, pp.area)
+                py0, py1, pest = part_heights(p, b, pp.area, bases)
                 if py1 <= py0 + 0.3:
                     continue
                 parts.append({'poly': pp, 'rings': r, 'y0': py0, 'y1': py1, 'est': pest})
@@ -341,6 +409,18 @@ def gen_buildings(data, bbox, names_keep):
             for q in parts[:k]:
                 if q['y1'] < p['y1'] and q['y0'] <= p['y0'] + 0.1 and p['poly'].intersection(q['poly']).area >= 0.6 * p['poly'].area:
                     p['y0'] = max(p['y0'], q['y1'])
+        # Published height of a landmark: its tower parts (and outline) scaled to reach it.
+        ph = published_height(name, poly)
+        if ph:
+            top = max([y1] + [p['y1'] for p in parts])
+            for p in parts:
+                if p['y1'] >= max(40.0, 0.6 * top):
+                    p['y1'] = p['y1'] * ph / top
+                    p['est'] = False
+            if not parts or y1 >= max(40.0, 0.6 * top):
+                y1 = y1 * ph / top
+                est = False
+            stats['published-height'] += 1
         heli = False
         if heli_tree is not None and y1 >= 60:
             for k in heli_tree.query(poly):
@@ -437,12 +517,54 @@ def excluded_ranges(s):
     return rs
 
 
-def is_oneway(s):
+def oneway_runs(s, length):
+    """(a, b, oneway) runs along a segment (fractions of its length): one-way where driving
+    backwards (against the drawing direction) is denied to all traffic at all times — over the
+    restriction's `between` range, or the whole segment. Runs shorter than 2 m join their longer
+    neighbour (a one-way restriction mapped from a few centimetres past a junction)."""
+    spans = []
     for a in s.get('access_restrictions') or []:
         w = a.get('when') or {}
         if a.get('access_type') == 'denied' and w.get('heading') == 'backward' and not w.get('mode') and not w.get('using') and not w.get('vehicle') and not w.get('during'):
-            return True
-    return False
+            spans.append(tuple(a['between']) if a.get('between') else (0.0, 1.0))
+    cuts = sorted({0.0, 1.0} | {c for sp in spans for c in sp})
+    runs = []
+    for a, b in zip(cuts, cuts[1:]):
+        if b - a < 1e-9:
+            continue
+        m = (a + b) / 2
+        ow = any(s0 <= m <= s1 for s0, s1 in spans)
+        if runs and runs[-1][2] == ow:
+            runs[-1] = (runs[-1][0], b, ow)
+        else:
+            runs.append((a, b, ow))
+    while len(runs) > 1:
+        k = min(range(len(runs)), key=lambda i: runs[i][1] - runs[i][0])
+        if (runs[k][1] - runs[k][0]) * length >= 2.0:
+            break
+        # Join the shortest run to its longer neighbour (taking the neighbour's direction).
+        nb = k - 1 if k == len(runs) - 1 or (k > 0 and runs[k - 1][1] - runs[k - 1][0] >= runs[k + 1][1] - runs[k + 1][0]) else k + 1
+        lo, hi = min(k, nb), max(k, nb)
+        runs[lo:hi + 1] = [(runs[lo][0], runs[hi][1], runs[nb][2])]
+        merged = []
+        for r in runs:
+            if merged and merged[-1][2] == r[2]:
+                merged[-1] = (merged[-1][0], r[1], r[2])
+            else:
+                merged.append(r)
+        runs = merged
+    return runs
+
+
+def split_runs(ranges, runs):
+    """Level ranges (a, b) cut further by one-way runs: (a, b, oneway)."""
+    out = []
+    for a, b in ranges:
+        for c, d, ow in runs:
+            lo, hi = max(a, c), min(b, d)
+            if hi - lo > 1e-9:
+                out.append((lo, hi, ow))
+    return out
 
 
 def seg_width(s):
@@ -589,9 +711,56 @@ def fit_widths(strokes):
             out.append(cur)
     return out
 
-def gen_roads(data, bbox, levels):
+def ground_plans(recs):
+    """Street-level plans of the kept buildings (parts or outline from the ground up; canopies
+    left out): what no service road may run through."""
+    out = []
+    for r in recs:
+        if r['canopy']:
+            continue
+        if r['parts']:
+            out.extend(p['poly'] for p in r['parts'] if p['y0'] < 1)
+        elif r['y0'] < 1:
+            p = Polygon(r['rings'][0], r['rings'][1:])
+            out.append(p if p.is_valid else p.buffer(0))
+    return out
+
+
+# A service road running at least this much of its length inside buildings is a passage or a
+# garage ramp mapped through them, not a street; of the others, stretches longer than
+# SERVICE_CUT inside a building (a driveway into a loading bay) are left out.
+SERVICE_INSIDE = 0.5
+SERVICE_CUT = 3.0
+
+
+def outside_runs(line, inside):
+    """The line without its stretches longer than SERVICE_CUT inside buildings (`inside` =
+    its intersection with them), as LineStrings at least 1 m long."""
+    geoms = [inside] if inside.geom_type == 'LineString' else [g for g in getattr(inside, 'geoms', []) if g.geom_type == 'LineString']
+    cuts = []
+    for g in geoms:
+        if g.length > SERVICE_CUT:
+            a, b = sorted((line.project(Point(g.coords[0])), line.project(Point(g.coords[-1]))))
+            cuts.append((a, b))
+    if not cuts:
+        return [line]
+    cuts.sort()
+    out = []
+    at = 0.0
+    for a, b in cuts + [(line.length, line.length)]:
+        if a - at >= 1.0:
+            piece = substring(line, at, a)
+            if piece.geom_type == 'LineString':
+                out.append(piece)
+        at = max(at, b)
+    return out
+
+
+def gen_roads(data, bbox, levels, plans):
     X0, X1, Z0, Z1 = bbox
     area_box = Polygon([(X0 - 60, Z0 - 60), (X1 + 60, Z0 - 60), (X1 + 60, Z1 + 60), (X0 - 60, Z1 + 60)])
+    plan_tree = STRtree(plans)
+    dropped = 0
     pieces = []  # {pts, cls, name, oneway, width}
     for s in data['segments']:
         if s.get('subtype') != 'road' or s.get('class') not in ROAD_CLASS:
@@ -610,11 +779,21 @@ def gen_roads(data, bbox, levels):
             L = LineString(ln)
             if not L.intersects(area_box) or L.length < 0.5:
                 continue
-            for a, b in ranges:
+            for a, b, ow in split_runs(ranges, oneway_runs(s, L.length)):
                 part = substring(L, a, b, normalized=True) if (a, b) != (0.0, 1.0) else L
                 if part.is_empty or part.length < 1.0 or part.geom_type != 'LineString':
                     continue
-                pieces.append({'pts': [tuple(c) for c in part.coords], 'cls': s['class'], 'name': name, 'oneway': is_oneway(s), 'width': seg_width(s)})
+                runs = [part]
+                if s['class'] == 'service':
+                    hits = [plans[k] for k in plan_tree.query(part)]
+                    inside = part.intersection(unary_union(hits)) if hits else None
+                    if inside is not None and inside.length >= SERVICE_INSIDE * part.length:
+                        dropped += 1
+                        continue
+                    if inside is not None and inside.length > 0:
+                        runs = outside_runs(part, inside)
+                for run in runs:
+                    pieces.append({'pts': [tuple(c) for c in run.coords], 'cls': s['class'], 'name': name, 'oneway': ow, 'width': seg_width(s)})
 
     # Split pieces at every vertex shared with another piece (junctions).
     count = defaultdict(int)
@@ -796,7 +975,7 @@ def gen_roads(data, bbox, levels):
         m = LineString(s['pts']).interpolate(0.5, normalized=True)
         if any(x0 <= m.x <= x1 and z0 <= m.y <= z1 for x0, x1, z0, z1 in TERMINALS):
             s['terminal'] = True
-    return strokes, ncw
+    return strokes, ncw, dropped
 
 
 def encode_roads(strokes):
@@ -840,7 +1019,8 @@ def level_runs(s):
     under construction), ≥ 1 on a bridge deck above the street."""
     rules = []
     for vals, between in flags_of(s):
-        if vals & {'is_tunnel', 'is_under_construction'}:
+        # A covered service road runs under (usually through) a building: like a tunnel.
+        if vals & {'is_tunnel', 'is_under_construction'} or (s.get('class') == 'service' and 'is_covered' in vals):
             rules.append((tuple(between) if between else (0.0, 1.0), -1))
     for lr in s.get('level_rules') or []:
         if lr.get('value'):
@@ -954,10 +1134,12 @@ def gen_viaducts(data, bbox, levels):
                 elif lv >= 1 and sg['class'] in DECK_CLASSES and part.length >= 2:
                     two, one = DECK_WIDTH[sg['class']]
                     link = is_link(sg)
-                    w = seg_width(sg) or (7.0 if link else one if is_oneway(sg) else two)
+                    # One-way where the restriction covers the middle of the deck piece.
+                    ow = any(c <= (a + b) / 2 <= d and o for c, d, o in oneway_runs(sg, L.length))
+                    w = seg_width(sg) or (7.0 if link else one if ow else two)
                     pts = [part.coords[0]] + list(part.simplify(SIMPLIFY_DECK).coords)[1:-1] + [part.coords[-1]]
                     decks.append({'pts': pts, 'lv': min(4, lv), 'cls': sg['class'], 'name': (sg.get('names') or {}).get('primary'),
-                                  'oneway': is_oneway(sg), 'w': w})
+                                  'oneway': ow, 'w': w})
     # Heights: every vertex starts at its level's height (a street-level junction at 0) and is
     # lowered to within RAMP of its neighbours (Dijkstra over the deck network).
     vid = {}
@@ -1019,6 +1201,32 @@ def encode_viaducts(decks):
     return w.text(), names
 
 
+# ----------------------------------------------------------------------------- malls
+
+# The underground malls context.ts draws at B1: mapped land-use outline → (app id, name).
+MALLS = {'Whityうめだ': ('whity', 'ホワイティうめだ'), 'ディアモール大阪': ('diamor', 'ディアモール大阪')}
+
+
+def gen_malls(data):
+    """Outlines of the underground malls (the OSM landuse=retail areas named after them),
+    simplified to 0.5 m and rounded to 0.1 m, counter-clockwise in x/z."""
+    out = []
+    for l in data['landuse']:
+        name = (l.get('names') or {}).get('primary')
+        if name not in MALLS or (l.get('src') and l['src'] != ['OpenStreetMap']):
+            continue
+        polys = to_polys(l['geom'])
+        if not polys:
+            continue
+        rings = prepare(max(polys, key=lambda p: p.area), 0.5)
+        if rings:
+            out.append({'id': MALLS[name][0], 'name': MALLS[name][1], 'poly': rings[0]})
+    missing = {v[0] for v in MALLS.values()} - {m['id'] for m in out}
+    if missing:
+        sys.exit(f'landuse.json lacks the mall outlines {sorted(missing)}: re-fetch with tools/overture/fetch.py')
+    return sorted(out, key=lambda m: m['id'])
+
+
 # ----------------------------------------------------------------------------- main
 
 LANDMARK_NAMES = {
@@ -1035,13 +1243,13 @@ LANDMARK_NAMES = {
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('data', help='directory with buildings.json, parts.json, segments.json, infra.json')
+    ap.add_argument('data', help='directory with buildings.json, parts.json, segments.json, infra.json, landuse.json')
     ap.add_argument('--out', default=os.path.join(os.path.dirname(__file__), '..', '..', 'src', 'data', 'osm'))
     ap.add_argument('--bbox', nargs=4, type=float, default=DEFAULT_BBOX, metavar=('X0', 'X1', 'Z0', 'Z1'))
     ap.add_argument('--debug-json', help='also write the final records as JSON (for previews)')
     a = ap.parse_args()
     data = {}
-    for k in ('buildings', 'parts', 'segments', 'infra'):
+    for k in ('buildings', 'parts', 'segments', 'infra', 'landuse'):
         with open(os.path.join(a.data, f'{k}.json')) as f:
             data[k] = json.load(f)
     if not any('access_restrictions' in s for s in data['segments'][:200]):
@@ -1050,10 +1258,11 @@ def main():
     recs, bstats = gen_buildings(data, bbox, LANDMARK_NAMES)
     btxt, bnames = encode_buildings(recs)
     levels = street_levels(data)
-    strokes, ncw = gen_roads(data, bbox, levels)
+    strokes, ncw, ndrop = gen_roads(data, bbox, levels, ground_plans(recs))
     rtxt, rnames = encode_roads(strokes)
     decks = gen_viaducts(data, bbox, levels)
     vtxt, vnames = encode_viaducts(decks)
+    malls = gen_malls(data)
     head = ('// Generated by tools/overture/gen_osm.py from OpenStreetMap data via Overture Maps\n'
             '// (© OpenStreetMap contributors, ODbL 1.0). Do not edit: re-run the generator.\n')
     os.makedirs(a.out, exist_ok=True)
@@ -1067,6 +1276,15 @@ def main():
         f.write(ts_string('ROAD_DATA', rtxt))
         f.write('\nexport const VIADUCT_NAMES: string[] = ' + json.dumps(vnames, ensure_ascii=False) + ';\n\n')
         f.write(ts_string('VIADUCT_DATA', vtxt))
+    with open(os.path.join(a.out, 'malls.ts'), 'w') as f:
+        f.write(head + '// The underground malls drawn at B1: their mapped outlines (landuse), local metres.\n\n')
+        f.write('export const MALLS: { id: string; nameJa: string; poly: [number, number][] }[] = [\n')
+        for m in malls:
+            f.write(f"  {{\n    id: '{m['id']}',\n    nameJa: '{m['name']}',\n    poly: [\n")
+            for k in range(0, len(m['poly']), 6):
+                f.write('      ' + ' '.join(f'[{x:g}, {z:g}],' for x, z in m['poly'][k:k + 6]) + '\n')
+            f.write('    ],\n  },\n')
+        f.write('];\n')
     if a.debug_json:
         with open(a.debug_json, 'w') as f:
             json.dump({
@@ -1076,8 +1294,9 @@ def main():
                 'viaducts': [{'cls': d['cls'], 'name': d['name'], 'oneway': d['oneway'], 'w': d['w'], 'pts': d['pts'], 'h': d['h']} for d in decks],
             }, f, ensure_ascii=False)
     print('buildings', dict(bstats), 'encoded', len(btxt), 'chars,', len(bnames), 'names')
-    print('roads', len(strokes), 'strokes,', ncw, 'crosswalks, encoded', len(rtxt), 'chars,', len(rnames), 'names')
+    print('roads', len(strokes), 'strokes,', ncw, 'crosswalks,', ndrop, 'service pieces inside buildings left out, encoded', len(rtxt), 'chars,', len(rnames), 'names')
     print('viaducts', len(decks), 'decks,', sum(len(d['pts']) for d in decks), 'vertices, encoded', len(vtxt), 'chars')
+    print('malls', [(m['id'], len(m['poly'])) for m in malls])
 
 
 if __name__ == '__main__':

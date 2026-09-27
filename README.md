@@ -100,7 +100,7 @@ npm run build:single # dist-single/index.html（1ファイルで完結する版�
 
 - 位置・高さ・通路長は、公開情報と推定に基づく**概略モデル**です（誤差は数十 m 程度）。実際の移動では駅の構内図・案内表示を優先してください。
 - 各駅の階段・改札・通路の位置と向きは、ウェブ調査（鉄道会社の構内案内・乗換案内・地図サイトなど）で確認できた事実に合わせています。確認できなかった部分（ホームの深さ、エレベーターの位置、一部の通路の形など）は推定です。
-- 周辺の建物（外形・高さ）と道路（車道の中心線・一方通行・横断歩道）は **OpenStreetMap** のデータ（© OpenStreetMap contributors、[ODbL](https://opendatacommons.org/licenses/odbl/)）を [Overture Maps](https://overturemaps.org/) 経由で取得して描いています（生成手順は `tools/overture/README.md`）。高さが登録されていない建物は階数×3.5 m または推定値です。
+- 周辺の建物（外形・高さ）と道路（車道の中心線・一方通行・横断歩道）は **OpenStreetMap** のデータ（© OpenStreetMap contributors、[ODbL](https://opendatacommons.org/licenses/odbl/)）を [Overture Maps](https://overturemaps.org/) 経由で取得して描いています（生成手順は `tools/overture/README.md`）。高さが登録されていない建物は階数×3.5 m（事務所・商業は4 m）または推定値で、地図の値が明らかに違う一部のランドマーク（ブリーゼタワー、グランフロント大阪など）は公表されている高さに合わせています。地下街（ホワイティうめだ・ディアモール大阪）の範囲も地図のものです。
 - 工事による一時的な通路閉鎖や、商業施設の営業時間は考慮していません。
 
 ## ディレクトリ構成

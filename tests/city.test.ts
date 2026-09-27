@@ -13,7 +13,9 @@ import {
   analyseRoads,
   approach,
   BoxGrid,
+  CITY_SQUARE,
   convexHull,
+  cutBands,
   distanceToEdges,
   distanceToPrism,
   fadeTarget,
@@ -25,6 +27,7 @@ import {
   inflateConvex,
   insideIntervals,
   insideRings,
+  intersectConvex,
   landmarkOf,
   laneLayout,
   makePrism,
@@ -119,6 +122,11 @@ describe('OpenStreetMap context data', () => {
       ['イノゲート大阪', 110, 130],
       ['大阪駅前第4ビル', 90, 120],
       ['HEP FIVE', 30, 50],
+      // Published heights where OpenStreetMap is off (gen_osm.py HEIGHTS): 48 floors are no
+      // 100 m tower, 33 office floors no 115 m one.
+      ['グランフロント大阪 オーナーズタワー', 170, 180],
+      ['ブリーゼタワー', 170, 180],
+      ['ハービスOSAKA', 185, 195],
     ];
     for (const [name, lo, hi] of want) {
       const f = byName(name);
@@ -127,6 +135,17 @@ describe('OpenStreetMap context data', () => {
       const h = top(f as Footprint);
       expect(h, name).toBeGreaterThanOrEqual(lo);
       expect(h, name).toBeLessThanOrEqual(hi);
+    }
+    // Other published heights the generator applies (not landmarks here): 32 office floors are
+    // no 108 m block.
+    for (const [name, lo, hi] of [
+      ['阪急グランドビル', 120, 135],
+      ['梅田センタービル', 130, 140],
+    ] as const) {
+      const f = byName(name);
+      expect(f, name).toBeDefined();
+      expect(top(f as Footprint), name).toBeGreaterThanOrEqual(lo);
+      expect(top(f as Footprint), name).toBeLessThanOrEqual(hi);
     }
     // NGB stands north of the JR tracks, SGB south of them, ヨドバシ north of NGB.
     const c = (n: string) => centroid((byName(n) as Footprint).poly);
@@ -150,6 +169,61 @@ describe('OpenStreetMap context data', () => {
     expect(est.length).toBeGreaterThan(100);
     expect(est.length).toBeLessThan(osm.length * 0.5);
     for (const f of est) expect(f.y1).toBeLessThanOrEqual(24);
+  });
+
+  it('gives every footprint its own id', () => {
+    const ids = net.footprints.map((f) => f.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.some((id) => id.startsWith('osm:hankyu-terminal-'))).toBe(true);
+  });
+
+  it('draws the underground malls as mapped, holding the network’s mall passages', () => {
+    const nodes = new Map(net.nodes.map((n) => [n.id, n]));
+    for (const [id, name] of [
+      ['whity', 'ホワイティうめだ'],
+      ['diamor', 'ディアモール大阪'],
+    ] as const) {
+      const mall = net.footprints.find((f) => f.id === id) as Footprint;
+      expect(mall.kind).toBe('mall');
+      expect(polyArea(mall.poly)).toBeGreaterThan(15000);
+      // The B1 passages named after the mall (not the links out of it) run inside its outline.
+      let total = 0;
+      let inside = 0;
+      for (const e of net.edges) {
+        if (!(e.name ?? '').startsWith(name) || /連絡|〜/.test(e.name ?? '')) continue;
+        const a = nodes.get(e.a) as NetNode;
+        const b = nodes.get(e.b) as NetNode;
+        const n = Math.ceil(Math.hypot(b.x - a.x, b.z - a.z));
+        for (let k = 0; k < n; k++) {
+          const t = (k + 0.5) / n;
+          total++;
+          if (insideRings([mall.poly], a.x + (b.x - a.x) * t, a.z + (b.z - a.z) * t)) inside++;
+        }
+      }
+      expect(total, name).toBeGreaterThan(200);
+      // (ディアモール's passage towards 西梅田 runs beyond the mall's mapped west end.)
+      expect(inside / total, name).toBeGreaterThan(id === 'whity' ? 0.95 : 0.6);
+    }
+  });
+
+  it('keeps service roads out of buildings and canopies large enough to stand', () => {
+    const plans = new PlanIndex(osm.filter((f) => f.use !== 'roof').flatMap((f) => (f.parts ?? [{ poly: f.poly, holes: f.holes, y0: f.y0, y1: f.y1 }]).filter((p) => p.y0 < 1).map((p) => [p.poly, ...(p.holes ?? [])])));
+    let total = 0;
+    let inside = 0;
+    for (const r of net.roads) {
+      if (r.cls !== 'service' || r.deck) continue;
+      const info = analyseRoads([r]).infos[0];
+      for (let s = 0.5; s < info.len; s += 1) {
+        let k = 0;
+        while (k < info.pts.length - 2 && s > info.cum[k + 1]) k++;
+        const t = (s - info.cum[k]) / (info.cum[k + 1] - info.cum[k] || 1);
+        total++;
+        if (plans.inside(info.pts[k][0] + (info.pts[k + 1][0] - info.pts[k][0]) * t, info.pts[k][1] + (info.pts[k + 1][1] - info.pts[k][1]) * t)) inside++;
+      }
+    }
+    expect(total).toBeGreaterThan(5000);
+    expect(inside / total).toBeLessThan(0.03);
+    for (const f of osm.filter((f) => f.use === 'roof')) expect(polyArea(f.poly)).toBeGreaterThanOrEqual(19.5);
   });
 
   it('models streets as mapped carriageways: one-way pairs that never overlap', () => {
@@ -341,6 +415,46 @@ describe('polygon buildings', () => {
     expect(total).toBeCloseTo(120 - 10 - 10 - 10 + 10, 6);
     // Uncut: the plain ring edges.
     expect(prismWalls(L, [], [])).toHaveLength(6);
+  });
+
+  it('splits a part into bands at its cutters: upper floors stay over a station, floors above a deck passage', () => {
+    const hull: P2[] = [
+      [0, 0],
+      [10, 0],
+      [10, 10],
+      [0, 10],
+    ];
+    const deck: P2[] = [
+      [0, 20],
+      [10, 20],
+      [10, 24],
+      [0, 24],
+    ];
+    // A tower touching a station's platform area (cut up to 19.5 m) keeps everything above.
+    const station = { poly: hull, y0: -Infinity, top: 19.5 };
+    expect(cutBands(0, 150, [station])).toEqual([
+      { y0: 0, y1: 19.5, cuts: [hull] },
+      { y0: 19.5, y1: 150, cuts: [] },
+    ]);
+    // A lower block is cut whole; a cutter above the part does nothing.
+    expect(cutBands(0, 12, [station])).toEqual([{ y0: 0, y1: 12, cuts: [hull] }]);
+    expect(cutBands(30, 60, [station])).toEqual([{ y0: 30, y1: 60, cuts: [] }]);
+    // A passage at 2F (floor 5.6 m, head room to 10.5 m) under a 70 m podium, beside the station cut.
+    const passage = { poly: deck, y0: 5.6, top: 10.5 };
+    expect(cutBands(0, 70, [passage, station])).toEqual([
+      { y0: 0, y1: 5.6, cuts: [hull] },
+      { y0: 5.6, y1: 10.5, cuts: [deck, hull] },
+      { y0: 10.5, y1: 19.5, cuts: [hull] },
+      { y0: 19.5, y1: 70, cuts: [] },
+    ]);
+    // Open to the sky along a facade.
+    expect(cutBands(0, 70, [{ poly: deck, y0: 5.6, top: Infinity }]).map((b) => [b.y0, b.y1, b.cuts.length])).toEqual([
+      [0, 5.6, 0],
+      [5.6, 70, 1],
+    ]);
+    // Clipping one convex polygon to another.
+    expect(polyArea(intersectConvex(hull, [[5, 5], [15, 5], [15, 15], [5, 15]]))).toBeCloseTo(25, 9);
+    expect(intersectConvex(hull, deck)).toEqual([]);
   });
 
   it('finds the oriented box of a rotated rectangle', () => {
@@ -604,7 +718,9 @@ describe('buildCity', () => {
       const day = city.stats();
       expect(day.buildings).toBeGreaterThanOrEqual(3000);
       expect(day.trees).toBeGreaterThan(300);
-      expect(day.vehicles).toBeGreaterThan(200);
+      // Traffic runs while walking; the overview leaves it out (it would bury the route).
+      if (walk) expect(day.vehicles).toBeGreaterThan(200);
+      else expect(day.vehicles).toBe(0);
       expect(day.drawCalls).toBeLessThanOrEqual(40);
       expect(day.triangles).toBeLessThanOrEqual(900_000);
       // Generous for loaded CI machines; ≈1 s on a desktop.
@@ -649,7 +765,7 @@ describe('buildCity', () => {
     expect(city.object.parent).toBeNull();
   }, 30_000);
 
-  it('keeps the overview readable: landmarks semi-solid, small low blocks fainter', () => {
+  it('keeps the overview readable: landmarks semi-solid, small low blocks fainter, far ones fading from the route', () => {
     const city = buildCity(net, { dark: false, night: false, ex: 4, walk: false });
     const ngb = city.buildingFade((byName('ノースゲートビルディング') as Footprint).id) as number;
     expect(ngb).toBeCloseTo(OVERVIEW_OPACITY, 2);
@@ -657,7 +773,39 @@ describe('buildCity', () => {
     const low = osm.filter((f) => f.y1 < 20 && !f.parts && f.use !== 'roof' && net.nodes.some((n) => Math.hypot(n.x - f.poly[0][0], n.z - f.poly[0][1]) < 100)).slice(0, 20);
     expect(low.length).toBeGreaterThan(5);
     for (const f of low) expect(city.buildingFade(f.id) as number).toBeLessThan(OVERVIEW_OPACITY * 0.6);
+    // No traffic, and no side streets: only the main carriageways are drawn.
+    expect(city.stats().vehicles).toBe(0);
+    // With a route selected (ノースゲート → サウスゲート), blocks far from it recede.
+    const sky = (byName('梅田スカイビル') as Footprint).id;
+    const yodo = (byName('ヨドバシ梅田タワー') as Footprint).id;
+    const skyBefore = city.buildingFade(sky) as number;
+    city.setRoute([new THREE.Vector3(-30, 0, -60), new THREE.Vector3(60, 0, 90)]);
+    const cam = new THREE.PerspectiveCamera();
+    cam.position.set(0, 900, 900);
+    cam.updateMatrixWorld();
+    for (let i = 0; i < 90; i++) city.update(cam, new THREE.Vector3(0, 0, 0), 1 / 30);
+    expect(city.buildingFade(sky) as number).toBeCloseTo(OVERVIEW_OPACITY * 0.3, 2);
+    expect(city.buildingFade(sky) as number).toBeLessThan(skyBefore);
+    expect(city.buildingFade(yodo) as number).toBeCloseTo(OVERVIEW_OPACITY, 2);
+    // Cleared again: back where they were.
+    city.setRoute(null);
+    for (let i = 0; i < 90; i++) city.update(cam, new THREE.Vector3(0, 0, 0), 1 / 30);
+    expect(city.buildingFade(sky) as number).toBeCloseTo(skyBefore, 2);
     city.dispose();
+  }, 30_000);
+
+  it('draws a fixed square around the network, the same when its outer nodes move', () => {
+    for (const n of net.nodes) {
+      expect(Math.abs(n.x - CITY_SQUARE.x), n.id).toBeLessThan(CITY_SQUARE.half - 300);
+      expect(Math.abs(n.z - CITY_SQUARE.z), n.id).toBeLessThan(CITY_SQUARE.half - 300);
+    }
+    const x1 = Math.max(...net.nodes.map((n) => n.x));
+    const moved: Network = { ...net, nodes: net.nodes.map((n) => (n.x === x1 ? { ...n, x: n.x + 60 } : n)) };
+    const a = buildCity(net, { dark: false, night: false, ex: 4, walk: false });
+    const b = buildCity(moved, { dark: false, night: false, ex: 4, walk: false });
+    expect(b.stats().buildings).toBe(a.stats().buildings);
+    a.dispose();
+    b.dispose();
   }, 30_000);
 
   it('fades thousands of buildings: the one between camera and walker ghosts, drawn in the blended pass only', () => {
@@ -666,7 +814,10 @@ describe('buildCity', () => {
     const hep = (byName('HEP FIVE') as Footprint).id;
     expect(city.stats().buildings).toBeGreaterThan(FADE_TEX_WIDTH * 4);
     const solid = () => city.object.getObjectByName('city-curtain-solid') as THREE.Mesh;
+    const ghost = () => city.object.getObjectByName('city-curtain-ghost') as THREE.Mesh;
+    const solidIndex = solid().geometry.getIndex();
     const drawnBefore = solid().geometry.drawRange.count;
+    expect(ghost().visible).toBe(false);
     // Camera north of ヨドバシ, walker south of it: the tower is in the way.
     const cam = new THREE.PerspectiveCamera();
     cam.position.set(49, 20, -330);
@@ -674,16 +825,23 @@ describe('buildCity', () => {
     for (let i = 0; i < 40; i++) city.update(cam, new THREE.Vector3(49, 0, -110), 1 / 30);
     expect(city.buildingFade(yodo) as number).toBeLessThan(0.2);
     expect(city.buildingFade(hep)).toBe(1);
-    // Its facades left the opaque pass and joined the blended one.
-    expect(solid().geometry.drawRange.count).toBeLessThan(drawnBefore);
-    const ghost = city.object.getObjectByName('city-curtain-ghost') as THREE.Mesh;
-    expect(ghost.visible).toBe(true);
-    expect(ghost.geometry.drawRange.count).toBeGreaterThan(0);
+    // Its facades joined the blended pass; the opaque pass keeps its fixed list (its shader folds
+    // a faded building away), so nothing big is rebuilt or uploaded.
+    expect(ghost().visible).toBe(true);
+    expect(ghost().geometry.drawRange.count).toBeGreaterThan(0);
+    expect(ghost().geometry.drawRange.count).toBeLessThan(drawnBefore / 4);
+    // Only the rebuilt tail of the ghost list is uploaded.
+    const uploads = (ghost().geometry.getIndex() as THREE.BufferAttribute).updateRanges;
+    expect(uploads.length).toBeGreaterThan(0);
+    expect(uploads.reduce((s, r) => s + r.count, 0)).toBeLessThan(drawnBefore / 4);
+    expect(solid().geometry.getIndex()).toBe(solidIndex);
+    expect(solid().geometry.drawRange.count).toBe(drawnBefore);
     // Walk away (the camera behind the walker, south): it comes back solid.
     cam.position.set(49, 20, 60);
     cam.updateMatrixWorld();
     for (let i = 0; i < 120; i++) city.update(cam, new THREE.Vector3(49, 0, 40), 1 / 30);
     expect(city.buildingFade(yodo)).toBe(1);
+    expect(ghost().visible).toBe(false);
     expect(solid().geometry.drawRange.count).toBe(drawnBefore);
     city.dispose();
   }, 30_000);
@@ -881,6 +1039,76 @@ describe('buildCity in walkable space', () => {
       if (onWalk(x, z, true)) inConcourse++;
     }
     expect(inConcourse).toBe(0);
+  });
+
+  it('opens a mapped building along the open deck the network walks through it', () => {
+    // OpenStreetMap draws ノースゲートビルディング's outline over the 2F deck along its north side
+    // (2階歩道橋（屋根なし）): the city opens the building there, so the walker on the deck is
+    // outside it and it is not cut away.
+    const a = net.nodes.find((n) => n.id === 'f_deck_w');
+    const b = net.nodes.find((n) => n.id === 'f_deck_y');
+    expect(a && b).toBeTruthy();
+    if (!a || !b) return;
+    const ngb = byName('ノースゲートビルディング') as Footprint;
+    const at = (t: number, up: number) => new THREE.Vector3(a.x + (b.x - a.x) * t, (a.y + (b.y - a.y) * t) * ex + up, a.z + (b.z - a.z) * t);
+    const cam = new THREE.PerspectiveCamera();
+    cam.position.copy(at(0.3, 2.4));
+    cam.lookAt(at(0.6, 1.5));
+    cam.updateMatrixWorld();
+    for (let i = 0; i < 40; i++) city.update(cam, at(0.5, 0), 1 / 30);
+    expect(city.buildingFade(ngb.id)).toBe(1);
+    // And nothing solid overhead: it is an open deck.
+    const s = soup(/^city-((curtain|grid|band|stone|roofs)-solid)$/);
+    for (const t of [0.3, 0.5, 0.7]) expect(hits(s, at(t, 2), at(t, 80), true), `t=${t}`).toBe(false);
+  });
+
+  it('stands every canopy it draws on posts', () => {
+    // OpenStreetMap maps canopies (building=roof) without their supports: the city gives each
+    // one it draws thin posts, and leaves out one with nowhere to stand them.
+    const s = soup(/^city-roofs-solid$/);
+    const canopies = osm.filter((f) => f.use === 'roof' && polyArea(f.poly) >= 20 && f.poly.every(([x, z]) => Math.abs(x - CITY_SQUARE.x) < CITY_SQUARE.half - 5 && Math.abs(z - CITY_SQUARE.z) < CITY_SQUARE.half - 5));
+    expect(canopies.length).toBeGreaterThan(50);
+    let drawn = 0;
+    for (const f of canopies) {
+      const [x0, x1, z0, z1] = [Math.min(...f.poly.map((p) => p[0])), Math.max(...f.poly.map((p) => p[0])), Math.min(...f.poly.map((p) => p[1])), Math.max(...f.poly.map((p) => p[1]))];
+      const top = sceneHeight(f.y1, ex);
+      let slab = false;
+      let foot = false;
+      for (let gx = Math.floor(x0 / 4); gx <= Math.floor(x1 / 4); gx++)
+        for (let gz = Math.floor(z0 / 4); gz <= Math.floor(z1 / 4); gz++)
+          for (const t of s.grid.get(`${gx},${gz}`) ?? []) {
+            // Its slab: a flat triangle at its top with its centre inside it (canopies side by side share corners).
+            const ys = [1, 4, 7].map((o) => s.tri[t * 9 + o]);
+            const cx = (s.tri[t * 9] + s.tri[t * 9 + 3] + s.tri[t * 9 + 6]) / 3;
+            const cz = (s.tri[t * 9 + 2] + s.tri[t * 9 + 5] + s.tri[t * 9 + 8]) / 3;
+            if (ys.every((y) => Math.abs(y - top) < 0.05) && insideRings([f.poly], cx, cz)) slab = true;
+            // A post: its foot on the ground under the canopy.
+            for (let v = 0; v < 3; v++) if (Math.abs(ys[v]) < 0.02 && insideRings([f.poly], s.tri[t * 9 + v * 3], s.tri[t * 9 + v * 3 + 2])) foot = true;
+          }
+      if (!slab) continue;
+      drawn++;
+      expect(foot, f.id).toBe(true);
+    }
+    expect(drawn / canopies.length).toBeGreaterThan(0.9);
+  });
+
+  it('keeps trees and lamps from growing through canopies', () => {
+    const canopies = osm.filter((f) => f.use === 'roof');
+    expect(canopies.length).toBeGreaterThan(50);
+    const m = new THREE.Matrix4();
+    const p = new THREE.Vector3();
+    for (const [name, r] of [
+      ['city-trunks', 3.4],
+      ['city-lamp-poles', 0.9],
+    ] as const) {
+      const mesh = city.object.getObjectByName(name) as THREE.InstancedMesh;
+      for (let i = 0; i < mesh.count; i++) {
+        mesh.getMatrixAt(i, m);
+        p.setFromMatrixPosition(m);
+        const under = canopies.find((f) => insideRings([f.poly], p.x, p.z) || distanceToEdges([f.poly], p.x, p.z) < r);
+        expect(under?.id, `${name} ${i}`).toBeUndefined();
+      }
+    }
   });
 
   it('keeps trees, lamps and the Ferris wheel off walking lines', () => {

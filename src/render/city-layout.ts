@@ -29,6 +29,13 @@ export function realHeight(y: number, ex: number): number {
   return y <= top ? y / ex : PODIUM_TOP + (y - top);
 }
 
+/**
+ * The square the city draws (buildings, streets, the walking ground), in local metres: fixed,
+ * so moving a few network nodes never makes the buildings at its edges come and go. It holds
+ * the network with at least 300 m around it; tools/overture/gen_osm.py's data area covers it.
+ */
+export const CITY_SQUARE = { x: 160, z: -10, half: 850 } as const;
+
 // ---------------------------------------------------------------- polygons
 
 /** Signed area in x-z (positive = counter-clockwise, the orientation used throughout). */
@@ -206,9 +213,9 @@ type Look = [FacadeStyle, string, RoofKind];
 
 /**
  * The landmarks around the station, found by their mapped name near a known spot (names like
- * 南館 repeat across the city), with their facades and, where the map lacks it, the published
- * height of the tower (roof, not antenna): 梅田阪急ビル 187 m, サウスゲートビルディング 122 m,
- * ハービスOSAKA 190 m, ハービスENT 133 m, HEP FIVE 46 m (with the Ø75 m wheel on top).
+ * 南館 repeat across the city), with their facades. Published tower heights where the map has
+ * them wrong are applied by the generator (tools/overture/gen_osm.py HEIGHTS); here only HEP
+ * FIVE's block is raised to 46 m to seat its Ø75 m wheel.
  */
 export interface Landmark {
   /** Mapped name, or null for a building found by position only. */
@@ -219,8 +226,6 @@ export interface Landmark {
   label: string;
   podium: Look;
   tower?: Look;
-  /** Tower (tallest part) height override, real metres. */
-  towerHeight?: number;
   /** Whole-building height override (single-volume buildings). */
   height?: number;
   wheel?: boolean;
@@ -228,12 +233,12 @@ export interface Landmark {
 
 export const LANDMARKS: Landmark[] = [
   { name: 'ノースゲートビルディング', at: [-24, -55], label: 'ノースゲートビルディング（ルクア）', podium: ['band', '#c9d2d8', 'plant'], tower: ['curtain', '#a9bccb', 'heli'] },
-  { name: 'サウスゲートビルディング', at: [66, 89], label: 'サウスゲートビルディング（大丸梅田店）', podium: ['stone', '#ddd5c8', 'plant'], tower: ['grid', '#e4dfd6', 'heli'], towerHeight: 122 },
+  { name: 'サウスゲートビルディング', at: [66, 89], label: 'サウスゲートビルディング（大丸梅田店）', podium: ['stone', '#ddd5c8', 'plant'], tower: ['grid', '#e4dfd6', 'heli'] },
   { name: '南館', at: [-80, -187], label: 'グランフロント大阪 南館', podium: ['curtain', '#c3ccd2', 'plant'], tower: ['curtain', '#9fb2c2', 'heli'] },
   { name: '北館', at: [-114, -371], label: 'グランフロント大阪 北館', podium: ['curtain', '#c3ccd2', 'plant'], tower: ['curtain', '#9fb2c2', 'heli'] },
   { name: 'グランフロント大阪 オーナーズタワー', at: [-151, -534], label: 'グランフロント大阪 オーナーズタワー', podium: ['curtain', '#c3ccd2', 'plant'], tower: ['curtain', '#aab8c4', 'heli'] },
   { name: 'ヨドバシ梅田タワー', at: [49, -209], label: 'ヨドバシ梅田タワー', podium: ['band', '#8b949c', 'plant'], tower: ['curtain', '#a2b0bb', 'heli'] },
-  { name: '大阪梅田ツインタワーズ・ノース', at: [269, -25], label: '阪急うめだ本店（大阪梅田ツインタワーズ・ノース）', podium: ['stone', '#d8cdbb', 'plant'], tower: ['curtain', '#a7b6c1', 'heli'], towerHeight: 187 },
+  { name: '大阪梅田ツインタワーズ・ノース', at: [269, -25], label: '阪急うめだ本店（大阪梅田ツインタワーズ・ノース）', podium: ['stone', '#d8cdbb', 'plant'], tower: ['curtain', '#a7b6c1', 'heli'] },
   { name: '大阪梅田ツインタワーズ・サウス', id: 'hanshin:bldg', at: [236, 164], label: '阪神梅田本店（大阪梅田ツインタワーズ・サウス）', podium: ['stone', '#d9d2c6', 'plant'], tower: ['curtain', '#a4b3bf', 'heli'] },
   { name: 'JPタワー大阪', at: [-153, 218], label: 'JPタワー大阪（KITTE大阪）', podium: ['stone', '#e2ddd3', 'plant'], tower: ['curtain', '#b3c1cc', 'heli'] },
   { name: 'イノゲート大阪', at: [-219, 79], label: 'イノゲート大阪', podium: ['curtain', '#cfd6db', 'none'], tower: ['band', '#b8c3cc', 'heli'] },
@@ -243,8 +248,8 @@ export const LANDMARKS: Landmark[] = [
   { name: '南館 ゲートタワー', at: [-317, 21], label: 'グラングリーン大阪 南館 ゲートタワー', podium: ['curtain', '#cfd6d8', 'plant'], tower: ['curtain', '#a8b8c0', 'heli'] },
   { name: '南館 サウスタワー', at: [-355, 85], label: 'グラングリーン大阪 南館 サウスタワー', podium: ['curtain', '#cfd6d8', 'plant'], tower: ['band', '#bcc6cc', 'heli'] },
   { name: 'GRAND GREEN OSAKA THE NORTH RESIDENCE', at: [-257, -489], label: 'グラングリーン大阪 ザ・ノースレジデンス', podium: ['curtain', '#cfd6d8', 'plant'], tower: ['grid', '#d9dcd8', 'heli'] },
-  { name: 'ハービスOSAKA', at: [-276, 449], label: 'ハービスOSAKA', podium: ['stone', '#d7cfc3', 'plant'], tower: ['curtain', '#b3b8b8', 'crown'], towerHeight: 190 },
-  { name: 'ハービスENT', at: [-106, 308], label: 'ハービスENT', podium: ['stone', '#d7cfc3', 'plant'], tower: ['curtain', '#aeb6ba', 'heli'], towerHeight: 133 },
+  { name: 'ハービスOSAKA', at: [-276, 449], label: 'ハービスOSAKA', podium: ['stone', '#d7cfc3', 'plant'], tower: ['curtain', '#b3b8b8', 'crown'] },
+  { name: 'ハービスENT', at: [-106, 308], label: 'ハービスENT', podium: ['stone', '#d7cfc3', 'plant'], tower: ['curtain', '#aeb6ba', 'heli'] },
   { name: '大阪駅前第1ビル', at: [71, 402], label: '大阪駅前第1ビル', podium: ['grid', '#d6d0c4', 'plant'], tower: ['grid', '#d6d0c4', 'plant'] },
   { name: '大阪駅前第2ビル', at: [207, 410], label: '大阪駅前第2ビル', podium: ['grid', '#cfc9bd', 'plant'], tower: ['grid', '#cfc9bd', 'plant'] },
   { name: null, at: [328, 409], label: '大阪駅前第3ビル', podium: ['grid', '#d3cdc2', 'plant'], tower: ['grid', '#ddd8ce', 'plant'] },
@@ -329,10 +334,7 @@ export function massing(fp: Footprint, seed: number): { parts: MassPart[]; landm
   const parts: MassPart[] = src.map((p) => {
     const area = polyArea(p.poly);
     const isTower = !!lm?.tower && p.y1 >= Math.max(40, top * 0.6);
-    let y1 = p.y1;
-    if (lm?.height && !fp.parts?.length) y1 = lm.height;
-    // A published tower height scales the tower parts (the tallest one reaches it exactly).
-    if (isTower && lm?.towerHeight && top > 0) y1 = (p.y1 * lm.towerHeight) / top;
+    const y1 = lm?.height && !fp.parts?.length ? lm.height : p.y1;
     const look: PartLook = lm ? toLook(isTower ? (lm.tower as Look) : lm.podium) : genericLook(fp.use, p.y1, area, r);
     return { poly: p.poly, holes: p.holes, y0: p.y0, y1, look };
   });
@@ -406,6 +408,64 @@ export function prismWalls(poly: P2[], holes: P2[][], cutters: P2[][]): WallSeg[
     }
   });
   return out;
+}
+
+/**
+ * A convex plan region a building part is kept out of between two real heights: an elevated
+ * station's platform area (from the ground up), or an open deck the network walks through a
+ * mapped building (from its floor up).
+ */
+export interface Cutter {
+  poly: P2[];
+  y0: number;
+  top: number;
+}
+
+/**
+ * Horizontal bands of a part spanning real heights [y0, y1], split wherever a cutter starts or
+ * stops, each with the cutter plans it is cut by — so a tower over a station's platform area
+ * keeps its floors above the cutter, and a podium a deck runs through keeps those below it.
+ */
+export function cutBands(y0: number, y1: number, cutters: Cutter[]): { y0: number; y1: number; cuts: P2[][] }[] {
+  const ys = [y0];
+  const inner = cutters.flatMap((c) => [c.y0, c.top]).filter((y) => y > y0 + 0.05 && y < y1 - 0.05);
+  for (const y of inner.sort((a, b) => a - b)) if (y - ys[ys.length - 1] > 0.05) ys.push(y);
+  ys.push(y1);
+  const out: { y0: number; y1: number; cuts: P2[][] }[] = [];
+  let prev: Cutter[] | null = null;
+  for (let i = 0; i < ys.length - 1; i++) {
+    const a = ys[i];
+    const b = ys[i + 1];
+    const cs = cutters.filter((c) => c.y0 <= a + 0.06 && c.top >= b - 0.06);
+    if (prev && cs.length === prev.length && cs.every((c) => prev?.includes(c))) out[out.length - 1].y1 = b;
+    else out.push({ y0: a, y1: b, cuts: cs.map((c) => c.poly) });
+    prev = cs;
+  }
+  return out;
+}
+
+/** The part of a convex polygon inside another convex polygon (either orientation); [] if none. */
+export function intersectConvex(poly: P2[], conv: P2[]): P2[] {
+  let cx = 0;
+  let cz = 0;
+  for (const [x, z] of conv) {
+    cx += x / conv.length;
+    cz += z / conv.length;
+  }
+  let out = poly;
+  for (let i = 0; i < conv.length && out.length >= 3; i++) {
+    const a = conv[i];
+    const b = conv[(i + 1) % conv.length];
+    // Outward normal of this edge (away from the centroid): keep the side facing the centroid.
+    let nx = b[1] - a[1];
+    let nz = a[0] - b[0];
+    if (nx * (cx - a[0]) + nz * (cz - a[1]) > 0) {
+      nx = -nx;
+      nz = -nz;
+    }
+    out = clipHalfPlane(out, nx, nz, nx * a[0] + nz * a[1]);
+  }
+  return out.length >= 3 && polyArea(out) > 1e-4 ? out : [];
 }
 
 /** Does a polygon reach into a convex cutter (by more than `eps` metres)? */
