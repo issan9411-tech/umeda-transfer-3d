@@ -38,9 +38,9 @@ export class Soup {
           m4.multiply(inst);
         }
         // Only the drawn range (the city's per-pass index lists are longer than what they draw).
-        const count = idx ? idx.count : pos.count;
-        const first = Math.min(count, Math.max(0, geo.drawRange.start));
-        const last = Math.min(count, first + Math.max(0, geo.drawRange.count));
+        const total = idx ? idx.count : pos.count;
+        const first = Math.min(total, Math.max(0, geo.drawRange.start));
+        const last = Math.min(total, first + Math.max(0, geo.drawRange.count));
         for (let t = Math.ceil(first / 3); t < Math.floor(last / 3); t++) {
           const i0 = idx ? idx.getX(t * 3) : t * 3;
           const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;

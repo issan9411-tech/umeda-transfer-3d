@@ -19,6 +19,7 @@ import {
   firstPersonPose,
   orbitPose,
   PIVOT_H,
+  shaftBeside,
   type Shaft,
   type WalkCameraPose,
 } from '../src/render/walk-camera';
@@ -38,8 +39,10 @@ import { segTri, Soup, type Tri } from './support/soup';
  *   - the walker stays in sight: the figure is shown and nothing opaque stands between the
  *     camera and his upper body or waist (glass is see-through).
  * Where the walker stands in a lift shaft the camera waits on the landing outside and looks in
- * through the shaft's glass, which then counts for none of these. Where it is boxed in (a dead end
- * right behind) it slides to the eye and fades the figure out: that counts as out of sight.
+ * through the shaft's glass, which then counts for none of these (nor while he steps out of it or
+ * waits beside it, when the camera may still look at him through that glass, and only that).
+ * Where it is boxed in (a dead end right behind) it slides to the eye and fades the figure out:
+ * that counts as out of sight.
  * The previous camera (8 behind, 3.4 up, lifted over the flight behind) is measured the same way
  * for comparison.
  */
@@ -116,7 +119,7 @@ beforeAll(() => {
   const inGrid = new Uint8Array(soup.tris.length);
   for (const ids of soup.grid.values()) for (const id of ids) inGrid[id] = 1;
   const big = soup.tris.filter((_, i) => !inGrid[i]);
-  /** The shaft the walker stands in (its glass is looked through), per sample. */
+  /** The shaft the walker stands in or beside (its glass may be looked through), per sample. */
   let own: Shaft | null = null;
   const ownGlass = (t: Tri) => !!own && t.tag === 'glass' && [t.a, t.b, t.c].every((v) => Math.hypot(v.x - own!.x, v.z - own!.z) <= own!.half * Math.SQRT2 + 0.06);
   const hit = (p: THREE.Vector3, q: THREE.Vector3, opaque = false): { tri: Tri; f: number } | null => {
@@ -263,7 +266,7 @@ beforeAll(() => {
       const label = `${e.id}@${(i / n).toFixed(2)}`;
       bodyBlocked = !!hit(feet.copy(w).setY(w.y + 0.5), crown.copy(w).setY(w.y + 2.2));
       pivot.copy(w).setY(w.y + PIVOT_H);
-      own = shafts.find((s) => pivot.y > s.y0 && pivot.y < s.y1 && Math.hypot(pivot.x - s.x, pivot.z - s.z) < s.half) ?? null;
+      own = shaftBeside(shafts, pivot);
       if (ride) rideSamples++;
       // After: the view's solver, run continuously along the edge.
       const t0 = performance.now();
@@ -370,7 +373,7 @@ beforeAll(() => {
       if (f % 2) continue;
       bodyBlocked = !!hit(feet.copy(w).setY(w.y + 0.5), crown.copy(w).setY(w.y + 2.2));
       pivot.copy(w).setY(w.y + PIVOT_H);
-      own = shafts.find((s) => pivot.y > s.y0 && pivot.y < s.y1 && Math.hypot(pivot.x - s.x, pivot.z - s.z) < s.half) ?? null;
+      own = shaftBeside(shafts, pivot);
       inLift = kind === 'elevator';
       measure(played, w, pose, `${q.name}@${t.toFixed(1)}`);
     }
@@ -455,6 +458,29 @@ describe('collision world and the city cut-away', () => {
     expect(rebuilt.triangles).toBe(fresh.triangles);
     expect(roofUnder(rebuilt)).toBeCloseTo(roof, 3);
   }, 60_000);
+
+  it('reads only the drawn range of each geometry', () => {
+    // Four level triangles over the origin (y = 0, 1, 2, 3) in the index, a stale entry after
+    // them, and only the middle two drawn.
+    const pos: number[] = [];
+    for (let y = 0; y < 4; y++) pos.push(-5, y, -5, 5, y, -5, 0, y, 5);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setIndex([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 4, 8]);
+    geo.setDrawRange(3, 6);
+    const mesh = new THREE.Mesh(geo);
+    mesh.name = 'walls';
+    const wd = CollisionWorld.fromScene([mesh]);
+    expect(wd.triangles).toBe(2);
+    expect(10 - wd.raycast(0, 10, 0, 0, -1, 0, 20)).toBeCloseTo(2, 5);
+    expect(-10 + wd.raycast(0, -10, 0, 0, 1, 0, 20)).toBeCloseTo(1, 5);
+    const soup = new Soup();
+    soup.addObject(mesh, cameraTag);
+    expect(soup.tris.map((t) => t.a.y)).toEqual([1, 2]);
+    // A draw range running past the index is cut at its end.
+    geo.setDrawRange(9, Infinity);
+    expect(CollisionWorld.fromScene([mesh]).triangles).toBe(2);
+  });
 
   it('cuts away only along the sight line once the camera keeps out of solids itself', () => {
     const box = makePrism([[-10, -5], [10, -5], [10, 5], [-10, 5]], [], 0, 50);

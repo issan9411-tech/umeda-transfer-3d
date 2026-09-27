@@ -142,6 +142,13 @@ export class UmedaView {
   private pose = createPose();
   /** Orbit view: the camera position the user asked for, before collisions pulled it in. */
   private orbitWanted = new THREE.Vector3();
+  /**
+   * Walking in the orbit view, OrbitControls drives this stand-in at target + orbitWanted (its
+   * input handlers move what they control at once): the drawn camera is where the walls let it be.
+   */
+  private orbitProxy = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
+  /** Length of orbitWanted after the last frame (before any input since). */
+  private orbitAsked = 0;
   /** Walker figure opacity (it fades out when the camera closes in behind the head). */
   private figureAlpha = 1;
   private figureShown = true;
@@ -408,12 +415,13 @@ export class UmedaView {
       // Close zoom is fine indoors; far zoom is pointless (walls stop the camera anyway).
       this.controls.minDistance = 2;
       this.controls.maxDistance = 160;
-      this.orbitWanted.subVectors(this.camera.position, this.controls.target);
+      this.seatOrbit();
       this.rig.len = this.camera.position.distanceTo(this.pose.pivot);
       this.rig.ready = true;
-    } else if (!first && prev !== view) {
+    } else {
+      this.controls.object = this.camera;
       // Ease from wherever the camera is now (the arm stays clear on the way).
-      this.rigFromCamera();
+      if (!first && prev !== view) this.rigFromCamera();
     }
     this.walker.visible = view !== 'first' && this.walkerTrack.length > 0;
     this.miniFrame.hidden = false;
@@ -437,6 +445,7 @@ export class UmedaView {
     this.setNear(1);
     this.setFigureAlpha(1);
     this.controls.enabled = true;
+    this.controls.object = this.camera;
     this.controls.minDistance = 40;
     this.controls.maxDistance = 4000;
     this.setWalkerScale();
@@ -557,11 +566,25 @@ export class UmedaView {
       this.applyWalkPose(0);
       this.walkView = 'orbit';
       this.controls.target.copy(this.walker.position).y += ORBIT_FOCUS_H;
-      this.orbitWanted.subVectors(this.camera.position, this.controls.target);
+      this.seatOrbit();
       this.camera.lookAt(this.controls.target);
       return;
     }
     this.applyWalkPose(0);
+  }
+
+  /** Orbit view: the user's camera starts where the drawn one is (OrbitControls then drives it). */
+  private seatOrbit(): void {
+    this.orbitWanted.subVectors(this.camera.position, this.controls.target);
+    this.orbitAsked = this.orbitWanted.length();
+    const p = this.orbitProxy;
+    p.position.copy(this.camera.position);
+    p.fov = this.camera.fov;
+    p.aspect = this.camera.aspect;
+    p.updateProjectionMatrix();
+    p.lookAt(this.controls.target);
+    p.updateMatrix();
+    this.controls.object = p;
   }
 
   private updateWalkCamera(dt: number): void {
@@ -575,25 +598,32 @@ export class UmedaView {
     this.miniMarker.position.copy(this.walker.position).setY(this.walker.position.y + 40);
     this.miniMarker.rotation.set(0, this.heading, 0);
     if (this.walkView === 'orbit') {
-      // Follow the walker, let OrbitControls apply the user's drag to the unobstructed position,
-      // then pull the camera in front of anything between it and the walker.
+      // Take what the user did since the last frame (OrbitControls moved the stand-in around the
+      // target itself), follow the walker, then pull the camera in front of anything between it
+      // and him.
+      const proxy = this.orbitProxy;
+      this.orbitWanted.subVectors(proxy.position, this.controls.target);
       const focus = _tgt.copy(this.walker.position);
       focus.y += ORBIT_FOCUS_H;
       this.controls.target.add(focus.sub(this.controls.target).multiplyScalar(Math.min(1, dt * 3)));
-      this.camera.position.copy(this.controls.target).add(this.orbitWanted);
-      const asked = this.orbitWanted.length();
+      proxy.position.copy(this.controls.target).add(this.orbitWanted);
+      const asked = this.orbitAsked;
       this.controls.update();
-      this.orbitWanted.subVectors(this.camera.position, this.controls.target);
-      // Zooming in where walls hold the camera closer than asked: zoom from where it is, so the
-      // wheel answers at once (the asked-for distance is kept otherwise, and comes back once
-      // nothing stands in the way).
+      this.orbitWanted.subVectors(proxy.position, this.controls.target);
+      // Where walls hold the camera closer than asked, the asked-for distance stays within reach
+      // of where it is (zooming out in a corridor piles up nothing to zoom back through, nor a
+      // flight out once in the open), and zooming in starts from where it is: the wheel answers
+      // at once.
       const zoomed = this.orbitWanted.length();
-      const held = this.rig.ready ? this.pose.reach : asked;
-      if (zoomed < asked - 1e-4 && held < asked) {
-        const to = Math.max(this.controls.minDistance, Math.min(zoomed, held * (zoomed / asked)));
-        this.orbitWanted.multiplyScalar(to / zoomed);
-        this.camera.position.copy(this.controls.target).add(this.orbitWanted);
-      }
+      const held = this.rig.ready ? this.pose.reach : zoomed;
+      let to = Math.min(zoomed, Math.max(held + 4, held * 1.5));
+      if (zoomed < asked - 1e-4 && held < asked) to = Math.min(to, held * (zoomed / asked));
+      to = Math.max(this.controls.minDistance, to);
+      if (Math.abs(to - zoomed) > 1e-4 && zoomed > 1e-6) this.orbitWanted.multiplyScalar(to / zoomed);
+      this.orbitAsked = this.orbitWanted.length();
+      proxy.position.copy(this.controls.target).add(this.orbitWanted);
+      proxy.updateMatrix();
+      this.camera.position.copy(proxy.position);
       orbitPose(this.collide, this.walker.position, this.camera.position, this.rig, dt, this.camera.fov, this.camera.aspect, this.pose, this.liftRide(), this.heading);
       this.camera.position.copy(this.pose.pos);
       this.camera.lookAt(this.controls.target);
@@ -1240,6 +1270,7 @@ export class UmedaView {
       if (this.walkView === 'orbit') {
         // Keep the user's orbit around the walker's new spot (no flight through the walls).
         this.controls.target.copy(this.walker.position).y += ORBIT_FOCUS_H;
+        this.orbitProxy.position.copy(this.controls.target).add(this.orbitWanted);
         this.rig.ready = false;
       } else this.snapWalkCamera();
     }
