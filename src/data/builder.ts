@@ -1,5 +1,5 @@
 import type { EdgeKind, Footprint, Level, Line, NetEdge, NetNode, Network, NodeKind, Platform, Road, Station } from '../core/types';
-import { alongOf, detour, inflate, lateralOf, rectFromFrame, rectsOverlap, segmentHitsRect, type ORect } from './flight-layout';
+import { alongOf, corners, detour, inflate, lateralOf, rectFromFrame, rectsOverlap, segmentHitsRect, type ORect } from './flight-layout';
 
 /** Local tangent plane centred on JR Osaka Station (Mapion reference point 34.70249, 135.49567). */
 export const ORIGIN = { lat: 34.7025, lon: 135.4957 };
@@ -487,7 +487,8 @@ export class NetBuilder {
       const a = this.get(from);
       const b = this.get(to);
       const obstacles = (level === 'low' ? lowObstacles : highObstacles).filter((r) => r !== own);
-      const via = detour(a, b, obstacles);
+      // 0.9 m clear of a well: the crowd spreads up to 0.8 m either side of a walkway's line.
+      const via = detour(a, b, obstacles, 0.9);
       const opts = { indoor: m.o.indoor, busy: m.o.busy, width: Math.max(w, 2.4) };
       let prev = from;
       via.forEach((p, i) => {
@@ -632,6 +633,37 @@ export class NetBuilder {
     return { o, u, n, len, anchor, platform: plat, center };
   }
 
+  /**
+   * Records, per level walkway, how far people can spread to either side before reaching a stair
+   * well or lift shaft laid out beside it (the crowd keeps within this; see sim/crowd.ts).
+   */
+  private limitRooms(): void {
+    for (const e of this.edges) {
+      if (e.kind === 'stairs' || e.kind === 'escalator' || e.kind === 'elevator') continue;
+      const a = this.get(e.a);
+      const b = this.get(e.b);
+      const len = Math.hypot(b.x - a.x, b.z - a.z);
+      if (len < 0.3) continue;
+      const u = { x: (b.x - a.x) / len, z: (b.z - a.z) / len };
+      const y = (a.y + b.y) / 2;
+      let left = Infinity;
+      let right = Infinity;
+      for (const f of this.placedFlights) {
+        if (y < f.y0 - 0.3 || y > f.y1 + 0.3) continue;
+        const cs = corners(f.rect);
+        const ss = cs.map((p) => alongOf(a, u, p));
+        if (Math.max(...ss) < -0.5 || Math.min(...ss) > len + 0.5) continue;
+        const ts = cs.map((p) => lateralOf(a, u, p));
+        const t0 = Math.min(...ts);
+        const t1 = Math.max(...ts);
+        if (t0 >= 0) right = Math.min(right, t0 - 0.5);
+        else if (t1 <= 0) left = Math.min(left, -t1 - 0.5);
+        else left = right = 0;
+      }
+      if (left < 8 || right < 8) e.room = [Math.max(0, Math.min(8, left)), Math.max(0, Math.min(8, right))];
+    }
+  }
+
   /** The platform whose slab a node stands on (same height, inside its outline), if any. */
   private platformUnder(n: NetNode): Platform | undefined {
     if (n.platformId) return this.platforms.find((p) => p.id === n.platformId);
@@ -714,6 +746,7 @@ export class NetBuilder {
 
   build(): Network {
     this.layoutFlights();
+    this.limitRooms();
     return {
       levels: this.levels,
       lines: this.lines,

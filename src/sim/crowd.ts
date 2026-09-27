@@ -324,7 +324,13 @@ export class CrowdSim {
       this.speeds[w] = moving ? (run * rate) / Math.max(0.5, tF - h) : 0;
       this.ids[w] = a.id;
       this.climbs[w] = edge.kind === 'stairs' ? Math.sign(nb.y - na.y) : 0;
-      const room = lateralRoom(edge.kind, edge.width);
+      let room = lateralRoom(edge.kind, edge.width);
+      if (edge.room) {
+        // Stair wells / lift shafts beside the walkway: keep to the free side's width.
+        const fwd = (k & 1) === 0;
+        const side = a.lane < 0 === fwd ? edge.room[0] : edge.room[1];
+        room = Math.min(room, side);
+      }
       this.lateral[w] = room > 0 ? a.lane * room : 0;
       w++;
       this.agents[keep++] = a;
@@ -357,7 +363,9 @@ export function lateralRoom(kind: string, width: number | undefined): number {
     case 'crossing':
       return Math.max(0, Math.min(w, 8) / 2 - 0.7);
     case 'platform':
-      return Math.max(0, w / 2 - 1.6); // stay behind the tactile strip
+      // The walking line runs 1.6 m inside the platform edge, beside the stair wells: keep to a
+      // 1.2 m band on it (behind the tactile strip, clear of the wells).
+      return Math.max(0, Math.min(0.6, w / 2 - 1.6));
     case 'gate':
       return Math.max(0, Math.min(w / 1.4, 14) / 2 - 0.6);
     default:

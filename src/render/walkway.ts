@@ -956,6 +956,15 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
       continue;
     }
 
+    // A floor disc as wide as the widest corridor fills the corners between the corridor mouths
+    // (walk-space.ts counts the same disc as walkable; the crowd spreads across it).
+    if (!onPlatform(n)) {
+      const r = Math.max(...solid.map((a) => a.width)) / 2 - 0.1;
+      const disc: THREE.Vector3[] = [];
+      for (let i = 0; i < 12; i++) disc.push(C.clone().add(V(Math.cos((i * Math.PI) / 6) * r, lift, Math.sin((i * Math.PI) / 6) * r)));
+      floorPoly(n.paid ? 'tile' : list.some((a) => a.indoor) ? 'stone' : 'paver', disc);
+    }
+
     // Mouth corners, counter-clockwise by arm angle.
     const poly: THREE.Vector3[] = [];
     const mouths = list.map((a) => {

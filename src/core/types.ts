@@ -66,6 +66,11 @@ export interface NetEdge {
   busy?: number;
   /** Fixed waiting time in seconds (signal cycles, elevator waits). */
   waitS?: number;
+  /**
+   * How far people may stray from the centre line to the left / right when walking a→b (metres),
+   * where a stair well or lift shaft beside the walkway limits it (set by the builder).
+   */
+  room?: [number, number];
 }
 
 export interface Line {
