@@ -4,13 +4,19 @@ Fetches the OpenStreetMap-derived Overture Maps data around 梅田 that gen_osm.
 src/data/osm/*.ts, and writes it as JSON in the app's local metres.
 
 Usage:  python3 tools/overture/fetch.py OUT_DIR [--release 2026-09-23.1] [--only buildings,...]
+                                         [--ca-bundle FILE]
 
 Reads the public GeoParquet release straight from s3://overturemaps-us-west-2 over HTTPS range
 requests (no credentials, no full download): for each data set it lists the release's files,
 keeps the row groups whose bbox statistics overlap the area, and reads only those. Needs
-pyarrow and shapely. Writes buildings.json, parts.json, segments.json and infra.json:
+pyarrow and shapely. Writes buildings.json, parts.json, segments.json, infra.json and
+landuse.json:
 
   x = east, z = south (metres), origin 34.7025 N 135.4957 E — exactly builder.ts ll().
+
+TLS uses the system's trusted certificates; behind an intercepting proxy, pass its CA bundle
+with --ca-bundle (or the OVERTURE_CA_BUNDLE / SSL_CERT_FILE environment variable). An
+HTTPS_PROXY environment variable is honoured.
 
 Data: OpenStreetMap © OpenStreetMap contributors (ODbL 1.0), distributed by Overture Maps.
 """
@@ -36,16 +42,27 @@ DATASETS = {
     'parts': ('buildings', 'building_part', 'id,building_id,height,min_height,num_floors,min_floor,level,is_underground,roof_shape,facade_color,facade_material,names'),
     'segments': ('transportation', 'segment', 'id,subtype,class,subclass,road_flags,level_rules,width_rules,access_restrictions,connectors,sources,names'),
     'infra': ('base', 'infrastructure', 'id,subtype,class,level,names'),
+    'landuse': ('base', 'land_use', 'id,subtype,class,sources,names'),
 }
 
-_ctx = ssl.create_default_context()
-_bundle = os.environ.get('SSL_CERT_FILE') or ('/root/.ccr/ca-bundle.crt' if os.path.exists('/root/.ccr/ca-bundle.crt') else None)
-if _bundle:
-    _ctx.load_verify_locations(_bundle)
-_opener = urllib.request.build_opener(urllib.request.ProxyHandler(), urllib.request.HTTPSHandler(context=_ctx))
+_opener = None
+
+
+def set_ca_bundle(path=None):
+    """HTTPS opener verifying against the system's certificates, plus `path` (a PEM bundle, e.g.
+    an intercepting proxy's CA) when given."""
+    global _opener
+    ctx = ssl.create_default_context()
+    if path:
+        if not os.path.isfile(path):
+            sys.exit(f'CA bundle not found: {path}')
+        ctx.load_verify_locations(path)
+    _opener = urllib.request.build_opener(urllib.request.ProxyHandler(), urllib.request.HTTPSHandler(context=ctx))
 
 
 def get(key, start=None, end=None, tries=5):
+    if _opener is None:
+        set_ca_bundle(os.environ.get('OVERTURE_CA_BUNDLE') or os.environ.get('SSL_CERT_FILE'))
     for i in range(tries):
         try:
             req = urllib.request.Request(BASE + key)
@@ -198,7 +215,10 @@ def main():
     ap.add_argument('out', help='directory for the JSON files')
     ap.add_argument('--release', default='2026-09-23.1')
     ap.add_argument('--only', help='comma-separated subset of ' + ','.join(DATASETS))
+    ap.add_argument('--ca-bundle', default=os.environ.get('OVERTURE_CA_BUNDLE') or os.environ.get('SSL_CERT_FILE'),
+                    help='extra PEM CA bundle to trust (e.g. an HTTPS proxy\'s); default: $OVERTURE_CA_BUNDLE or $SSL_CERT_FILE, else the system store only')
     a = ap.parse_args()
+    set_ca_bundle(a.ca_bundle)
     os.makedirs(a.out, exist_ok=True)
     for name in (a.only.split(',') if a.only else DATASETS):
         theme, typ, cols = DATASETS[name]
