@@ -1300,6 +1300,31 @@ input[type="radio"] {
   border-radius: 3px;
 }
 
+/* Data credit for the city (OpenStreetMap, ODbL): bottom right, just above the play bar. */
+.map-credit {
+  position: absolute;
+  z-index: 2;
+  right: 14px;
+  bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+  padding: 0 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  color: var(--ink-2);
+  font-size: 10.5px;
+  line-height: 15px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+@media (max-width: 760px) {
+  .map-credit {
+    right: 10px;
+    bottom: 59px;
+    font-size: 10px;
+    line-height: 14px;
+  }
+}
+
 .floor.is-current {
   background: var(--accent);
   color: var(--accent-ink);

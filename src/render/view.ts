@@ -10,13 +10,14 @@ import { applyLook, createEnvironment, Lighting, setupRenderer } from './look';
 import { heatColor, KIND_COLORS, readPalette, type ScenePalette } from './palette';
 import { PeopleCrowd, createWalkerFigure, type PeopleOptions, type WalkerFigure } from './people';
 import { buildStations, buildTrainModel } from './station';
-import { chasePose, CollisionWorld, createPose, createRig, firstPersonPose, NEAR_MAX, orbitPose, PIVOT_H } from './walk-camera';
+import { chasePose, CollisionWorld, createPose, createRig, EYE_H, firstPersonPose, NEAR_MAX, orbitPose, PEOPLE_SCALE, PIVOT_H, type LiftRide } from './walk-camera';
 import {
   angleDelta,
   buildGuideLine,
   buildWalkway,
   disposeWalkway,
   headingBetween,
+  liftShafts,
   updateWalkway,
   verticalLaneOffsets,
   type WalkCut,
@@ -38,11 +39,6 @@ export type WalkView = 'chase' | 'first' | 'orbit';
 const WALK_EX = 1.5;
 /** Size of the walker's halo while walking (the overview marker is drawn oversized). */
 const WALKER_SCALE = 0.3;
-/**
- * Pedestrian figures while walking: a little above real size, between the real horizontal
- * scale and the 1.5× vertical exaggeration, so people, gates and steps read in proportion.
- */
-const PEOPLE_SCALE = 1.25;
 /** The walker figure in the overview: a "you are here" marker, larger than the crowd (×5). */
 const WALKER_OVERVIEW_SCALE = 9;
 
@@ -137,6 +133,10 @@ export class UmedaView {
   private heading = 0;
   /** Solid walk-scene triangles the camera keeps out of (rebuilt with the walk scene). */
   private collide: CollisionWorld | null = null;
+  /** The city's part of it (every building at rest, streets, viaducts), built once per city. */
+  private cityCollide: { city: City; world: CollisionWorld } | null = null;
+  /** The lift ride under way (scene y of the soles at both landings), for the walk camera. */
+  private ride: LiftRide = { from: 0, to: 0 };
   /** Spring-arm state and the pose it produced this frame. */
   private rig = createRig();
   private pose = createPose();
@@ -207,6 +207,11 @@ export class UmedaView {
     this.miniFrame.hidden = true;
     this.miniFrame.setAttribute('aria-hidden', 'true');
     container.appendChild(this.miniFrame);
+    // The city's buildings and streets are OpenStreetMap data (ODbL): credit it on the view.
+    const credit = document.createElement('div');
+    credit.className = 'map-credit';
+    credit.textContent = '© OpenStreetMap contributors';
+    container.appendChild(credit);
     this.laneOffsets = verticalLaneOffsets(g);
     this.edgeLevels = g.edges.map((e) => [g.nodes[g.nodeIndex.get(e.a) as number].level, g.nodes[g.nodeIndex.get(e.b) as number].level]);
     this.figure = createWalkerFigure();
@@ -331,8 +336,20 @@ export class UmedaView {
     );
     if (r) this.buildWalkExtras(r);
     this.applyLook();
-    // Everything solid the walk camera must stay out of, in one hierarchy (≈200k triangles).
-    this.collide = CollisionWorld.fromScene([this.walkGroup, this.trainGroup, this.city?.object]);
+    // Everything solid the walk camera must stay out of: the walk scene (≈200k triangles, rebuilt
+    // with it) and the city as it stands at rest (kept while the city is), and the lift shafts.
+    this.collide = CollisionWorld.join([CollisionWorld.fromScene([this.walkGroup, this.trainGroup]), this.cityCollision()]);
+    this.collide.shafts = liftShafts(this.walkGroup);
+    // The city then needs no cut-away around the camera, only along its sight line.
+    this.city?.setSolidCamera(true);
+  }
+
+  /** Collision world of the city (null while the ground level is hidden). */
+  private cityCollision(): CollisionWorld | null {
+    const city = this.city;
+    if (!city || !city.object.visible) return null;
+    if (this.cityCollide?.city !== city) this.cityCollide = { city, world: CollisionWorld.fromScene(city.solidMeshes()) };
+    return this.cityCollide.world;
   }
 
   /** Trains at both ends of the route and signboards at each instruction. */
@@ -416,6 +433,7 @@ export class UmedaView {
     this.exaggeration = this.savedEx;
     this.scene.fog = null;
     this.collide = null;
+    this.cityCollide = null;
     this.setNear(1);
     this.setFigureAlpha(1);
     this.controls.enabled = true;
@@ -481,7 +499,7 @@ export class UmedaView {
       const ahead = sampleKeyframes(this.walkerTrack, this.walkerT + 4);
       const dy = this.Y(ahead.y) - (w.y - FLOOR_LIFT - this.walkerLift);
       const target = _tgt.copy(w).addScaledVector(fwd, 14);
-      target.y += 1.6 * PEOPLE_SCALE + dy * 0.7 - 1.2;
+      target.y += EYE_H + dy * 0.7 - 1.2;
       if (dt <= 0) this.rig.target.copy(target);
       else this.rig.target.lerp(target, 1 - Math.exp(-dt * 5));
       firstPersonPose(this.collide, w, this.rig.target, cam.fov, cam.aspect, this.pose);
@@ -493,13 +511,25 @@ export class UmedaView {
       this.ahead.set(soon.x + this.walkerOff.x, this.Y(soon.y) + base, soon.z + this.walkerOff.z);
       const h = this.lookaheadHeading();
       const headingSoon = h === null ? this.heading : this.heading + angleDelta(this.heading, h) * (1 - Math.exp(-0.35 * 2.4));
-      chasePose(this.collide, { walker: w, heading: this.heading, headingSoon, slopeBehind, slopeAhead, aspect: cam.aspect, fov: cam.fov, ahead: this.ahead }, this.rig, dt, this.pose);
+      const ride = this.liftRide();
+      chasePose(this.collide, { walker: w, heading: this.heading, headingSoon, slopeBehind, slopeAhead, aspect: cam.aspect, fov: cam.fov, ahead: this.ahead, ride }, this.rig, dt, this.pose);
       this.setFigureAlpha(this.pose.figure);
     }
     cam.position.copy(this.pose.pos);
     cam.lookAt(this.pose.target);
     this.controls.target.copy(this.pose.target);
     this.setNear(this.pose.near);
+  }
+
+  /** The lift ride the walker is on (soles at both landings, scene y), or null. */
+  private liftRide(): LiftRide | null {
+    const k = this.walkerSegment(this.walkerT);
+    if (this.edgeKind(this.walkerSegEdge[k] ?? -1) !== 'elevator') return null;
+    const kf = this.walkerTrack;
+    const base = this.walker.position.y - this.Y(sampleKeyframes(kf, this.walkerT).y);
+    this.ride.from = this.Y(kf[k].y) + base;
+    this.ride.to = this.Y(kf[Math.min(k + 1, kf.length - 1)].y) + base;
+    return this.ride;
   }
 
   /** Seeds the spring arm from the current camera position (switching views without a cut). */
@@ -553,7 +583,13 @@ export class UmedaView {
       this.camera.position.copy(this.controls.target).add(this.orbitWanted);
       this.controls.update();
       this.orbitWanted.subVectors(this.camera.position, this.controls.target);
-      orbitPose(this.collide, this.walker.position, this.camera.position, this.rig, dt, this.camera.fov, this.camera.aspect, this.pose);
+      orbitPose(this.collide, this.walker.position, this.camera.position, this.rig, dt, this.camera.fov, this.camera.aspect, this.pose, this.liftRide(), this.heading);
+      // Zoomed out where walls stop the camera: keep the asked-for distance near what it can
+      // reach, so zooming back in answers at once.
+      const reach = this.pose.reach;
+      const cap = Math.max(reach + 4, reach * 1.5, this.controls.minDistance);
+      const asked = this.orbitWanted.length();
+      if (asked > cap) this.orbitWanted.multiplyScalar(cap / asked);
       this.camera.position.copy(this.pose.pos);
       this.camera.lookAt(this.controls.target);
       this.setNear(this.pose.near);
@@ -599,7 +635,8 @@ export class UmedaView {
     const h = this.container.clientHeight;
     const size = Math.round(Math.min(190, w * 0.3, h * 0.32));
     const x = w - size - 14;
-    const bottom = w < 760 ? 70 : 92;
+    // (Above the play bar and the map credit.)
+    const bottom = w < 760 ? 76 : 92;
     this.miniFrame.style.width = `${size}px`;
     this.miniFrame.style.height = `${size}px`;
     this.miniFrame.style.left = `${x}px`;
@@ -1076,6 +1113,9 @@ export class UmedaView {
   private camAnim: { from: THREE.Vector3; to: THREE.Vector3; tFrom: THREE.Vector3; tTo: THREE.Vector3; t: number } | null = null;
 
   private animateCamera(target: THREE.Vector3, position: THREE.Vector3): void {
+    // Walking, the walk camera frames the walker itself (a jump already snapped it there); an
+    // overview flight from it would pass through ceilings and streets.
+    if (this.walkView) return;
     const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
     if (reduce) {
       this.controls.target.copy(target);
@@ -1086,6 +1126,7 @@ export class UmedaView {
   }
 
   setCamera(preset: CameraPreset, animate = true): void {
+    if (this.walkView) return;
     const c = this.center.clone();
     const r = this.radius;
     let pos: THREE.Vector3;
@@ -1364,7 +1405,7 @@ export class UmedaView {
       this.walkCut.target.copy(this.walker.position).y += 1.2;
       // With the collision camera nothing solid stands between it and the walker any more; the
       // shader cut-away (which also clears everything near the lens) is only a fallback.
-      updateWalkway(this.walkGroup, dt, this.walkView === 'first' || this.collide ? null : this.walkCut);
+      updateWalkway(this.walkGroup, dt, this.walkView === 'first' || this.collide ? null : this.walkCut, this.walker.position);
     }
     // Minor labels only when the camera is close enough to read them.
     const camPos = this.camera.position;
