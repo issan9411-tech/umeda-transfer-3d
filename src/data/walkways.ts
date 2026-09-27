@@ -247,6 +247,9 @@ export function addWalkways(b: NetBuilder): void {
   ent('e_yodobashi', 'ヨドバシ梅田', [34.7044, 135.4968], 'f_deck_mid', '2F');
   ent('e_hkdept', '阪急うめだ本店', [34.703, 135.4994], 'f_hk_sw');
   ent('e_gfo', 'グランフロント大阪', [34.7047, 135.4944], 'f_gfo_b1', 'B1');
+  ent('e_ggo', 'グラングリーン大阪 南館', [34.70345, 135.49185], 'f_ggo2', '2F');
+  b.node('e_ggo_b1', 'entrance', 'グラングリーン大阪 南館（地下）', [34.70345, 135.49182], 'B1', { y: -7 });
+  b.walk('e_ggo_b1', 'f_ggo_b1', { indoor: true, name: 'グラングリーン大阪 南館（地下）' });
   ent('e_park', 'うめきた公園', [34.70351, 135.49263], 'f_sp1');
   ent('e_kitte', 'KITTE大阪・JPタワー', [34.70105, 135.4938], 'f_kitte1');
   ent('e_herbis', 'ハービスOSAKA', [34.7003, 135.4944], 'f_dm_w', 'B1');

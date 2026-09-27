@@ -1,8 +1,9 @@
 import { NetBuilder, offset, type LatLon } from './builder';
 
 /**
- * Osaka Metro: 梅田 (御堂筋線, shallow, N–S under the 阪急–阪神 frontage),
- * 東梅田 (谷町線, B2) and 西梅田 (四つ橋線, B2 under 四つ橋筋).
+ * Osaka Metro: 梅田 (御堂筋線, NNW under 御堂筋 / 国道176号 between JR 御堂筋口 and 阪急うめだ本店,
+ * gates on the B1 mall floor), 東梅田 (谷町線, B2) and 西梅田 (四つ橋線, B2 under 四つ橋筋).
+ * Sources: osaka-transfer.com (阪急 → 北改札), the 桜橋口 → ハービス guide (西梅田 北改札).
  */
 
 export function addMidosujiUmeda(b: NetBuilder): void {
@@ -39,7 +40,7 @@ export function addMidosujiUmeda(b: NetBuilder): void {
     b.node(conc, 'vertical', `${name}内コンコース`, concAt, 'B1', { station: st, paid: true, y: -6 });
     b.vertical(stop, conc, ['stairs', 'esc'], { busy, bearingUp: up, anchor: 'top' });
     b.node(inId, 'gate', `御堂筋線 ${name}`, at, 'B1', { station: st, paid: true, label: true, y: -6 });
-    b.walk(conc, inId, { busy });
+    b.walk(conc, inId, { busy, width: 16 });
     b.node(`m_${key}_out`, 'junction', `御堂筋線 ${name}前`, outAt, 'B1', { station: st, y: -6 });
     b.gate(inId, `m_${key}_out`, `御堂筋線梅田 ${name}`, { busy, width: 20 });
   };

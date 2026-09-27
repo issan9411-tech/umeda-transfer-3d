@@ -386,6 +386,8 @@ export function addUmekita(b: NetBuilder): void {
     const okuFoot = `uk_okuFoot_${is.id}`;
     b.node(okuFoot, 'junction', `${is.nameJa} 西口連絡通路寄り階段下`, U(-11, is.side), 'B2', { station: st, paid: true, y: -15 });
     b.platformWalk(stops[is.id].m, okuFoot, { busy: 1, width: 9 * 0.6 });
+    // People bound for the south half of the platform turn straight off the flight towards it.
+    b.platformWalk(stops[is.id].s, okuFoot, { busy: 1, width: 9 * 0.6 });
     b.vertical(stops[is.id].m, hN, ['stairs', 'esc'], { bearingUp: axis, anchor: 'top' });
     b.vertical(okuFoot, hS, ['stairs', 'esc'], { bearingUp: axis + 180, anchor: 'top' });
     b.vertical(stops[is.id].m, ev, ['elev'], { anchor: 'top' });
@@ -445,9 +447,9 @@ export function addKitashinchi(b: NetBuilder): void {
     busy: 2,
     stops: [
       // At the feet of the end banks, so nobody doubles back under a well.
-      { key: 'w', t: 0.18, name: '西寄り（西改札・西梅田方面）' },
+      { key: 'w', t: 0.2, name: '西寄り（西改札・西梅田方面）' },
       { key: 'm', t: 0.5, name: '中ほど' },
-      { key: 'e', t: 0.82, name: '東寄り（東改札・東梅田方面）' },
+      { key: 'e', t: 0.8, name: '東寄り（東改札・東梅田方面）' },
     ],
   });
   // Bank heads 3 m inside the platform ends; the 13 m rise needs ≈25–30 m of run.

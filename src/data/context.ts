@@ -22,7 +22,8 @@ export function addContext(b: NetBuilder): void {
   bl('gfo-n', 'グランフロント大阪 北館', [34.70635, 135.4946], 190, 85, 355);
   bl('inogate', 'イノゲート大阪', [34.7028, 135.49375], 70, 40, 76);
   // A long N–S building over the うめきた underground station box (NAVITIME tenant points), north of イノゲート.
-  bl('ugp', 'うめきたグリーンプレイス', [34.70345, 135.49362], 100, 40, 10, 10);
+  // North of イノゲート across the E–W road (the crossing's north end stays outside).
+  bl('ugp', 'うめきたグリーンプレイス', [34.70358, 135.49365], 76, 40, 10, 10);
   bl('ggo-s', 'グラングリーン大阪 南館', [34.70231, 135.49163], 90, 70, 0);
   bl('kitte', 'JPタワー大阪（KITTE大阪）', [34.7012, 135.4941], 80, 60, 0);
   bl('yodobashi', 'ヨドバシ梅田タワー', [34.70455, 135.49665], 130, 95, 355);
