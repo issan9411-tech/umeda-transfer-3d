@@ -701,6 +701,13 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
       }
     };
 
+    // The floor under the trimmed ends too (plain, no wall shading): walk-space.ts counts the
+    // whole strip from node to node as walkable, and the crowd uses all of it.
+    const endKind: FloorKind = e.kind === 'crossing' ? 'asphalt' : !e.indoor ? 'paver' : na.paid && nb.paid ? 'tile' : 'stone';
+    const endLift = e.kind === 'crossing' ? 0.1 : lift;
+    if (s0 > 0.05) floorPoly(endKind, [at(0, hw, endLift), at(s0, hw, endLift), at(s0, -hw, endLift), at(0, -hw, endLift)]);
+    if (s1 < run - 0.05) floorPoly(endKind, [at(s1, hw, endLift), at(run, hw, endLift), at(run, -hw, endLift), at(s1, -hw, endLift)]);
+
     if (e.kind === 'crossing') {
       floorPoly('asphalt', [at(s0, hw, 0.1), at(s1, hw, 0.1), at(s1, -hw, 0.1), at(s0, -hw, 0.1)]);
       // Zebra bars: 45 cm wide every 90 cm, long axis across the walking direction.
