@@ -331,7 +331,11 @@ export class CrowdSim {
         const side = a.lane < 0 === fwd ? edge.room[0] : edge.room[1];
         room = Math.min(room, side);
       }
-      this.lateral[w] = room > 0 ? a.lane * room : 0;
+      let lat = room > 0 ? a.lane * room : 0;
+      // Through a gate line people use the aisles between the machines (walkway.ts: 0.9 m pitch,
+      // an aisle on the centre line).
+      if (edge.kind === 'gate') lat = Math.round(lat / GATE_AISLE_PITCH) * GATE_AISLE_PITCH;
+      this.lateral[w] = lat;
       w++;
       this.agents[keep++] = a;
     }
@@ -353,6 +357,9 @@ export function hashUnit(n: number): number {
   h ^= h >>> 13;
   return (h >>> 0) / 4294967296;
 }
+
+/** Spacing of fare-gate aisles (walkway.ts draws the machines at this pitch). */
+export const GATE_AISLE_PITCH = 0.9;
 
 /** How far from the centre line people may walk on an edge (metres; 0 on stairs and lifts). */
 export function lateralRoom(kind: string, width: number | undefined): number {

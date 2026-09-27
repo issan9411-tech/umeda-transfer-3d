@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { Graph } from '../core/graph';
 import type { NetEdge, NetNode, Platform } from '../core/types';
+import { lateralRoom } from '../sim/crowd';
 import { CLEARANCE, flightWidth, WalkSpace, type WalkPiece } from './walk-space';
 import * as TX from './walkway-tex';
 import { arrowFor, cabinCycle, destinationsVia, dominantAngle, hash01, isMallEdge, isVertical, laneOffsets, mouthTrims, subtractConvex, type P2, type SignTarget } from './walkway-util';
@@ -889,7 +890,12 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
 
   function addPillars(e: NetEdge, at: (s: number, lat: number, h?: number) => THREE.Vector3, s0: number, s1: number, w: number, H: number): void {
     if (s1 - s0 < 8) return;
-    const lats = [-w * 0.3, w * 0.3];
+    // Pillar rows stand outside the band the crowd walks in (sim/crowd.ts lateralRoom), near the
+    // walls; concourses too narrow for that get none.
+    const band = lateralRoom(e.kind, e.width);
+    const off = Math.min(w / 2 - 1, Math.max(w * 0.3, band + 0.7));
+    if (off < band + 0.6) return;
+    const lats = [-off, off];
     const yaw = yawOf(at(1, 0).sub(at(0, 0)));
     let k = 0;
     const own = not(e.id, `node:${e.a}`, `node:${e.b}`);
