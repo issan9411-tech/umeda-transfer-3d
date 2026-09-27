@@ -10,6 +10,7 @@ import { applyLook, createEnvironment, Lighting, setupRenderer } from './look';
 import { heatColor, KIND_COLORS, readPalette, type ScenePalette } from './palette';
 import { PeopleCrowd, createWalkerFigure, type PeopleOptions, type WalkerFigure } from './people';
 import { buildStations, buildTrainModel } from './station';
+import { chasePose, CollisionWorld, createPose, createRig, firstPersonPose, NEAR_MAX, orbitPose, PIVOT_H } from './walk-camera';
 import {
   angleDelta,
   buildGuideLine,
@@ -51,6 +52,8 @@ const overviewZoom = (dist: number) => Math.min(1, Math.max(0.3, dist / 500));
 const FLOOR_LIFT = 0.09;
 /** Stair flights in the walk scene rise ≈0.94 m per metre (1.5× exaggerated). */
 const WALK_STAIR_SLOPE = 0.9;
+/** Orbit view while walking: the point orbited, above the walker's soles. */
+const ORBIT_FOCUS_H = 1.2;
 
 /** Per-agent crowd state the view draws (CrowdSim satisfies it). */
 export interface CrowdFrame {
@@ -67,6 +70,8 @@ export interface CrowdFrame {
 }
 
 const tmpColor = new THREE.Color();
+const _fwd = new THREE.Vector3();
+const _tgt = new THREE.Vector3();
 
 export class UmedaView {
   readonly g: Graph;
@@ -130,8 +135,22 @@ export class UmedaView {
   private signGroup = new THREE.Group();
   private savedEx = 4;
   private heading = 0;
-  private camPos = new THREE.Vector3();
-  private camTarget = new THREE.Vector3();
+  /** Solid walk-scene triangles the camera keeps out of (rebuilt with the walk scene). */
+  private collide: CollisionWorld | null = null;
+  /** Spring-arm state and the pose it produced this frame. */
+  private rig = createRig();
+  private pose = createPose();
+  /** Orbit view: the camera position the user asked for, before collisions pulled it in. */
+  private orbitWanted = new THREE.Vector3();
+  /** Walker figure opacity (it fades out when the camera closes in behind the head). */
+  private figureAlpha = 1;
+  private figureShown = true;
+  /** Frame-time budget check of the camera solver (ms, smoothed). */
+  cameraMs = 0;
+  /** Route seconds per real second (playback rate, smoothed), to look a moment ahead. */
+  private walkRate = 0;
+  private lastWalkerT = 0;
+  private ahead = new THREE.Vector3();
   private miniCam = new THREE.OrthographicCamera(-160, 160, 160, -160, 1, 6000);
   private miniMarker: THREE.Mesh;
   private miniFrame: HTMLDivElement;
@@ -312,6 +331,8 @@ export class UmedaView {
     );
     if (r) this.buildWalkExtras(r);
     this.applyLook();
+    // Everything solid the walk camera must stay out of, in one hierarchy (≈200k triangles).
+    this.collide = CollisionWorld.fromScene([this.walkGroup, this.trainGroup, this.city?.object]);
   }
 
   /** Trains at both ends of the route and signboards at each instruction. */
@@ -348,6 +369,7 @@ export class UmedaView {
   enterWalk(view: WalkView): void {
     if (!this.routes[this.selected]) return;
     const first = this.walkView === null;
+    const prev = this.walkView;
     this.walkView = view;
     if (first) {
       this.savedEx = this.exaggeration;
@@ -356,8 +378,7 @@ export class UmedaView {
       this.scene.fog = new THREE.Fog(this.lighting.haze, 160, 900);
       this.rebuildAll();
       this.camAnim = null;
-      this.camera.near = 0.3;
-      this.camera.updateProjectionMatrix();
+      this.setNear(NEAR_MAX);
       this.setWalkerScale();
       this.setWalkerTime(this.walkerT);
       this.heading = this.lookaheadHeading() ?? this.heading;
@@ -365,9 +386,17 @@ export class UmedaView {
     }
     this.controls.enabled = view === 'orbit';
     if (view === 'orbit') {
-      this.controls.target.copy(this.walker.position);
-      this.controls.minDistance = 15;
       if (this.camera.position.distanceTo(this.walker.position) > 400) this.snapWalkCamera();
+      this.controls.target.copy(this.walker.position).y += ORBIT_FOCUS_H;
+      // Close zoom is fine indoors; far zoom is pointless (walls stop the camera anyway).
+      this.controls.minDistance = 2;
+      this.controls.maxDistance = 160;
+      this.orbitWanted.subVectors(this.camera.position, this.controls.target);
+      this.rig.len = this.camera.position.distanceTo(this.pose.pivot);
+      this.rig.ready = true;
+    } else if (!first && prev !== view) {
+      // Ease from wherever the camera is now (the arm stays clear on the way).
+      this.rigFromCamera();
     }
     this.walker.visible = view !== 'first' && this.walkerTrack.length > 0;
     this.miniFrame.hidden = false;
@@ -386,10 +415,12 @@ export class UmedaView {
     this.clearGroup(this.signGroup);
     this.exaggeration = this.savedEx;
     this.scene.fog = null;
-    this.camera.near = 1;
-    this.camera.updateProjectionMatrix();
+    this.collide = null;
+    this.setNear(1);
+    this.setFigureAlpha(1);
     this.controls.enabled = true;
     this.controls.minDistance = 40;
+    this.controls.maxDistance = 4000;
     this.setWalkerScale();
     this.walker.visible = this.walkerTrack.length > 0;
     this.miniFrame.hidden = true;
@@ -427,51 +458,140 @@ export class UmedaView {
     return back;
   }
 
-  private walkPose(): { pos: THREE.Vector3; target: THREE.Vector3 } {
+  /** Rise per unit run (scene) of the track 2.5 s behind and ahead of the walker. */
+  private trackSlopes(): [number, number] {
+    const t = this.walkerT;
+    const p0 = sampleKeyframes(this.walkerTrack, t);
+    const pb = sampleKeyframes(this.walkerTrack, t - 2.5);
+    const pa = sampleKeyframes(this.walkerTrack, t + 2.5);
+    const rb = Math.hypot(pb.x - p0.x, pb.z - p0.z);
+    const ra = Math.hypot(pa.x - p0.x, pa.z - p0.z);
+    return [rb > 0.4 ? (this.Y(pb.y) - this.Y(p0.y)) / rb : 0, ra > 0.4 ? (this.Y(pa.y) - this.Y(p0.y)) / ra : 0];
+  }
+
+  /**
+   * Chase / first-person camera for this frame (dt ≤ 0 snaps). The spring arm (walk-camera.ts)
+   * keeps the camera and its near plane out of every wall, ceiling, floor and facade.
+   */
+  private applyWalkPose(dt: number): void {
     const w = this.walker.position;
-    const fwd = new THREE.Vector3(Math.sin(this.heading), 0, Math.cos(this.heading));
+    const cam = this.camera;
+    const fwd = _fwd.set(Math.sin(this.heading), 0, Math.cos(this.heading));
     if (this.walkView === 'first') {
-      const eye = w.clone().add(new THREE.Vector3(0, 1.6 * PEOPLE_SCALE, 0));
       const ahead = sampleKeyframes(this.walkerTrack, this.walkerT + 4);
       const dy = this.Y(ahead.y) - (w.y - FLOOR_LIFT - this.walkerLift);
-      return { pos: eye, target: eye.clone().add(fwd.multiplyScalar(14)).add(new THREE.Vector3(0, dy * 0.7 - 1.2, 0)) };
+      const target = _tgt.copy(w).addScaledVector(fwd, 14);
+      target.y += 1.6 * PEOPLE_SCALE + dy * 0.7 - 1.2;
+      if (dt <= 0) this.rig.target.copy(target);
+      else this.rig.target.lerp(target, 1 - Math.exp(-dt * 5));
+      firstPersonPose(this.collide, w, this.rig.target, cam.fov, cam.aspect, this.pose);
+    } else {
+      const [slopeBehind, slopeAhead] = this.trackSlopes();
+      // Where the walker will be ≈0.4 s from now at the current playback rate (on the track).
+      const soon = sampleKeyframes(this.walkerTrack, this.walkerT + this.walkRate * 0.4);
+      const base = w.y - this.Y(sampleKeyframes(this.walkerTrack, this.walkerT).y);
+      this.ahead.set(soon.x + this.walkerOff.x, this.Y(soon.y) + base, soon.z + this.walkerOff.z);
+      const h = this.lookaheadHeading();
+      const headingSoon = h === null ? this.heading : this.heading + angleDelta(this.heading, h) * (1 - Math.exp(-0.35 * 2.4));
+      chasePose(this.collide, { walker: w, heading: this.heading, headingSoon, slopeBehind, slopeAhead, aspect: cam.aspect, fov: cam.fov, ahead: this.ahead }, this.rig, dt, this.pose);
+      this.setFigureAlpha(this.pose.figure);
     }
-    // Close behind and below the corridor ceiling (walls are 3.2 m × 1.5 high, with light strips
-    // just under the top), so the ceiling never hides the walker; on the way down a flight the
-    // camera stays above the steps behind.
-    const pos = w.clone().sub(fwd.clone().multiplyScalar(8)).add(new THREE.Vector3(0, 3.4, 0));
-    const behind = sampleKeyframes(this.walkerTrack, this.walkerT - 6);
-    pos.y = Math.max(pos.y, this.Y(behind.y) + 2.6);
-    return { pos, target: w.clone().add(fwd.multiplyScalar(7)).add(new THREE.Vector3(0, 1.0, 0)) };
+    cam.position.copy(this.pose.pos);
+    cam.lookAt(this.pose.target);
+    this.controls.target.copy(this.pose.target);
+    this.setNear(this.pose.near);
+  }
+
+  /** Seeds the spring arm from the current camera position (switching views without a cut). */
+  private rigFromCamera(): void {
+    const pivot = _tgt.copy(this.walker.position);
+    pivot.y += PIVOT_H;
+    const d = _fwd.subVectors(this.camera.position, pivot);
+    const len = d.length();
+    if (len < 1e-3) {
+      this.rig.ready = false;
+      return;
+    }
+    this.rig.swing = angleDelta(this.heading + Math.PI, Math.atan2(d.x, d.z));
+    this.rig.pitch = Math.asin(Math.max(-1, Math.min(1, d.y / len)));
+    this.rig.len = len;
+    this.rig.target.copy(this.controls.target);
+    this.rig.ready = true;
   }
 
   private snapWalkCamera(): void {
-    const { pos, target } = this.walkPose();
-    this.camPos.copy(pos);
-    this.camTarget.copy(target);
-    this.camera.position.copy(pos);
-    this.camera.lookAt(target);
-    this.controls.target.copy(target);
+    this.rig.ready = false;
+    if (this.walkView === 'orbit') {
+      // Re-seat the orbit at the chase position (then the user takes over).
+      this.walkView = 'chase';
+      this.applyWalkPose(0);
+      this.walkView = 'orbit';
+      this.controls.target.copy(this.walker.position).y += ORBIT_FOCUS_H;
+      this.orbitWanted.subVectors(this.camera.position, this.controls.target);
+      this.camera.lookAt(this.controls.target);
+      return;
+    }
+    this.applyWalkPose(0);
   }
 
   private updateWalkCamera(dt: number): void {
+    const t0 = performance.now();
+    const step = this.walkerT - this.lastWalkerT;
+    this.lastWalkerT = this.walkerT;
+    if (dt > 0 && Math.abs(step) < 3) this.walkRate += (step / dt - this.walkRate) * Math.min(1, dt * 4);
+    else if (Math.abs(step) >= 3) this.walkRate = 0;
     const h = this.lookaheadHeading();
     if (h !== null) this.heading += angleDelta(this.heading, h) * Math.min(1, dt * 2.4);
     this.miniMarker.position.copy(this.walker.position).setY(this.walker.position.y + 40);
     this.miniMarker.rotation.set(0, this.heading, 0);
     if (this.walkView === 'orbit') {
-      const delta = this.walker.position.clone().sub(this.controls.target).multiplyScalar(Math.min(1, dt * 3));
-      this.controls.target.add(delta);
-      this.camera.position.add(delta);
-      return;
+      // Follow the walker, let OrbitControls apply the user's drag to the unobstructed position,
+      // then pull the camera in front of anything between it and the walker.
+      const focus = _tgt.copy(this.walker.position);
+      focus.y += ORBIT_FOCUS_H;
+      this.controls.target.add(focus.sub(this.controls.target).multiplyScalar(Math.min(1, dt * 3)));
+      this.camera.position.copy(this.controls.target).add(this.orbitWanted);
+      this.controls.update();
+      this.orbitWanted.subVectors(this.camera.position, this.controls.target);
+      orbitPose(this.collide, this.walker.position, this.camera.position, this.rig, dt, this.camera.fov, this.camera.aspect, this.pose);
+      this.camera.position.copy(this.pose.pos);
+      this.camera.lookAt(this.controls.target);
+      this.setNear(this.pose.near);
+      this.setFigureAlpha(this.pose.figure);
+    } else {
+      this.applyWalkPose(dt);
     }
-    const { pos, target } = this.walkPose();
-    const k = 1 - Math.exp(-dt * 5);
-    this.camPos.lerp(pos, k);
-    this.camTarget.lerp(target, k);
-    this.camera.position.copy(this.camPos);
-    this.camera.lookAt(this.camTarget);
-    this.controls.target.copy(this.camTarget);
+    this.cameraMs += (performance.now() - t0 - this.cameraMs) * 0.05;
+  }
+
+  private setNear(near: number): void {
+    if (Math.abs(this.camera.near - near) < 0.002) return;
+    this.camera.near = near;
+    this.camera.updateProjectionMatrix();
+  }
+
+  /** Fades the walker figure (it is hidden below a few percent). */
+  private setFigureAlpha(a: number): void {
+    const q = Math.round(a * 40) / 40;
+    this.figureShown = q > 0.02;
+    this.figure.object.visible = this.figureShown;
+    if (q === this.figureAlpha) return;
+    this.figureAlpha = q;
+    this.figure.object.traverse((o) => {
+      const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+      if (!m) return;
+      for (const mat of Array.isArray(m) ? m : [m]) {
+        const ud = mat.userData;
+        ud.baseOpacity ??= mat.opacity;
+        ud.baseTransparent ??= mat.transparent;
+        const transparent = (ud.baseTransparent as boolean) || q < 0.999;
+        if (mat.transparent !== transparent) {
+          mat.transparent = transparent;
+          mat.needsUpdate = true;
+        }
+        mat.opacity = (ud.baseOpacity as number) * q;
+      }
+    });
   }
 
   private renderMinimap(): void {
@@ -503,7 +623,7 @@ export class UmedaView {
     this.renderer.shadowMap.autoUpdate = true;
     this.renderer.setScissorTest(false);
     if (people) people.visible = true;
-    this.figure.object.visible = true;
+    this.figure.object.visible = this.figureShown;
     this.scene.fog = fog;
     this.renderer.setViewport(0, 0, w, h);
   }
@@ -1069,9 +1189,13 @@ export class UmedaView {
     this.walker.position.set(p.x + this.walkerOff.x, this.Y(p.y) + base, p.z + this.walkerOff.z);
     this.figure.update(Math.min(dt, 5), speed, this.walkerYaw, climb, walking ? WALK_STAIR_SLOPE : undefined);
     // A jump (scrubbing, picking a step) cuts to the new spot instead of flying through walls.
-    if (walking && dt > 3 && this.walkView !== 'orbit') {
+    if (walking && dt > 3) {
       this.heading = this.lookaheadHeading() ?? this.heading;
-      this.snapWalkCamera();
+      if (this.walkView === 'orbit') {
+        // Keep the user's orbit around the walker's new spot (no flight through the walls).
+        this.controls.target.copy(this.walker.position).y += ORBIT_FOCUS_H;
+        this.rig.ready = false;
+      } else this.snapWalkCamera();
     }
   }
 
@@ -1238,7 +1362,9 @@ export class UmedaView {
       // Cut away whatever stands between the following camera and the walker.
       this.walkCut.eye.copy(this.camera.position);
       this.walkCut.target.copy(this.walker.position).y += 1.2;
-      updateWalkway(this.walkGroup, dt, this.walkView === 'first' ? null : this.walkCut);
+      // With the collision camera nothing solid stands between it and the walker any more; the
+      // shader cut-away (which also clears everything near the lens) is only a fallback.
+      updateWalkway(this.walkGroup, dt, this.walkView === 'first' || this.collide ? null : this.walkCut);
     }
     // Minor labels only when the camera is close enough to read them.
     const camPos = this.camera.position;
@@ -1264,7 +1390,8 @@ export class UmedaView {
       const s = (1 + 0.25 * Math.sin(this.pulse * 4)) * ((halo.userData.base as number | undefined) ?? 1);
       halo.scale.set(s, s, s);
     }
-    if (!this.walkView || this.walkView === 'orbit') this.controls.update();
+    // (Walk orbit runs OrbitControls inside updateWalkCamera, before the collision pull-in.)
+    if (!this.walkView) this.controls.update();
     if (this.walkView) this.lighting.setShadowFocus(this.walker.position, 110);
     else this.lighting.setShadowFocus(this.controls.target, this.radius);
     this.city?.update(this.camera, this.walkView ? this.walker.position : this.controls.target, dt);
