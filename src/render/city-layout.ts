@@ -607,6 +607,8 @@ export interface FadeInput {
   /** Route samples (scene coordinates) that should stay visible in the overview. */
   route: { x: number; y: number; z: number }[];
   walk: boolean;
+  /** Walking with a camera that keeps out of solids itself: nothing to cut away around it. */
+  solidCamera?: boolean;
 }
 
 /** Opacity a building settles at in the overview when nothing needs cutting away. */
@@ -616,7 +618,7 @@ export const GHOST_OPACITY = 0.1;
 
 /**
  * Target opacity of one building. Walking: fully solid unless it stands between the camera and
- * the walker, or the camera is inside / grazing it. Overview: semi-solid (`rest`), and ghosted
+ * the walker, or the camera is inside / grazing it (unless it keeps out of solids itself). Overview: semi-solid (`rest`), and ghosted
  * when it hides (or stands on) part of the selected route.
  */
 export function fadeTarget(parts: Prism[], o: FadeInput, rest = OVERVIEW_OPACITY): number {
@@ -624,7 +626,7 @@ export function fadeTarget(parts: Prism[], o: FadeInput, rest = OVERVIEW_OPACITY
   const ghost = o.walk ? GHOST_OPACITY * 0.7 : GHOST_OPACITY;
   for (let i = 0; i < parts.length; i++) {
     const b = parts[i];
-    if (distanceToPrism(c.x, c.y, c.z, b) < (o.walk ? 3 : 10)) return ghost;
+    if (!(o.walk && o.solidCamera) && distanceToPrism(c.x, c.y, c.z, b) < (o.walk ? 3 : 10)) return ghost;
     if (segmentHitsPrism(c.x, c.y, c.z, f.x, f.y, f.z, b, o.walk ? 0.4 : 0)) return ghost;
   }
   if (o.walk) {

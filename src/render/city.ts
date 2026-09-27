@@ -108,6 +108,18 @@ export interface City {
   stats(): { drawCalls: number; triangles: number; buildings: number; vehicles: number; trees: number };
   /** Current opacity of each building (fade system), for tests and tools. */
   buildingFade(id: string): number | null;
+  /**
+   * The walk camera keeps out of solids itself (walk-camera.ts): no cut-away around it and no
+   * hole in the street over an underground walker, only buildings in its sight line or around
+   * the walker. Off by default.
+   */
+  setSolidCamera(on: boolean): void;
+  /**
+   * What the walk camera collides with, as it stands at rest: every building whatever is cut
+   * away at the moment (sharing the drawn vertex buffers), the street level and the viaducts, in
+   * scene coordinates. Built on first call.
+   */
+  solidMeshes(): THREE.Mesh[];
   dispose(): void;
 }
 
@@ -2086,7 +2098,8 @@ export function buildCity(net: Network, opts: CityOptions): City {
   let time = 0;
   const route: THREE.Vector3[] = [];
   const camPos = new THREE.Vector3();
-  const fadeIn = { camera: camPos, focus: new THREE.Vector3(), route, walk };
+  const fadeIn = { camera: camPos, focus: new THREE.Vector3(), route, walk, solidCamera: false };
+  let atRest: THREE.Mesh[] | null = null;
   const mat4 = new THREE.Matrix4();
   // Fade bookkeeping (allocation-free per frame).
   const grid = new BoxGrid(
@@ -2362,7 +2375,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
       updateFades(dt);
       if (walk) {
         hideTreesNear(fadeIn.focus);
-        const cut = streetPiercing(camPos, focus, pierce);
+        const cut = !fadeIn.solidCamera && streetPiercing(camPos, focus, pierce);
         revealR = approach(revealR, cut ? 15 : 0, dt, 8);
         if (cut) uReveal.value.set(pierce.x, pierce.z, revealR, 0);
         else uReveal.value.z = revealR;
@@ -2406,6 +2419,19 @@ export function buildCity(net: Network, opts: CityOptions): City {
     buildingFade(id) {
       const i = idIndex.get(id);
       return i === undefined ? null : fade[i];
+    },
+    setSolidCamera(on) {
+      fadeIn.solidCamera = on;
+    },
+    solidMeshes() {
+      // The solid pass's index is fixed (every building resting solid, all of them when walking);
+      // faded ones are folded away in its shader only, so its geometry is the city at rest.
+      atRest ??= passGeos.map((pg, i) => {
+        const m = new THREE.Mesh(pg.solid, passMeshes[i * 2].material);
+        m.name = passMeshes[i * 2].name;
+        return m;
+      });
+      return [...atRest, ...group.children.filter((o): o is THREE.Mesh => (o as THREE.Mesh).isMesh && (o.name === 'city-ground' || o.name === 'city-viaducts'))];
     },
     dispose() {
       group.removeFromParent();

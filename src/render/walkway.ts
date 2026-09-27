@@ -241,6 +241,11 @@ interface WalkState {
   cabins: THREE.InstancedMesh | null;
   /** Per cabin: x, z, yaw, y0, y1, height, phase, travel, dwell. */
   cabinData: Float32Array;
+  /** Per cabin, its glass shaft. */
+  shafts: LiftShaft[];
+  /** Per cabin: floor height it was called to, and how far it has gone there (0 = own cycle). */
+  cabinFloor: Float32Array;
+  cabinCall: Float32Array;
   cut: CutUniforms;
   textures: THREE.Texture[];
 }
@@ -413,6 +418,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
   const glow = new Boxes();
   const cabins = new Boxes();
   const cabinData: number[] = [];
+  const shafts: LiftShaft[] = [];
   const signs: SignSpec[] = [];
   const faces: TX.SignEntry[][] = [];
 
@@ -1490,6 +1496,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     const ch = 2.4 * ex;
     cabins.add(S.clone().setY(y0 + ch / 2), _s.set(2.1, ch, 2.1), yaw, c.steel);
     cabinData.push(S.x, S.z, yaw, y0 + 0.02, y1 + 0.02, ch, hash01(e.id) * 40, 3 + Math.abs(y1 - y0) / ex * 0.5, 5);
+    shafts.push({ x: S.x, z: S.z, y0: y0 - 0.2, y1: top + 0.24, half: hs, yaw, edge: e.id });
   }
 
   // ------------------------------------------------------------------ materials and meshes
@@ -1569,10 +1576,12 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     boxes.mesh(withCut(new THREE.MeshLambertMaterial(), cut), 'fittings'),
     glow.mesh(withCut(new THREE.MeshBasicMaterial(), cut), 'lamps'),
   ];
-  const cabinMesh = cabins.mesh(withCut(new THREE.MeshLambertMaterial(), cut), 'elevator-cabins');
+  // Glass cabins (like the shafts), so the walker riding one stays in sight.
+  const cabinMesh = cabins.mesh(withCut(new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.42, depthWrite: false }), cut), 'elevator-cabins');
   if (cabinMesh) {
     cabinMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     cabinMesh.frustumCulled = false;
+    cabinMesh.renderOrder = 3;
     meshes.push(cabinMesh);
   }
   for (const m of meshes) {
@@ -1581,17 +1590,31 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     group.add(m);
   }
 
-  const state: WalkState = { time: 0, esc: tex.esc, cabins: cabinMesh, cabinData: new Float32Array(cabinData), cut, textures };
+  const state: WalkState = {
+    time: 0,
+    esc: tex.esc,
+    cabins: cabinMesh,
+    cabinData: new Float32Array(cabinData),
+    shafts,
+    cabinFloor: new Float32Array(shafts.length),
+    cabinCall: new Float32Array(shafts.length),
+    cut,
+    textures,
+  };
   group.userData.walkway = state;
   return group;
 }
 
+/** A cabin comes to meet the walker when he is this close to its shaft (plan, scene units). */
+const CABIN_CALL = 6;
+
 /**
  * Per-frame animation: escalator treads, elevator cabins and the chase-camera cut-away (pass the
- * camera position and a point on the walker; null disables it, e.g. in first person).
- * Allocation-free.
+ * camera position and a point on the walker; null disables it, e.g. in first person). A lift the
+ * walker (`rider`: his soles) comes up to is called to his floor and carries him, then goes back
+ * to its own cycle once he has walked on. Allocation-free.
  */
-export function updateWalkway(group: THREE.Object3D, dt: number, cut: WalkCut | null = null): void {
+export function updateWalkway(group: THREE.Object3D, dt: number, cut: WalkCut | null = null, rider: THREE.Vector3 | null = null): void {
   const s = group.userData.walkway as WalkState | undefined;
   if (!s) return;
   s.time += dt;
@@ -1603,7 +1626,14 @@ export function updateWalkway(group: THREE.Object3D, dt: number, cut: WalkCut | 
     for (let i = 0; i * CABIN_STRIDE < d.length; i++) {
       const k = i * CABIN_STRIDE;
       const f = cabinCycle(s.time + d[k + 6], d[k + 7], d[k + 8]);
-      _p.set(d[k], d[k + 3] + (d[k + 4] - d[k + 3]) * f + d[k + 5] / 2, d[k + 1]);
+      let floor = d[k + 3] + (d[k + 4] - d[k + 3]) * f;
+      // Called by the walker: follow his soles between the landings (blended in and out).
+      const called = !!rider && Math.hypot(rider.x - d[k], rider.z - d[k + 1]) < CABIN_CALL && rider.y > d[k + 3] - 2 && rider.y < d[k + 4] + 2;
+      if (called) s.cabinFloor[i] = Math.min(d[k + 4], Math.max(d[k + 3], rider.y - 0.07));
+      s.cabinCall[i] += ((called ? 1 : 0) - s.cabinCall[i]) * (1 - Math.exp(-Math.max(0, dt) * 2.5));
+      if (dt > 3) s.cabinCall[i] = called ? 1 : 0;
+      floor += (s.cabinFloor[i] - floor) * s.cabinCall[i];
+      _p.set(d[k], floor + d[k + 5] / 2, d[k + 1]);
       _q.setFromEuler(_e.set(0, d[k + 2], 0));
       _m.compose(_p, _q, _s.set(2.1, d[k + 5], 2.1));
       m.setMatrixAt(i, _m);
@@ -1617,6 +1647,25 @@ export function updateWalkway(group: THREE.Object3D, dt: number, cut: WalkCut | 
   } else {
     s.cut.uCutR.value = 0;
   }
+}
+
+/**
+ * A glass lift shaft of a walk scene: axis (x, z), from just below its lowest landing (y0) to its
+ * roof (y1), half width, yaw of its faces (one faces sin/cos of it) and the elevator edge it serves.
+ */
+export interface LiftShaft {
+  x: number;
+  z: number;
+  y0: number;
+  y1: number;
+  half: number;
+  yaw: number;
+  edge: string;
+}
+
+/** The lift shafts `buildWalkway` laid out (the walk camera keeps out of them). */
+export function liftShafts(group: THREE.Object3D): LiftShaft[] {
+  return (group.userData.walkway as WalkState | undefined)?.shafts ?? [];
 }
 
 /** Frees every geometry, material and texture created by `buildWalkway`. */

@@ -37,8 +37,11 @@ export class Soup {
           if (Math.abs(inst.determinant()) < 1e-12) continue; // hidden (zero-scaled) instance
           m4.multiply(inst);
         }
-        const nt = idx ? idx.count / 3 : pos.count / 3;
-        for (let t = 0; t < nt; t++) {
+        // Only the drawn range (the city's per-pass index lists are longer than what they draw).
+        const total = idx ? idx.count : pos.count;
+        const first = Math.min(total, Math.max(0, geo.drawRange.start));
+        const last = Math.min(total, first + Math.max(0, geo.drawRange.count));
+        for (let t = Math.ceil(first / 3); t < Math.floor(last / 3); t++) {
           const i0 = idx ? idx.getX(t * 3) : t * 3;
           const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
           const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;

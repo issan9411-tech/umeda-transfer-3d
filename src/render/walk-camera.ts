@@ -6,9 +6,11 @@ import * as THREE from 'three';
  *
  * - `CollisionWorld`: every solid triangle of the walk scene (walkway walls, glass, shopfronts,
  *   fittings, signs, ceilings, floors, flights; station structure, shell and glass; trains; the
- *   city's street level, solid facades and roofs), picked by mesh name so it follows whatever the
- *   renderers build, in one bounding volume hierarchy built once per walk scene (≈200k triangles,
- *   ≈0.3 s). Swept-sphere, ray and clearance queries take microseconds and allocate nothing.
+ *   city's street level, viaducts and every building as it stands at rest, whatever is cut away
+ *   at the moment), picked by mesh name so it follows whatever the renderers build, in bounding
+ *   volume hierarchies: one per walk scene and one per city, kept across walk-scene rebuilds.
+ *   Swept-sphere, ray and clearance queries take microseconds and allocate nothing. It also knows
+ *   the lift shafts (walkway.ts): the camera keeps out of them, since their cabins run there.
  * - `chasePose` / `firstPersonPose` / `orbitPose`: pure camera solvers shared by the view and the
  *   regression test (tests/walk-camera.test.ts).
  *
@@ -22,11 +24,18 @@ import * as THREE from 'three';
  * on, the arm turning at a corner), and lets out slowly. When it gets very short the figure fades
  * out and the camera slides to the eye rather than into the head. The near plane opens up to 0.3
  * where there is room and closes to 0.08 in tight spots.
+ *
+ * Lift shafts are glass boxes the camera never enters (the cabins run in them), not even at the
+ * eye. While the walker stands in one, the arm may pass its glass, so the camera waits on the
+ * landing outside and looks in; while he rides, it holds a spot on a landing (over its floor) that
+ * sees him and cuts once to the landing he is riding to, where it also sees him step out of the
+ * door. While he steps out, or waits beside the shaft, a camera left where it was may still look
+ * at him through that shaft's glass (never through any other glass, and the arm never passes it).
  */
 
 /** Mesh names that stop the camera (dynamic things such as lift cabins and cars do not). */
 export const CAMERA_SOLID =
-  /^(walls|shopfronts|glass|fittings|signs|ceilings|stairs|escalator-treads|floor-(tile|stone|paver|asphalt)|station-(structure|shell|glass|roof-top)|track-(ballast|slab)|train-bodies|train|city-ground|city-[a-z]+-solid)$/;
+  /^(walls|shopfronts|glass|fittings|signs|ceilings|stairs|escalator-treads|floor-(tile|stone|paver|asphalt)|station-(structure|shell|glass|roof-top)|track-(ballast|slab)|train-bodies|train|city-ground|city-viaducts|city-[a-z]+-solid)$/;
 
 /** Collision tag of a mesh: its name (route-end trains are unnamed children of a 'train' group). */
 export function cameraTag(mesh: THREE.Object3D): string | null {
@@ -34,20 +43,207 @@ export function cameraTag(mesh: THREE.Object3D): string | null {
   return CAMERA_SOLID.test(name) ? name : null;
 }
 
+/** Walkway glass (lift shafts among it): the arm may look into the shaft the walker stands in. */
+const GLASS = 1;
+
+/**
+ * A lift shaft (walkway.ts `liftShafts`): a square glass box of half width `half` around a
+ * vertical axis at (x, z), from y0 (below the lowest landing) to y1 (its roof); one pair of its
+ * faces looks along (sin yaw, cos yaw).
+ */
+export interface Shaft {
+  x: number;
+  z: number;
+  y0: number;
+  y1: number;
+  half: number;
+  yaw: number;
+}
+
 // ---------------------------------------------------------------- collision world
 
 const LEAF = 4;
 
-function visibleInWorld(o: THREE.Object3D): boolean {
-  for (let x: THREE.Object3D | null = o; x; x = x.parent) if (!x.visible) return false;
+/** Visible, with every ancestor up to (and including) `root`. */
+function visibleUnder(o: THREE.Object3D, root: THREE.Object3D): boolean {
+  for (let x: THREE.Object3D | null = o; x; x = x.parent) {
+    if (!x.visible) return false;
+    if (x === root) break;
+  }
   return true;
 }
 
 /**
- * Static triangle BVH of the solid walk scene. Positions are world (scene) coordinates; all
- * faces count from both sides.
+ * Solid triangles of the camera, in bounding volume hierarchies (one per part: the walk scene,
+ * the city). Positions are world (scene) coordinates; all faces count from both sides.
  */
 export class CollisionWorld {
+  private readonly parts: Bvh[];
+  /** Vertical component of the normal of the triangle the last `raycast` hit (0 if none). */
+  hitNormalY = 0;
+  /** Closest solid point found by the last `clearance` query (valid when it found one). */
+  readonly closest = new THREE.Vector3();
+  readonly triangles: number;
+  /** Milliseconds spent building (collect + hierarchy), all parts. */
+  readonly buildMs: number;
+  /** Lift shafts the camera keeps out of (and may look into through their glass). */
+  shafts: readonly Shaft[] = [];
+
+  /** `tris`: 9 floats per triangle; `flags` (optional): per triangle, GLASS for walkway glass. */
+  constructor(tris: Float32Array, buildMs = 0, flags?: Uint8Array) {
+    this.parts = [new Bvh(tris, flags ?? new Uint8Array(tris.length / 9))];
+    this.triangles = this.parts[0].n;
+    this.buildMs = buildMs + this.parts[0].buildMs;
+  }
+
+  /** One world over several (shared) parts, e.g. a walk scene and the city it stands in. */
+  static join(parts: readonly (CollisionWorld | null | undefined)[]): CollisionWorld {
+    const w = Object.create(CollisionWorld.prototype) as CollisionWorld;
+    const bvhs = parts.flatMap((p) => (p ? p.parts : []));
+    Object.assign(w, {
+      parts: bvhs.length ? bvhs : [new Bvh(new Float32Array(0), new Uint8Array(0))],
+      hitNormalY: 0,
+      closest: new THREE.Vector3(),
+      triangles: bvhs.reduce((s, b) => s + b.n, 0),
+      buildMs: parts.reduce((s, p) => s + (p ? p.buildMs : 0), 0),
+      shafts: parts.flatMap((p) => (p ? p.shafts : [])),
+    });
+    return w;
+  }
+
+  /**
+   * Collects the solid triangles of every visible mesh under `roots` whose tag (see
+   * `cameraTag`) is accepted: each drawn instance of instanced meshes, only the drawn range of
+   * each geometry (`drawRange`), and a geometry shared by several meshes at the same place once.
+   */
+  static fromScene(roots: readonly (THREE.Object3D | null | undefined)[], tagOf: (m: THREE.Mesh) => string | null = cameraTag): CollisionWorld {
+    const t0 = now();
+    const chunks: Float32Array[] = [];
+    const flagChunks: { n: number; flag: number }[] = [];
+    let total = 0;
+    const m4 = new THREE.Matrix4();
+    const inst = new THREE.Matrix4();
+    const v = new THREE.Vector3();
+    const seen = new Map<THREE.BufferGeometry, THREE.Matrix4[]>();
+    for (const root of roots) {
+      if (!root) continue;
+      root.updateMatrixWorld(true);
+      root.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (!mesh.isMesh || !mesh.geometry) return;
+        const tag = tagOf(mesh);
+        if (!tag || !visibleUnder(mesh, root)) return;
+        const geo = mesh.geometry;
+        const pos = geo.getAttribute('position');
+        if (!pos) return;
+        // Two passes drawing one geometry (or one mesh reached from two roots): collect it once.
+        const im = mesh as THREE.InstancedMesh;
+        if (!im.isInstancedMesh) {
+          const at = seen.get(geo);
+          if (at?.some((m) => m.equals(mesh.matrixWorld))) return;
+          if (at) at.push(mesh.matrixWorld.clone());
+          else seen.set(geo, [mesh.matrixWorld.clone()]);
+        }
+        const index = geo.getIndex();
+        const count = index ? index.count : pos.count;
+        const first = Math.min(count, Math.max(0, geo.drawRange.start));
+        const last = Math.min(count, first + Math.max(0, geo.drawRange.count));
+        const t0i = Math.ceil(first / 3);
+        const nt = Math.max(0, Math.floor(last / 3) - t0i);
+        const copies = im.isInstancedMesh ? im.count : 1;
+        const out = new Float32Array(nt * 9 * copies);
+        let w = 0;
+        for (let c = 0; c < copies; c++) {
+          m4.copy(mesh.matrixWorld);
+          if (im.isInstancedMesh) {
+            im.getMatrixAt(c, inst);
+            if (Math.abs(inst.determinant()) < 1e-12) continue; // hidden instance
+            m4.multiply(inst);
+          }
+          for (let t = t0i; t < t0i + nt; t++) {
+            for (let k = 0; k < 3; k++) {
+              const vi = index ? index.getX(t * 3 + k) : t * 3 + k;
+              v.fromBufferAttribute(pos, vi).applyMatrix4(m4);
+              out[w++] = v.x;
+              out[w++] = v.y;
+              out[w++] = v.z;
+            }
+            // Drop degenerate slivers (they have no plane to collide with).
+            const b = w - 9;
+            const e1x = out[b + 3] - out[b], e1y = out[b + 4] - out[b + 1], e1z = out[b + 5] - out[b + 2]; // prettier-ignore
+            const e2x = out[b + 6] - out[b], e2y = out[b + 7] - out[b + 1], e2z = out[b + 8] - out[b + 2]; // prettier-ignore
+            const cx = e1y * e2z - e1z * e2y;
+            const cy = e1z * e2x - e1x * e2z;
+            const cz = e1x * e2y - e1y * e2x;
+            if (cx * cx + cy * cy + cz * cz < 1e-12) w -= 9;
+          }
+        }
+        if (w > 0) {
+          chunks.push(out.subarray(0, w));
+          flagChunks.push({ n: w / 9, flag: tag === 'glass' ? GLASS : 0 });
+          total += w;
+        }
+      });
+    }
+    const tris = new Float32Array(total);
+    const flags = new Uint8Array(total / 9);
+    let o = 0;
+    chunks.forEach((c, i) => {
+      tris.set(c, o);
+      flags.fill(flagChunks[i].flag, o / 9, o / 9 + flagChunks[i].n);
+      o += c.length;
+    });
+    return new CollisionWorld(tris, now() - t0, flags);
+  }
+
+  /**
+   * Sweeps a sphere of radius r from a to b; returns the fraction of the way (0..1) at which
+   * it first touches a solid, 1 when the whole way is free, 0 when it already overlaps at a.
+   * Glass lying wholly inside `pass` (x0, z0, x1, z1) does not count.
+   */
+  sweep(ax: number, ay: number, az: number, bx: number, by: number, bz: number, r: number, pass: Float32Array | null = null): number {
+    let best = 1;
+    for (const p of this.parts) {
+      best = p.sweep(ax, ay, az, bx, by, bz, r, best, pass);
+      if (best <= 0) return 0;
+    }
+    return best;
+  }
+
+  /**
+   * Distance along the unit direction (dx, dy, dz) to the first solid, or maxT when none; the
+   * hit face's normal.y is left in `hitNormalY`. Glass wholly inside `pass` does not count.
+   */
+  raycast(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, maxT: number, pass: Float32Array | null = null): number {
+    let best = 1;
+    let ny = 0;
+    for (const p of this.parts) {
+      const f = p.raycast(ox, oy, oz, dx * maxT, dy * maxT, dz * maxT, best, pass);
+      if (f < best) {
+        best = f;
+        ny = p.hitNormalY;
+      }
+    }
+    this.hitNormalY = best < 1 ? ny : 0;
+    return best * maxT;
+  }
+
+  /** Distance from p to the nearest solid, or maxD when nothing is closer. */
+  clearance(px: number, py: number, pz: number, maxD: number): number {
+    let best2 = maxD * maxD;
+    for (const p of this.parts) {
+      const d2 = p.clearance2(px, py, pz, best2);
+      if (d2 < best2) {
+        best2 = d2;
+        this.closest.copy(p.closest);
+      }
+    }
+    return Math.sqrt(best2);
+  }
+}
+
+/** One static triangle hierarchy (see CollisionWorld). */
+class Bvh {
   /** 9 floats per triangle, in BVH leaf order. */
   private tri: Float32Array;
   /** Unit normal and plane offset per triangle (n·p + d = 0). */
@@ -56,22 +252,24 @@ export class CollisionWorld {
   private box: Float32Array;
   /** Per node: triangle count (0 = inner node) and first triangle / right child. */
   private node: Int32Array;
+  /** Per triangle (leaf order): GLASS or 0. */
+  private flag: Uint8Array;
   private stack = new Int32Array(128);
-  /** Vertical component of the normal of the triangle the last `raycast` hit (0 if none). */
+  /** Vertical component of the normal of the triangle the last `raycast` hit. */
   hitNormalY = 0;
-  /** Closest solid point found by the last `clearance` query (valid when it found one). */
+  /** Closest solid point found by the last `clearance2` query that found one. */
   readonly closest = new THREE.Vector3();
   private cx = 0;
   private cy = 0;
   private cz = 0;
-  readonly triangles: number;
-  /** Milliseconds spent building (collect + hierarchy). */
+  readonly n: number;
+  /** Milliseconds spent building the hierarchy. */
   readonly buildMs: number;
 
-  constructor(tris: Float32Array, buildMs = 0) {
+  constructor(tris: Float32Array, flags: Uint8Array) {
     const t0 = now();
     const n = tris.length / 9;
-    this.triangles = n;
+    this.n = n;
     const idx = new Uint32Array(n);
     const cen = new Float32Array(n * 3);
     const tb = new Float32Array(n * 6);
@@ -169,12 +367,14 @@ export class CollisionWorld {
     }
     this.box = box.slice(0, count * 6);
     this.node = node.slice(0, count * 2);
-    // Triangles and planes in leaf order (the hierarchy then walks memory front to back).
+    // Triangles, planes and flags in leaf order (the hierarchy then walks memory front to back).
     this.tri = new Float32Array(n * 9);
     this.pln = new Float32Array(n * 4);
+    this.flag = new Uint8Array(n);
     for (let j = 0; j < n; j++) {
       const s = idx[j] * 9;
       const d = j * 9;
+      this.flag[j] = flags[idx[j]];
       for (let k = 0; k < 9; k++) this.tri[d + k] = tris[s + k];
       const ax = tris[s], ay = tris[s + 1], az = tris[s + 2]; // prettier-ignore
       const e1x = tris[s + 3] - ax, e1y = tris[s + 4] - ay, e1z = tris[s + 5] - az; // prettier-ignore
@@ -191,80 +391,24 @@ export class CollisionWorld {
       this.pln[j * 4 + 2] = nz;
       this.pln[j * 4 + 3] = -(nx * ax + ny * ay + nz * az);
     }
-    this.buildMs = buildMs + (now() - t0);
+    this.buildMs = now() - t0;
   }
 
-  /**
-   * Collects the solid triangles of every visible mesh under `roots` whose tag (see
-   * `cameraTag`) is accepted, including each drawn instance of instanced meshes.
-   */
-  static fromScene(roots: readonly (THREE.Object3D | null | undefined)[], tagOf: (m: THREE.Mesh) => string | null = cameraTag): CollisionWorld {
-    const t0 = now();
-    const chunks: Float32Array[] = [];
-    let total = 0;
-    const m4 = new THREE.Matrix4();
-    const inst = new THREE.Matrix4();
-    const v = new THREE.Vector3();
-    for (const root of roots) {
-      if (!root) continue;
-      root.updateMatrixWorld(true);
-      root.traverse((o) => {
-        const mesh = o as THREE.Mesh;
-        if (!mesh.isMesh || !mesh.geometry || !tagOf(mesh) || !visibleInWorld(mesh)) return;
-        const geo = mesh.geometry;
-        const pos = geo.getAttribute('position');
-        if (!pos) return;
-        const index = geo.getIndex();
-        const nt = Math.floor((index ? index.count : pos.count) / 3);
-        const im = mesh as THREE.InstancedMesh;
-        const copies = im.isInstancedMesh ? im.count : 1;
-        const out = new Float32Array(nt * 9 * copies);
-        let w = 0;
-        for (let c = 0; c < copies; c++) {
-          m4.copy(mesh.matrixWorld);
-          if (im.isInstancedMesh) {
-            im.getMatrixAt(c, inst);
-            if (Math.abs(inst.determinant()) < 1e-12) continue; // hidden instance
-            m4.multiply(inst);
-          }
-          for (let t = 0; t < nt; t++) {
-            for (let k = 0; k < 3; k++) {
-              const vi = index ? index.getX(t * 3 + k) : t * 3 + k;
-              v.fromBufferAttribute(pos, vi).applyMatrix4(m4);
-              out[w++] = v.x;
-              out[w++] = v.y;
-              out[w++] = v.z;
-            }
-            // Drop degenerate slivers (they have no plane to collide with).
-            const b = w - 9;
-            const e1x = out[b + 3] - out[b], e1y = out[b + 4] - out[b + 1], e1z = out[b + 5] - out[b + 2]; // prettier-ignore
-            const e2x = out[b + 6] - out[b], e2y = out[b + 7] - out[b + 1], e2z = out[b + 8] - out[b + 2]; // prettier-ignore
-            const cx = e1y * e2z - e1z * e2y;
-            const cy = e1z * e2x - e1x * e2z;
-            const cz = e1x * e2y - e1y * e2x;
-            if (cx * cx + cy * cy + cz * cz < 1e-12) w -= 9;
-          }
-        }
-        if (w > 0) {
-          chunks.push(out.subarray(0, w));
-          total += w;
-        }
-      });
+  /** Glass triangle t lying wholly inside the plan box `pass` (x0, z0, x1, z1)? */
+  private passes(t: number, pass: Float32Array): boolean {
+    if (!(this.flag[t] & GLASS)) return false;
+    const T = this.tri;
+    const k = t * 9;
+    for (let i = 0; i < 9; i += 3) {
+      const x = T[k + i];
+      const z = T[k + i + 2];
+      if (x < pass[0] || x > pass[2] || z < pass[1] || z > pass[3]) return false;
     }
-    const tris = new Float32Array(total);
-    let o = 0;
-    for (const c of chunks) {
-      tris.set(c, o);
-      o += c.length;
-    }
-    return new CollisionWorld(tris, now() - t0);
+    return true;
   }
 
-  /**
-   * Sweeps a sphere of radius r from a to b; returns the fraction of the way (0..1) at which
-   * it first touches a solid, 1 when the whole way is free, 0 when it already overlaps at a.
-   */
-  sweep(ax: number, ay: number, az: number, bx: number, by: number, bz: number, r: number): number {
+  /** Sweep (see CollisionWorld.sweep) that only looks for contacts before `limit`. */
+  sweep(ax: number, ay: number, az: number, bx: number, by: number, bz: number, r: number, limit: number, pass: Float32Array | null): number {
     const dx = bx - ax;
     const dy = by - ay;
     const dz = bz - az;
@@ -274,7 +418,7 @@ export class CollisionWorld {
     const box = this.box;
     const node = this.node;
     const st = this.stack;
-    let best = 1;
+    let best = limit;
     let sp = 0;
     st[sp++] = 0;
     while (sp > 0) {
@@ -285,6 +429,7 @@ export class CollisionWorld {
       const off = node[ni * 2 + 1];
       if (cnt > 0) {
         for (let t = off; t < off + cnt; t++) {
+          if (pass && this.passes(t, pass)) continue;
           const h = this.sweepTri(t, ax, ay, az, dx, dy, dz, r, best);
           if (h < best) {
             best = h;
@@ -300,21 +445,18 @@ export class CollisionWorld {
   }
 
   /**
-   * Distance along the unit direction (dx, dy, dz) to the first solid, or maxT when none; the
-   * hit face's normal.y is left in `hitNormalY`.
+   * First solid along the segment o → o + s before fraction `limit` (its fraction, else
+   * `limit`); the hit face's normal.y is left in `hitNormalY`.
    */
-  raycast(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, maxT: number): number {
-    const ix = dx !== 0 ? 1 / (dx * maxT) : Infinity;
-    const iy = dy !== 0 ? 1 / (dy * maxT) : Infinity;
-    const iz = dz !== 0 ? 1 / (dz * maxT) : Infinity;
+  raycast(ox: number, oy: number, oz: number, sx: number, sy: number, sz: number, limit: number, pass: Float32Array | null): number {
+    const ix = sx !== 0 ? 1 / sx : Infinity;
+    const iy = sy !== 0 ? 1 / sy : Infinity;
+    const iz = sz !== 0 ? 1 / sz : Infinity;
     const box = this.box;
     const node = this.node;
     const st = this.stack;
     const tri = this.tri;
-    const sx = dx * maxT;
-    const sy = dy * maxT;
-    const sz = dz * maxT;
-    let best = 1;
+    let best = limit;
     let bestTri = -1;
     let sp = 0;
     st[sp++] = 0;
@@ -328,7 +470,7 @@ export class CollisionWorld {
         for (let t = off; t < off + cnt; t++) {
           const k = t * 9;
           const f = segTri(ox, oy, oz, sx, sy, sz, tri[k], tri[k + 1], tri[k + 2], tri[k + 3], tri[k + 4], tri[k + 5], tri[k + 6], tri[k + 7], tri[k + 8]);
-          if (f >= 0 && f < best) {
+          if (f >= 0 && f < best && !(pass && this.passes(t, pass))) {
             best = f;
             bestTri = t;
           }
@@ -338,16 +480,15 @@ export class CollisionWorld {
         st[sp++] = ni + 1;
       }
     }
-    this.hitNormalY = bestTri >= 0 ? this.pln[bestTri * 4 + 1] : 0;
-    return best * maxT;
+    if (bestTri >= 0) this.hitNormalY = this.pln[bestTri * 4 + 1];
+    return best;
   }
 
-  /** Distance from p to the nearest solid, or maxD when nothing is closer. */
-  clearance(px: number, py: number, pz: number, maxD: number): number {
+  /** Squared distance from p to the nearest triangle closer than √best2, else best2 (`closest` set when found). */
+  clearance2(px: number, py: number, pz: number, best2: number): number {
     const box = this.box;
     const node = this.node;
     const st = this.stack;
-    let best2 = maxD * maxD;
     let sp = 0;
     st[sp++] = 0;
     while (sp > 0) {
@@ -372,7 +513,7 @@ export class CollisionWorld {
         st[sp++] = ni + 1;
       }
     }
-    return Math.sqrt(best2);
+    return best2;
   }
 
   /** Squared distance from p to triangle t (Ericson, Real-Time Collision Detection 5.1.5). */
@@ -648,10 +789,15 @@ function segTri(
 
 // ---------------------------------------------------------------- camera solvers
 
-/** Height of the spring arm's pivot above the walker's soles (upper chest; scene units). */
-export const PIVOT_H = 1.75;
-/** First-person eye height above the soles (1.6 m × the walk-mode people scale). */
-export const EYE_H = 2.0;
+/**
+ * Walk-mode size of the figures (the walker and the crowd; view.ts): a little above real size,
+ * between the real horizontal scale and the 1.5× vertical exaggeration.
+ */
+export const PEOPLE_SCALE = 1.25;
+/** Height of the spring arm's pivot above the walker's soles: his upper chest (1.4 m, scaled). */
+export const PIVOT_H = 1.4 * PEOPLE_SCALE;
+/** First-person eye height above the soles (1.6 m, scaled). */
+export const EYE_H = 1.6 * PEOPLE_SCALE;
 /** Radius kept free around the camera: the near plane's corners plus a 0.1 margin. */
 export const CAMERA_RADIUS = 0.24;
 /** Near-plane range while walking (it opens up to NEAR_MAX where there is room). */
@@ -667,12 +813,18 @@ const ARM_PITCH = Math.atan2(ARM_UP, ARM_BACK);
 const PITCHES = [0, -0.14, 0.17, 0.38, 0.7];
 const SWINGS = [0.45, -0.45, 0.9, -0.9, 1.35, -1.35];
 const SWING_PITCHES = [0, 0.17];
+/** Still boxed in (a dead end, a lift door right behind): swung round in front, looking back at him. */
+const FRONT_SWINGS = [1.8, -1.8, 2.25, -2.25, 2.7, -2.7, Math.PI];
+const FRONT_PITCH = 0.17;
 /** Pitches relative to the flight's own slope (on stairs and escalators). */
 const SLOPE_PITCHES = [0.05, 0.2];
 /** Score of a candidate: free arm length minus these per radian away from the preferred arm. */
 const PITCH_COST = 2.2;
 const SWING_COST = 1.8;
 const KEEP_BONUS = 0.6;
+/** After a cut to another arm, it is kept with this much more bonus, fading over COMMIT s. */
+const COMMIT_BONUS = 3;
+const COMMIT = 1.5;
 /** Arm lengths where the walker fades out (FADE_TO → FADE_FROM) and the camera moves to the eye (FADE_FROM → EYE_FROM). */
 const FADE_TO = 2.1;
 const FADE_FROM = 1.4;
@@ -697,6 +849,16 @@ export interface ChaseInput {
   ahead?: THREE.Vector3;
   /** The travel direction the view is turning toward (the camera eases to it). */
   headingSoon?: number;
+  /**
+   * Riding a lift: scene y of the soles at the landing the ride starts from and at the one it
+   * ends at (`heading` is then the way he will walk out there).
+   */
+  ride?: LiftRide | null;
+}
+
+export interface LiftRide {
+  from: number;
+  to: number;
 }
 
 /** Smoothed state of a walk camera (one per view). */
@@ -711,6 +873,18 @@ export interface CameraRig {
   choice: number;
   /** Smoothed look-at point. */
   target: THREE.Vector3;
+  /** Where the camera was last placed (valid once `placed`). */
+  cam: THREE.Vector3;
+  placed: boolean;
+  /** Riding a lift: 0 not, 1 holding a spot on the landing he left, 2 on the one he rides to. */
+  ride: 0 | 1 | 2;
+  /** The spot held while riding. */
+  hold: THREE.Vector3;
+  /** Ride progress at the last search for a spot that found none. */
+  tried: number;
+  /** Seconds of camera time, and when the arm last cut to another side. */
+  clock: number;
+  cutAt: number;
 }
 
 export interface WalkCameraPose {
@@ -723,14 +897,16 @@ export interface WalkCameraPose {
   figure: number;
   /** Where the arm starts: the walker's upper body (eased off anything it brushes past). */
   pivot: THREE.Vector3;
+  /** Orbit: the longest arm the solids allow in the direction asked for. */
+  reach: number;
 }
 
 export function createRig(): CameraRig {
-  return { ready: false, swing: 0, pitch: ARM_PITCH, len: ARM_LEN, choice: 0, target: new THREE.Vector3() };
+  return { ready: false, swing: 0, pitch: ARM_PITCH, len: ARM_LEN, choice: 0, target: new THREE.Vector3(), cam: new THREE.Vector3(), placed: false, ride: 0, hold: new THREE.Vector3(), tried: -1, clock: 0, cutAt: -Infinity };
 }
 
 export function createPose(): WalkCameraPose {
-  return { pos: new THREE.Vector3(), target: new THREE.Vector3(), near: NEAR_MAX, arm: 0, figure: 1, pivot: new THREE.Vector3() };
+  return { pos: new THREE.Vector3(), target: new THREE.Vector3(), near: NEAR_MAX, arm: 0, figure: 1, pivot: new THREE.Vector3(), reach: 0 };
 }
 
 /** Distance from the camera to its near plane's corners, per unit of near distance. */
@@ -754,12 +930,186 @@ const _vt = new THREE.Vector3();
 const _vp = new THREE.Vector3();
 const _ahead = new THREE.Vector3();
 const _dSoon = new THREE.Vector3();
+const _dT = new THREE.Vector3();
+const _land = new THREE.Vector3();
+const _spot = new THREE.Vector3();
+const _waist = new THREE.Vector3();
 
 /** Unit arm direction for a yaw (direction the arm points) and pitch. */
 function armDir(yaw: number, pitch: number, out: THREE.Vector3): THREE.Vector3 {
   const c = Math.cos(pitch);
   return out.set(Math.sin(yaw) * c, Math.sin(pitch), Math.cos(yaw) * c);
 }
+
+// ---------------------------------------------------------------- lift shafts
+
+/** Plan half width of the square around a shaft's axis the camera keeps out of: its glass plus the camera sphere. */
+export function shaftKeep(s: Shaft): number {
+  return s.half + CAMERA_RADIUS + 0.05;
+}
+
+/** Plan offset (x, z) from a shaft's axis, or a plan direction, along its two face directions (_lu, _lv). */
+let _lu = 0;
+let _lv = 0;
+function shaftAxes(s: Shaft, x: number, z: number): void {
+  const sn = Math.sin(s.yaw);
+  const cs = Math.cos(s.yaw);
+  _lu = x * sn + z * cs;
+  _lv = -x * cs + z * sn;
+}
+
+/** How far out of a lift's glass (plan) the walker may be while the camera still looks at him through it. */
+export const SEE_BESIDE = 2.5;
+
+/**
+ * The lift shaft p (the walker's upper body) stands in or beside, within SEE_BESIDE of its glass
+ * (plan, between its floor and roof), the nearest; null if none. A camera waiting outside may
+ * look at him through that shaft's glass (it never looks, or moves, through any other).
+ */
+export function shaftBeside(shafts: readonly Shaft[], p: { x: number; y: number; z: number }): Shaft | null {
+  let best: Shaft | null = null;
+  let bd = SEE_BESIDE;
+  for (const s of shafts) {
+    if (p.y <= s.y0 || p.y >= s.y1) continue;
+    shaftAxes(s, p.x - s.x, p.z - s.z);
+    const d = Math.max(Math.abs(_lu), Math.abs(_lv)) - s.half;
+    if (d < bd) {
+      bd = d;
+      best = s;
+    }
+  }
+  return best;
+}
+
+/** Plan box (x0, z0, x1, z1) around every glass pane of shaft s. */
+function glassBox(s: Shaft, out: Float32Array): Float32Array {
+  const e = s.half * Math.SQRT2 + 0.05;
+  out[0] = s.x - e;
+  out[1] = s.z - e;
+  out[2] = s.x + e;
+  out[3] = s.z + e;
+  return out;
+}
+
+/** The nearby lift shaft p stands in (inside its glass), or null. */
+function shaftAt(p: THREE.Vector3): Shaft | null {
+  for (const s of nearShafts) {
+    if (p.y <= s.y0 || p.y >= s.y1) continue;
+    shaftAxes(s, p.x - s.x, p.z - s.z);
+    if (Math.abs(_lu) < s.half && Math.abs(_lv) < s.half) return s;
+  }
+  return null;
+}
+
+/**
+ * Per solve (the solvers run one at a time): the shafts near the pivot, the one it stands in
+ * and the plan box of that one's glass, which the arm may pass, and the plan box of the glass
+ * of the shaft he stands in or beside, which sight lines may pass.
+ */
+const nearShafts: Shaft[] = [];
+let inShaft: Shaft | null = null;
+const passBox = new Float32Array(4);
+let pass: Float32Array | null = null;
+const seeBox = new Float32Array(4);
+let see: Float32Array | null = null;
+
+function beginShafts(world: CollisionWorld | null, p: THREE.Vector3): void {
+  nearShafts.length = 0;
+  inShaft = null;
+  pass = null;
+  see = null;
+  if (!world) return;
+  for (const s of world.shafts) {
+    if (p.y < s.y0 - ARM_LEN - 1 || p.y > s.y1 + ARM_LEN + 1) continue;
+    const d = Math.hypot(p.x - s.x, p.z - s.z);
+    if (d > ARM_LEN + shaftKeep(s) * Math.SQRT2 + 1) continue;
+    nearShafts.push(s);
+  }
+  inShaft = shaftAt(p);
+  if (inShaft) pass = glassBox(inShaft, passBox);
+  const beside = shaftBeside(nearShafts, p);
+  if (beside) see = glassBox(beside, seeBox);
+}
+
+/** Where the last `shaftSpan` found the line in the shaft: from _t0 to _t1 along it. */
+let _t0 = 0;
+let _t1 = 0;
+
+/**
+ * Whether the line p + d·t (unit d) passes through the box kept around shaft s (its plan square,
+ * between its floor and roof less and plus r), and where (_t0.._t1).
+ */
+function shaftSpan(s: Shaft, p: THREE.Vector3, d: THREE.Vector3, r: number): boolean {
+  const k = shaftKeep(s);
+  shaftAxes(s, p.x - s.x, p.z - s.z);
+  const pu = _lu;
+  const pv = _lv;
+  shaftAxes(s, d.x, d.z);
+  _t0 = -Infinity;
+  _t1 = Infinity;
+  return clip(pu, _lu, -k, k) && clip(pv, _lv, -k, k) && clip(p.y, d.y, s.y0 - r, s.y1 + r) && _t0 < _t1;
+}
+
+/** Narrows _t0.._t1 to where q + v·t lies strictly between lo and hi; false when nowhere. */
+function clip(q: number, v: number, lo: number, hi: number): boolean {
+  if (Math.abs(v) < 1e-9) return q > lo && q < hi;
+  const a = (lo - q) / v;
+  const b = (hi - q) / v;
+  _t0 = Math.max(_t0, Math.min(a, b));
+  _t1 = Math.min(_t1, Math.max(a, b));
+  return true;
+}
+
+/**
+ * Longest length ≤ len along the arm p + d·t (unit d) that keeps a camera sphere of radius r out
+ * of every nearby lift shaft; 0 when the arm starts in one and does not get out within len.
+ */
+function outOfShafts(p: THREE.Vector3, d: THREE.Vector3, len: number, r: number): number {
+  let exit = 0;
+  for (const s of nearShafts) {
+    if (!shaftSpan(s, p, d, r) || _t1 <= 0 || _t0 >= len) continue;
+    if (_t0 > 0) len = Math.max(0, _t0 - 0.02);
+    else exit = Math.max(exit, _t1);
+  }
+  return exit > 0 && len < exit + 0.02 ? 0 : len;
+}
+
+/** Is p outside the square kept around shaft s (or above or below the shaft)? */
+function outsideShaft(s: Shaft, p: THREE.Vector3): boolean {
+  if (p.y <= s.y0 - CAMERA_RADIUS || p.y >= s.y1 + CAMERA_RADIUS) return true;
+  const k = shaftKeep(s);
+  shaftAxes(s, p.x - s.x, p.z - s.z);
+  return Math.abs(_lu) >= k || Math.abs(_lv) >= k;
+}
+
+/** Is p outside every nearby lift shaft (with room for the camera sphere)? */
+function outsideShafts(p: THREE.Vector3): boolean {
+  for (const s of nearShafts) if (!outsideShaft(s, p)) return false;
+  return true;
+}
+
+/** Distance along the arm p + d·t (unit d, p inside) to where it leaves the plan square kept around shaft s. */
+function shaftExit(p: THREE.Vector3, d: THREE.Vector3, s: Shaft): number {
+  const k = shaftKeep(s);
+  shaftAxes(s, p.x - s.x, p.z - s.z);
+  const pu = _lu;
+  const pv = _lv;
+  shaftAxes(s, d.x, d.z);
+  let t = Infinity;
+  if (Math.abs(_lu) > 1e-9) t = Math.min(t, ((_lu > 0 ? k : -k) - pu) / _lu);
+  if (Math.abs(_lv) > 1e-9) t = Math.min(t, ((_lv > 0 ? k : -k) - pv) / _lv);
+  return Math.max(0, t);
+}
+
+/** Nothing solid (but the glass of the shaft the walker stands in or beside) on the segment a → b? */
+function clearLine(world: CollisionWorld, a: THREE.Vector3, b: THREE.Vector3): boolean {
+  _s.subVectors(b, a);
+  const l = _s.length();
+  if (l < 1e-6) return true;
+  return world.raycast(a.x, a.y, a.z, _s.x / l, _s.y / l, _s.z / l, l, see) >= l - 1e-4;
+}
+
+// ---------------------------------------------------------------- arms
 
 /**
  * Eases p (in place) off anything closer than `radius`, the way the nearest solid pushes it,
@@ -817,11 +1167,15 @@ function seatColumn(world: CollisionWorld | null, walker: THREE.Vector3, heights
   return bestC >= CAMERA_RADIUS ? CAMERA_RADIUS : seat(world, out);
 }
 
-/** Free length along the arm from the pivot (sphere of radius r), up to len. */
-function freeArm(world: CollisionWorld | null, p: THREE.Vector3, d: THREE.Vector3, len: number, r: number): number {
+/**
+ * Free length along the arm from the pivot (sphere of radius r), up to len: past the glass of
+ * the lift shaft the walker stands in, never into a shaft.
+ */
+function freeArm(world: CollisionWorld | null, p: THREE.Vector3, d: THREE.Vector3, len: number, r: number, glass = pass): number {
   if (!world) return len;
-  const f = world.sweep(p.x, p.y, p.z, p.x + d.x * len, p.y + d.y * len, p.z + d.z * len, r);
-  return Math.max(0, f * len - 0.02);
+  const f = world.sweep(p.x, p.y, p.z, p.x + d.x * len, p.y + d.y * len, p.z + d.z * len, r, glass);
+  const free = Math.max(0, f * len - 0.02);
+  return nearShafts.length ? outOfShafts(p, d, free, r) : free;
 }
 
 /**
@@ -844,8 +1198,8 @@ function flooredArm(world: CollisionWorld | null, p: THREE.Vector3, d: THREE.Vec
 }
 
 /** Arm length allowed along d: clear of solids and over a floor. */
-function allowedArm(world: CollisionWorld | null, p: THREE.Vector3, d: THREE.Vector3, len: number, r: number, check: boolean): number {
-  return flooredArm(world, p, d, freeArm(world, p, d, len, r), check);
+function allowedArm(world: CollisionWorld | null, p: THREE.Vector3, d: THREE.Vector3, len: number, r: number, check: boolean, glass = pass): number {
+  return flooredArm(world, p, d, freeArm(world, p, d, len, r, glass), check);
 }
 
 const smooth = (rate: number, dt: number) => 1 - Math.exp(-Math.max(0, dt) * rate);
@@ -876,12 +1230,19 @@ function place(world: CollisionWorld | null, out: WalkCameraPose, d: THREE.Vecto
     const p = out.pivot;
     _s.subVectors(_q, p);
     const l = _s.length();
-    if (l > 1e-4 && world.raycast(p.x, p.y, p.z, _s.x / l, _s.y / l, _s.z / l, l) >= l && floorUnder(world, _q.x, _q.y, _q.z, strict)) {
+    if (l > 1e-4 && world.raycast(p.x, p.y, p.z, _s.x / l, _s.y / l, _s.z / l, l, pass) >= l && floorUnder(world, _q.x, _q.y, _q.z, strict) && (!nearShafts.length || outsideShafts(_q))) {
       out.pos.copy(_q);
       c = world.clearance(out.pos.x, out.pos.y, out.pos.z, 1);
     }
   }
   out.near = safeNear(c, fov, aspect);
+}
+
+/** Remembers where the camera went (a lift ride starts from there). */
+function placed(rig: CameraRig, out: WalkCameraPose): WalkCameraPose {
+  rig.cam.copy(out.pos);
+  rig.placed = true;
+  return out;
 }
 
 /**
@@ -892,6 +1253,8 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
   const snap = !rig.ready || dt <= 0;
   const pivot = out.pivot;
   const r = Math.min(CAMERA_RADIUS, seatColumn(world, inp.walker, PIVOTS, pivot) * 0.95);
+  beginShafts(world, pivot);
+  if (world && inp.ride && inShaft && ridePose(world, inp.walker, inp.heading, inp.ride, inp.fov, inp.aspect, rig, dt, snap, r, out)) return placed(rig, out);
   const check = world ? floorUnder(world, pivot.x, pivot.y, pivot.z) : false;
   const back = inp.heading + Math.PI;
   // Follow the slope of the track behind: up a flight when coming down, a little lower when
@@ -910,30 +1273,46 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
   // Candidate ids: straight behind at PITCHES offsets, then parallel to the flight, then swings.
   const nPitch = PITCHES.length;
   const nStraight = nPitch + SLOPE_PITCHES.length;
-  const nAll = nStraight + SWINGS.length * SWING_PITCHES.length;
+  const nSide = nStraight + SWINGS.length * SWING_PITCHES.length;
+  const nAll = nSide + FRONT_SWINGS.length;
   // Where the walker is about to be (arms are judged from there too, so the choice does not
-  // flip to one that is about to be cut).
+  // flip to one that is about to be cut), with a sphere that fits there.
   let soon: THREE.Vector3 | null = null;
-  if (world && inp.ahead && !snap) {
+  let rSoon = r;
+  if (world && inp.ahead) {
     soon = _ahead.copy(inp.ahead).add(pivot).sub(inp.walker);
-    if (soon.distanceToSquared(pivot) < 0.01 || world.clearance(soon.x, soon.y, soon.z, r + 0.01) < r * 0.95) soon = null;
+    const cs = soon.distanceToSquared(pivot) < 0.01 ? 0 : world.clearance(soon.x, soon.y, soon.z, r + 0.01);
+    // (Not from a lift he is about to step into or is still in: the camera waits on the landing
+    // there, and every arm from in there would count as cut.)
+    if (cs < r * 0.5 || (nearShafts.length && !outsideShafts(soon))) soon = null;
+    else rSoon = Math.min(r, cs * 0.95);
   }
+  // (Just after a cut the new arm is kept a while longer: no second cut straight after.)
+  const sinceCut = rig.clock + Math.max(0, dt) - rig.cutAt;
+  const commit = sinceCut < COMMIT ? COMMIT_BONUS * (1 - sinceCut / COMMIT) : 0;
+  const backSoon = (inp.headingSoon ?? inp.heading) + Math.PI;
+  const turning = Math.abs(wrap(backSoon - back)) > 0.03;
   const consider = (id: number) => {
     if (id >= nPitch && id < nStraight && !onFlight) return;
-    const swing = id < nStraight ? 0 : SWINGS[Math.floor((id - nStraight) / SWING_PITCHES.length)];
-    const dp = id < nPitch ? PITCHES[id] : id < nStraight ? sb + SLOPE_PITCHES[id - nPitch] - basePitch : SWING_PITCHES[(id - nStraight) % SWING_PITCHES.length];
+    const swing = id < nStraight ? 0 : id < nSide ? SWINGS[Math.floor((id - nStraight) / SWING_PITCHES.length)] : FRONT_SWINGS[id - nSide];
+    const dp = id < nPitch ? PITCHES[id] : id < nStraight ? sb + SLOPE_PITCHES[id - nPitch] - basePitch : id < nSide ? SWING_PITCHES[(id - nStraight) % SWING_PITCHES.length] : FRONT_PITCH;
     const pitch = Math.min(1.5, Math.max(-0.9, basePitch + dp));
     const flight = id >= nPitch && id < nStraight ? 0.5 : 1;
-    const cost = PITCH_COST * flight * Math.abs(dp) + SWING_COST * Math.abs(swing) - (id === rig.choice && !snap ? KEEP_BONUS : 0);
+    const kept = id === rig.choice && !snap;
+    const cost = PITCH_COST * flight * Math.abs(dp) + SWING_COST * Math.abs(swing) - (kept ? KEEP_BONUS + commit : 0);
     const d = armDir(back + swing, pitch, _d);
     let free = freeArm(world, pivot, d, ARM_LEN, r);
     if (free - cost <= bestScore) return;
     if (soon) {
-      free = Math.min(free, freeArm(world, soon, d, ARM_LEN, r));
+      // (From there, pointing where this arm will point once the view has turned.)
+      const ds = turning ? armDir(backSoon + swing, pitch, _dT) : d;
+      free = Math.min(free, freeArm(world, soon, ds, ARM_LEN, rSoon, null));
       if (free - cost <= bestScore) return;
     }
     free = flooredArm(world, pivot, d, free, check);
-    const score = free - cost - (free < 1.2 ? 2 : 0);
+    // (An arm too short to show him, the view at his eye, is worth less the shorter it is; a
+    // kept arm about to collapse loses its extra hold.)
+    const score = free - cost - (free < FADE_TO ? 2 + 2 * (FADE_TO - free) : 0) - (kept && free < FADE_TO + 1 ? commit : 0);
     if (score > bestScore) {
       bestScore = score;
       bestSwing = swing;
@@ -945,8 +1324,12 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
   const first = !snap && rig.choice >= 0 && rig.choice < nAll ? rig.choice : 0;
   consider(first);
   for (let id = 0; id < nStraight; id++) if (id !== first) consider(id);
-  // Boxed in behind (a wall, a stairwell, a lift door): look for room to the sides.
-  if (bestLen < ARM_LEN * 0.75 && world) for (let id = nStraight; id < nAll; id++) if (id !== first) consider(id);
+  // Boxed in behind (a wall, a stairwell, a lift door): look for room to the sides, and if
+  // there is none, in front.
+  if (bestLen < ARM_LEN * 0.75 && world) for (let id = nStraight; id < nSide; id++) if (id !== first) consider(id);
+  if (bestLen < FADE_TO + 1 && world) for (let id = nSide; id < nAll; id++) if (id !== first) consider(id);
+  // In a lift with no way out past its glass: wait on the landing outside (never in the shaft).
+  if (world && inShaft && bestLen < FADE_TO && ridePose(world, inp.walker, inp.heading, { from: inp.walker.y, to: inp.walker.y }, inp.fov, inp.aspect, rig, dt, snap, r, out)) return placed(rig, out);
   rig.choice = bestId;
 
   // Ease the arm toward the choice, then keep it clear along the eased direction.
@@ -957,8 +1340,8 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
     rig.swing += wrap(bestSwing - rig.swing) * smooth(3, dt);
     rig.pitch += (bestPitch - rig.pitch) * smooth(2.5, dt);
   }
-  const dir = armDir(back + rig.swing, rig.pitch, _d);
-  const free = allowedArm(world, pivot, dir, ARM_LEN, r, check);
+  let dir = armDir(back + rig.swing, rig.pitch, _d);
+  let free = allowedArm(world, pivot, dir, ARM_LEN, r, check);
   let want = free;
   if (world && !snap) {
     // Where the arm is about to point (turning at a corner, easing to another choice)...
@@ -968,23 +1351,47 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
     const turn = armDir(hs + Math.PI + swingSoon, pitchSoon, _dSoon);
     if (turn.dot(dir) < 0.9995) want = Math.min(want, allowedArm(world, pivot, turn, ARM_LEN, r, check));
     // ...from where the walker is about to be.
-    if (soon) want = Math.min(want, allowedArm(world, soon, turn, ARM_LEN, r, check));
+    if (soon) want = Math.min(want, allowedArm(world, soon, turn, ARM_LEN, rSoon, check, null));
+  }
+  rig.clock += Math.max(0, dt);
+  let cut = false;
+  if (world && !snap && !inShaft) {
+    // The arm collapsing into the head (a U-turn by a wall, a lobby just out of a lift): cut
+    // to a free arm if there is one (not twice in a row), else stay where the camera is while
+    // it still sees him, rather than slide into his head.
+    const poor = bestLen < FADE_TO + 0.5;
+    const canCut = free < FADE_TO && !poor && rig.clock - rig.cutAt > CUT_GAP;
+    if (!canCut && (free < FADE_TO || want < FADE_TO) && stayPose(world, inp, rig, r, check, dt, out)) return placed(rig, out);
+    if (canCut) {
+      rig.swing = bestSwing;
+      rig.pitch = bestPitch;
+      dir = armDir(back + rig.swing, rig.pitch, _d);
+      free = want = allowedArm(world, pivot, dir, ARM_LEN, r, check);
+      cut = true;
+    }
   }
   // Pull in at once where something already cuts the arm, quickly where it is about to, and
   // let it out slowly.
-  let len = snap || free < rig.len ? free : rig.len + (want - rig.len) * (want < rig.len ? smooth(9, dt) : smooth(1 / 0.55, dt));
+  let len = snap || cut || free < rig.len ? free : rig.len + (want - rig.len) * (want < rig.len ? smooth(9, dt) : smooth(1 / 0.55, dt));
   // Floors are not monotonic along the arm: check the eased length too.
   if (len < free) len = flooredArm(world, pivot, dir, len, check);
+  // (Still in the lift that way, e.g. easing out from the eye: wait on the landing instead.)
+  if (world && inShaft && len < shaftExit(pivot, dir, inShaft) + 0.05 && ridePose(world, inp.walker, inp.heading, { from: inp.walker.y, to: inp.walker.y }, inp.fov, inp.aspect, rig, dt, snap, r, out)) return placed(rig, out);
+  rig.ride = 0;
+  if (cut) rig.cutAt = rig.clock;
   rig.len = len;
   const eyeBlend = 1 - smoothstep(EYE_FROM, FADE_FROM, rig.len);
   if (eyeBlend > 0) {
-    // Boxed in (a lift shaft, a door behind): slide toward the eye rather than into the head.
+    // Boxed in (a dead end, a door behind): slide toward the eye rather than into the head.
     _q.copy(pivot).addScaledVector(dir, rig.len);
     const up = EYE_H - PIVOT_H;
     const eyeUp = world ? Math.max(0, world.sweep(pivot.x, pivot.y, pivot.z, pivot.x, pivot.y + up, pivot.z, r) * up - 0.02) : up;
-    _s.set(pivot.x, pivot.y + eyeUp, pivot.z).sub(_q).multiplyScalar(eyeBlend).add(_q).sub(pivot);
+    _s.set(pivot.x, pivot.y + eyeUp, pivot.z).sub(_q).multiplyScalar(eyeBlend).add(_q);
+    // (Not into a lift shaft, where the cabins run: his eye there, just in or out of the door.)
+    const inLift = nearShafts.length > 0 && !outsideShafts(_s);
+    _s.sub(pivot);
     const l = _s.length();
-    const clear = !world || l < 1e-4 || world.sweep(pivot.x, pivot.y, pivot.z, pivot.x + _s.x, pivot.y + _s.y, pivot.z + _s.z, Math.min(r, 0.1)) >= 1;
+    const clear = !world || l < 1e-4 || (!inLift && world.sweep(pivot.x, pivot.y, pivot.z, pivot.x + _s.x, pivot.y + _s.y, pivot.z + _s.z, Math.min(r, 0.1)) >= 1);
     if (clear && l > 1e-4) place(world, out, _s.divideScalar(l), l, inp.fov, inp.aspect, check);
     else place(world, out, dir, rig.len, inp.fov, inp.aspect, check);
   } else place(world, out, dir, rig.len, inp.fov, inp.aspect, check);
@@ -995,7 +1402,7 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
   const tx = inp.walker.x + Math.sin(inp.heading) * 7;
   const ty = inp.walker.y + 1.0 + ahead * 7 * 0.6;
   const tz = inp.walker.z + Math.cos(inp.heading) * 7;
-  if (snap) rig.target.set(tx, ty, tz);
+  if (snap || cut) rig.target.set(tx, ty, tz);
   else {
     const k = smooth(5, dt);
     rig.target.x += (tx - rig.target.x) * k;
@@ -1007,8 +1414,246 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
   // Right behind the head: fade the figure out rather than filling the screen with it.
   out.figure = smoothstep(FADE_FROM, FADE_TO, rig.len);
   rig.ready = true;
-  return out;
+  return placed(rig, out);
 }
+
+// ---------------------------------------------------------------- staying put
+
+/** A camera left where it was sees the walker from at most this far. */
+const STAY_MAX = ARM_LEN * 1.5;
+/** At most one cut from a collapsing arm to another free one per this many seconds. */
+const CUT_GAP = 0.4;
+
+/** Outside every lift shaft of the world (with room for the camera sphere)? */
+function outsideAllShafts(world: CollisionWorld, p: THREE.Vector3): boolean {
+  for (const s of world.shafts) if (!outsideShaft(s, p)) return false;
+  return true;
+}
+
+/**
+ * Leaves the camera where it was last placed, turned toward the walker, if it still sees his
+ * upper body and waist over a clear sight line from not too close and not too far, with room
+ * and a floor, out of the lift shafts. The spring arm keeps easing toward its choice meanwhile.
+ */
+function stayPose(world: CollisionWorld, inp: ChaseInput, rig: CameraRig, r: number, check: boolean, dt: number, out: WalkCameraPose): boolean {
+  if (!rig.placed) return false;
+  const c = rig.cam;
+  const pivot = out.pivot;
+  const d = c.distanceTo(pivot);
+  if (d < FADE_TO + 0.3 || d > STAY_MAX) return false;
+  const waist = _waist.set(inp.walker.x, inp.walker.y + 1.0, inp.walker.z);
+  if (world.clearance(c.x, c.y, c.z, r + 0.01) < r * 0.9) return false;
+  if (!clearLine(world, pivot, c) || !clearLine(world, c, waist)) return false;
+  if (!outsideAllShafts(world, c) || !floorUnder(world, c.x, c.y, c.z, check)) return false;
+  out.pos.copy(c);
+  out.near = safeNear(world.clearance(c.x, c.y, c.z, 1), inp.fov, inp.aspect);
+  const k = smooth(6, dt);
+  rig.target.x += (inp.walker.x - rig.target.x) * k;
+  rig.target.y += (inp.walker.y + 1.3 - rig.target.y) * k;
+  rig.target.z += (inp.walker.z - rig.target.z) * k;
+  out.target.copy(rig.target);
+  keepInFrame(out, inp.walker, inp.fov);
+  out.figure = 1;
+  out.arm = d;
+  // (When the arm takes over again it starts no longer than this.)
+  rig.len = d;
+  rig.ride = 0;
+  rig.ready = true;
+  return true;
+}
+
+// ---------------------------------------------------------------- lift rides
+
+/** Arms tried from a landing while the walker rides: swings about the way out there, pitches, lengths. */
+const RIDE_SWINGS = [0, 0.45, -0.45, 0.9, -0.9, 1.35, -1.35, 1.8, -1.8, 2.25, -2.25, 2.7, -2.7, Math.PI];
+const RIDE_PITCHES = [0, 0.25, -0.22];
+const RIDE_LENGTHS = [1, 0.7, 0.45];
+/**
+ * Steep sight lines cost this much per radian beyond an angle: looking up at him (his soles, a
+ * floor's underside) more than looking down on him.
+ */
+const RIDE_UP = 0.3;
+const RIDE_UP_COST = 8;
+const RIDE_DOWN = 0.55;
+const RIDE_DOWN_COST = 4;
+/** Held on the landing the ride began from, a sight line to him steeper than this (rad) looks for a better spot. */
+const RIDE_STEEP = 0.95;
+/** A cut to the landing he rides to before he is half way down needs at least this score. */
+const RIDE_GOOD = ARM_LEN * 0.5;
+
+/** Nothing but the lift's own glass between c and the walker's upper body and waist? */
+function seesRider(world: CollisionWorld, c: THREE.Vector3, pivot: THREE.Vector3, waist: THREE.Vector3): boolean {
+  return clearLine(world, c, pivot) && clearLine(world, c, waist);
+}
+
+/**
+ * A spot for the camera on the landing where the soles stand at y (the walker riding the shaft
+ * he stands in): along the freest arms from where his upper body will be there, about the way
+ * he walks out (so the chase arm takes over from it), out of the shaft, with room and a floor,
+ * not looking steeply up at him, and (if `see`) in sight of him where he is now. Written to
+ * `out`; returns its score (-Infinity if there is none).
+ */
+function landingSpot(world: CollisionWorld, s: Shaft, y: number, heading: number, r: number, pivot: THREE.Vector3, waist: THREE.Vector3, see: boolean, out: THREE.Vector3, exit = false): number {
+  const lp = _land.set(s.x, y + PIVOT_H, s.z);
+  // Where his upper body will be once out of the door (the face looking most his way): the
+  // camera left there as he walks out still sees him from a spot that sees that.
+  const face = s.yaw + Math.round(wrap(heading - s.yaw) / (Math.PI / 2)) * (Math.PI / 2);
+  const out1 = _exitAt.set(s.x + Math.sin(face) * (s.half + 1), y + PIVOT_H, s.z + Math.cos(face) * (s.half + 1));
+  beginShafts(world, lp);
+  const back = heading + Math.PI;
+  let best = -Infinity;
+  // A spot over a floor (in the modelled rooms, not outside them over the void); only where the
+  // landing has none anywhere, one that at least does not look down on a ceiling.
+  for (const strict of [true, false]) {
+    for (const sw of RIDE_SWINGS) {
+      for (const dp of RIDE_PITCHES) {
+        const cost = SWING_COST * 0.5 * Math.abs(sw) + PITCH_COST * Math.abs(dp);
+        if (ARM_LEN - cost <= best) continue;
+        const d = armDir(back + sw, ARM_PITCH + dp, _d);
+        const free = allowedArm(world, lp, d, ARM_LEN, r, strict);
+        const min = shaftExit(lp, d, s) + 0.1;
+        if (free < min) continue;
+        for (const k of RIDE_LENGTHS) {
+          const len = Math.max(min, free * k);
+          if (len - cost <= best) break;
+          _q.copy(lp).addScaledVector(d, len);
+          const el = Math.atan2(pivot.y - _q.y, Math.hypot(pivot.x - _q.x, pivot.z - _q.z));
+          const score = len - cost - RIDE_UP_COST * Math.max(0, el - RIDE_UP) - RIDE_DOWN_COST * Math.max(0, -el - RIDE_DOWN);
+          if (score <= best) continue;
+          if (!floorUnder(world, _q.x, _q.y, _q.z, strict)) continue;
+          if (world.clearance(_q.x, _q.y, _q.z, r + 0.01) < r * 0.9) continue;
+          if (see && !seesRider(world, _q, pivot, waist)) continue;
+          const lost = exit && !clearLine(world, _q, out1) ? EXIT_COST : 0;
+          if (score - lost <= best) continue;
+          best = score - lost;
+          out.copy(_q);
+        }
+      }
+    }
+    if (best > -Infinity) break;
+  }
+  beginShafts(world, pivot);
+  return best;
+}
+
+const _spotFrom = new THREE.Vector3();
+const _exitAt = new THREE.Vector3();
+/** A landing spot that loses sight of him as he steps out of the lift scores this much less. */
+const EXIT_COST = 4;
+
+/**
+ * Riding a lift: the camera stays on a landing outside the shaft, where the cabins cannot reach
+ * it, and looks in through the glass. It keeps the spot it had when the ride began while that
+ * sees the walker; once he is half way (or lost from there) it cuts to the landing he rides to,
+ * or where he passes through a floor, to whichever landing sees him best, and it is on the one
+ * he rides to by the end, where the chase arm takes over when he walks out. False when no landing
+ * has room (the caller then runs the chase arm).
+ */
+function ridePose(
+  world: CollisionWorld,
+  walker: THREE.Vector3,
+  heading: number,
+  ride: LiftRide,
+  fov: number,
+  aspect: number,
+  rig: CameraRig,
+  dt: number,
+  snap: boolean,
+  r: number,
+  out: WalkCameraPose,
+): boolean {
+  const s = inShaft as Shaft;
+  const pivot = out.pivot;
+  const waist = _waist.set(walker.x, walker.y + 1.0, walker.z);
+  const span = ride.to - ride.from;
+  const prog = Math.abs(span) < 1e-3 ? 1 : Math.min(1, Math.max(0, (walker.y - ride.from) / span));
+  const hold = rig.hold;
+  let cut = false;
+  if (snap || rig.ride === 0) {
+    rig.ride = 0;
+    rig.tried = -1;
+    // Keep the spot the camera had on the way in, if it is out of the shaft and sees him.
+    const c = rig.cam;
+    if (!snap && rig.placed && outsideShafts(c) && world.clearance(c.x, c.y, c.z, r + 0.01) >= r * 0.9 && seesRider(world, c, pivot, waist)) {
+      hold.copy(c);
+      // (Waiting in the lift rather than riding it: that is where he stays.)
+      rig.ride = Math.abs(span) < 1e-3 ? 2 : 1;
+    }
+  }
+  const to = (see: boolean) => landingSpot(world, s, ride.to, heading, r, pivot, waist, see, _spot, true);
+  const from = (see: boolean) => landingSpot(world, s, ride.from, heading, r, pivot, waist, see, _spotFrom);
+  /** Best spot that sees him on either landing: 2 (the one he rides to, in _spot), 1 (_spotFrom), 0. */
+  const either = (): 0 | 1 | 2 => {
+    const a = to(true);
+    const b = Math.abs(span) < 1e-3 ? -Infinity : from(true);
+    if (a === -Infinity && b === -Infinity) return 0;
+    if (a >= b) return 2;
+    _spot.copy(_spotFrom);
+    return 1;
+  };
+  const sees = rig.ride > 0 && seesRider(world, hold, pivot, waist);
+  // (Looking steeply down or up the shaft at him from where the ride began: his head or soles
+  // and a floor edge fill the view. A search that found nothing is retried once he has moved on
+  // a little.)
+  const steep = rig.ride === 1 && Math.abs(Math.atan2(pivot.y - hold.y, Math.hypot(pivot.x - hold.x, pivot.z - hold.z))) > RIDE_STEEP;
+  const retry = Math.abs(prog - rig.tried) >= 0.03;
+  if (rig.ride === 0) {
+    // Fresh: whichever landing sees him best, else wherever there is room where he rides to.
+    const got = either();
+    if (got) rig.ride = got;
+    else if (to(false) > -Infinity) rig.ride = 2;
+    else return false;
+    cut = true;
+  } else if (rig.ride === 1 && (!sees || steep) && retry) {
+    const got = either();
+    if (got && (!sees || _spot.distanceToSquared(hold) > 0.25)) {
+      rig.ride = got;
+      cut = true;
+    } else rig.tried = prog;
+  } else if (rig.ride === 1 && prog >= 0.5 && retry) {
+    // Still in sight from where the ride began: move on to where he is going when that looks
+    // good, and by the end in any case.
+    const score = to(true);
+    if (score >= RIDE_GOOD || (prog > 0.9 && score > -Infinity) || (prog >= 1 && to(false) > -Infinity)) {
+      rig.ride = 2;
+      cut = true;
+    } else rig.tried = prog;
+  } else if (rig.ride === 2 && !sees && retry) {
+    if (to(true) > -Infinity) cut = true;
+    else rig.tried = prog;
+  }
+  if (cut) hold.copy(_spot);
+  out.pos.copy(hold);
+  out.near = safeNear(world.clearance(hold.x, hold.y, hold.z, 1), fov, aspect);
+  // Look at him (keepInFrame keeps him below the middle).
+  const tx = walker.x;
+  const ty = walker.y + 1.3;
+  const tz = walker.z;
+  if (snap || cut) rig.target.set(tx, ty, tz);
+  else {
+    const k = smooth(6, dt);
+    rig.target.x += (tx - rig.target.x) * k;
+    rig.target.y += (ty - rig.target.y) * k;
+    rig.target.z += (tz - rig.target.z) * k;
+  }
+  out.target.copy(rig.target);
+  keepInFrame(out, walker, fov);
+  out.figure = 1;
+  // The arm the chase camera takes over from when he walks out.
+  _s.subVectors(hold, pivot);
+  const len = _s.length();
+  out.arm = len;
+  if (len > 1e-4) {
+    rig.swing = wrap(Math.atan2(_s.x, _s.z) - (heading + Math.PI));
+    rig.pitch = Math.asin(Math.max(-1, Math.min(1, _s.y / len)));
+  }
+  rig.len = len;
+  rig.choice = -1;
+  rig.ready = true;
+  return true;
+}
+
+// ---------------------------------------------------------------- framing, other views
 
 /** The walker's body stays at least this far (rad) below the middle of the frame. */
 const MIN_BELOW = 0.07;
@@ -1053,6 +1698,7 @@ function keepInFrame(out: WalkCameraPose, walker: THREE.Vector3, fov: number): v
 /** First person: eye at head height (lowered under anything overhead), looking at `target`. */
 export function firstPersonPose(world: CollisionWorld | null, walker: THREE.Vector3, target: THREE.Vector3, fov: number, aspect: number, out: WalkCameraPose = createPose()): WalkCameraPose {
   seatColumn(world, walker, EYES, out.pivot);
+  beginShafts(null, out.pivot);
   place(world, out, _d.set(0, 1, 0), 0, fov, aspect, false);
   out.target.copy(target);
   out.arm = 0;
@@ -1062,24 +1708,52 @@ export function firstPersonPose(world: CollisionWorld | null, walker: THREE.Vect
 
 /**
  * Orbit: the user's camera position (from OrbitControls) pulled in toward the walker's upper
- * body wherever a solid stands in between; pull-in immediate, release eased.
+ * body wherever a solid stands in between; pull-in immediate, release eased. Riding a lift, where
+ * that would leave the camera in the shaft, it waits on a landing instead (as the chase view
+ * does); `heading` is then the way he walks out.
  */
-export function orbitPose(world: CollisionWorld | null, walker: THREE.Vector3, wanted: THREE.Vector3, rig: CameraRig, dt: number, fov: number, aspect: number, out: WalkCameraPose = createPose()): WalkCameraPose {
+export function orbitPose(
+  world: CollisionWorld | null,
+  walker: THREE.Vector3,
+  wanted: THREE.Vector3,
+  rig: CameraRig,
+  dt: number,
+  fov: number,
+  aspect: number,
+  out: WalkCameraPose = createPose(),
+  ride: LiftRide | null = null,
+  heading = 0,
+): WalkCameraPose {
   const pivot = out.pivot;
   const r = Math.min(CAMERA_RADIUS, seatColumn(world, walker, PIVOTS, pivot) * 0.95);
+  beginShafts(world, pivot);
   const check = world ? floorUnder(world, pivot.x, pivot.y, pivot.z) : false;
   const dir = _d.subVectors(wanted, pivot);
   const len = dir.length();
   if (len < 1e-6) dir.set(0, 1, 0);
   else dir.divideScalar(len);
-  const free = allowedArm(world, pivot, dir, len, r, check);
-  let arm = !rig.ready || dt <= 0 || free < rig.len ? free : rig.len + (free - rig.len) * smooth(1 / 0.45, dt);
-  arm = Math.min(arm, len);
+  // Out of a shaft he stands in, the arm reaches at least past its glass (never into a cabin).
+  const exit = inShaft ? shaftExit(pivot, dir, inShaft) : 0;
+  const minLen = Number.isFinite(exit) && exit > 0 ? exit + 0.05 : 0;
+  const want = Math.max(len, minLen);
+  const free = allowedArm(world, pivot, dir, want, r, check);
+  out.reach = free;
+  const snap = !rig.ready || dt <= 0;
+  if (world && inShaft && free < minLen) {
+    // Nowhere to go out of the lift that way: wait on a landing (the one he is on, if not riding).
+    const stay = ride ?? { from: walker.y, to: walker.y };
+    if (ridePose(world, walker, heading, stay, fov, aspect, rig, snap ? 0 : dt, snap, r, out)) return placed(rig, out);
+  }
+  rig.ride = 0;
+  let arm = snap || free < rig.len ? free : rig.len + (free - rig.len) * smooth(1 / 0.45, dt);
+  arm = Math.min(arm, want);
   if (arm < free) arm = flooredArm(world, pivot, dir, arm, check);
+  // (Easing out from close in, or short of a floor: never inside the lift he stands in.)
+  if (arm < minLen) arm = free;
   rig.len = arm;
   rig.ready = true;
   place(world, out, dir, rig.len, fov, aspect, check);
   out.arm = rig.len;
   out.figure = smoothstep(FADE_FROM, FADE_TO, rig.len);
-  return out;
+  return placed(rig, out);
 }
