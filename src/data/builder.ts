@@ -1,4 +1,5 @@
 import type { EdgeKind, Footprint, Level, Line, NetEdge, NetNode, Network, NodeKind, Platform, Road, Station } from '../core/types';
+import { alongOf, detour, inflate, lateralOf, rectFromFrame, rectsOverlap, segmentHitsRect, type ORect } from './flight-layout';
 
 /** Local tangent plane centred on JR Osaka Station (Mapion reference point 34.70249, 135.49567). */
 export const ORIGIN = { lat: 34.7025, lon: 135.4957 };
@@ -46,6 +47,63 @@ interface EdgeOpts {
   busy?: number;
   length?: number;
   waitS?: number;
+}
+
+/**
+ * Where a vertical connection physically is. By default the builder derives it from the two
+ * landings (see `layoutFlights`); surveyed data can pin it down.
+ */
+export interface FlightOpts {
+  /** Compass bearing (0 = north, 90 = east) of the walking direction when going UP. */
+  bearingUp?: number;
+  /**
+   * Which end of the flight sits on its node: 'top' = the head is at the upper node (platform
+   * stair heads, street exits), 'bottom' = the foot is at the lower node, 'mid' = centred
+   * between the two nodes.
+   */
+  anchor?: 'top' | 'bottom' | 'mid';
+}
+
+type VerticalMode = { kind: 'stairs' | 'escalator' | 'elevator'; dir?: NetEdge['dir']; o: EdgeOpts };
+
+interface VerticalSpec {
+  a: string;
+  b: string;
+  modes: VerticalMode[];
+  o: EdgeOpts & FlightOpts;
+}
+
+/** Stair going per metre of rise (30 cm treads, 16 cm risers ≈ 28°). */
+export const STAIR_RUN_PER_RISE = 1.875;
+/** Escalators are inclined at 30°. */
+export const ESCALATOR_RUN_PER_RISE = Math.sqrt(3);
+/** A landing at least every 4 m of rise (Building Standards Order art. 24), 1.6 m deep. */
+export const STAIR_LANDING_EVERY = 4;
+export const STAIR_LANDING_DEPTH = 1.6;
+/** Plan widths of the parallel lanes of a bundle (m). */
+const LANE_WIDTH = { stairs: 3.2, escalator: 1.6, elevator: 2.6 } as const;
+const LANE_GAP = 0.5;
+
+/** Walking line on a platform: 1.6 m inside one edge (beside the stair wells); wide bays keep the centre. */
+export function platformWalkOffset(p: Platform): number {
+  return p.width >= 16 ? 0 : Math.max(0, p.width / 2 - 1.6);
+}
+
+/** Platform axis frame: o = end a, u = unit a→b, n = u rotated +90°, len. */
+export function platformFrame(p: Platform): { o: XZ; u: XZ; n: XZ; len: number } {
+  const ax = p.b[0] - p.a[0];
+  const az = p.b[1] - p.a[1];
+  const len = Math.hypot(ax, az) || 1;
+  const u = { x: ax / len, z: az / len };
+  return { o: { x: p.a[0], z: p.a[1] }, u, n: { x: -u.z, z: u.x }, len };
+}
+
+/** Horizontal run of a flight of the given kind and rise (landings included). */
+export function flightRun(kind: VerticalMode['kind'], rise: number): number {
+  if (kind === 'elevator') return 0;
+  if (kind === 'escalator') return rise * ESCALATOR_RUN_PER_RISE;
+  const landings = Math.max(0, Math.ceil(rise / STAIR_LANDING_EVERY - 1e-6) - 1);
+  return rise * STAIR_RUN_PER_RISE + landings * STAIR_LANDING_DEPTH;
 }
 
 export interface PlatformSpec {
@@ -173,18 +231,35 @@ export class NetBuilder {
     return this;
   }
 
-  stairs(a: string, b: string, o: EdgeOpts = {}): this {
-    this.edge('stairs', a, b, o);
-    return this;
+  stairs(a: string, b: string, o: EdgeOpts & FlightOpts = {}): this {
+    return this.addVertical(a, b, [{ kind: 'stairs' }], o);
   }
 
-  esc(a: string, b: string, dir: 'up' | 'down' | 'both' = 'both', o: EdgeOpts = {}): this {
-    this.edge('escalator', a, b, { ...o, dir });
-    return this;
+  esc(a: string, b: string, dir: 'up' | 'down' | 'both' = 'both', o: EdgeOpts & FlightOpts = {}): this {
+    return this.addVertical(a, b, [{ kind: 'escalator', dir }], o);
   }
 
-  elev(a: string, b: string, o: EdgeOpts = {}): this {
-    this.edge('elevator', a, b, o);
+  elev(a: string, b: string, o: EdgeOpts & FlightOpts = {}): this {
+    return this.addVertical(a, b, [{ kind: 'elevator' }], o);
+  }
+
+  private readonly verticals: VerticalSpec[] = [];
+  /** Footprints of flights already laid out (bundles must not overlap). */
+  private readonly placedFlights: { rect: ORect; y0: number; y1: number }[] = [];
+
+  private addVertical(a: string, b: string, modes: Omit<VerticalMode, 'o'>[], o: EdgeOpts & FlightOpts): this {
+    this.get(a);
+    this.get(b);
+    const { bearingUp, anchor, ...edgeOpts } = o;
+    const list = modes.map((m) => ({ ...m, o: edgeOpts }));
+    // Separate calls for the same pair of landings form one bundle, laid out side by side.
+    const same = this.verticals.find((v) => (v.a === a && v.b === b) || (v.a === b && v.b === a));
+    if (same) {
+      same.modes.push(...list);
+      same.o = { ...same.o, bearingUp: same.o.bearingUp ?? bearingUp, anchor: same.o.anchor ?? anchor, width: Math.max(same.o.width ?? 0, o.width ?? 0) || undefined };
+    } else {
+      this.verticals.push({ a, b, modes: list, o: { ...o } });
+    }
     return this;
   }
 
@@ -202,15 +277,317 @@ export class NetBuilder {
    * Vertical connection bundle: stairs, escalator and/or elevator between two landings.
    * Creates separate landing nodes per mode so the renderer can show them side by side.
    */
-  vertical(a: string, b: string, modes: ('stairs' | 'esc' | 'esc-up' | 'esc-down' | 'elev')[], o: EdgeOpts = {}): this {
-    for (const m of modes) {
-      if (m === 'stairs') this.stairs(a, b, o);
-      else if (m === 'esc') this.esc(a, b, 'both', o);
-      else if (m === 'esc-up') this.esc(a, b, 'up', o);
-      else if (m === 'esc-down') this.esc(a, b, 'down', o);
-      else this.elev(a, b, o);
+  vertical(a: string, b: string, modes: ('stairs' | 'esc' | 'esc-up' | 'esc-down' | 'elev')[], o: EdgeOpts & FlightOpts = {}): this {
+    const list: Omit<VerticalMode, 'o'>[] = modes.map((m) =>
+      m === 'stairs'
+        ? { kind: 'stairs' }
+        : m === 'elev'
+          ? { kind: 'elevator' }
+          : { kind: 'escalator', dir: m === 'esc-up' ? 'up' : m === 'esc-down' ? 'down' : 'both' },
+    );
+    return this.addVertical(a, b, list, o);
+  }
+
+  /**
+   * Turns every recorded vertical connection into physical flights: stairs at 28° with a landing
+   * every 4 m of rise, escalators at 30°, elevators as vertical shafts. The declared nodes are
+   * joined to each flight's ends by level walkways that go around the stair wells (never over a
+   * well, never under the low end of a flight), so the walker, the crowd and the renderer all
+   * follow something that could really be built.
+   */
+  private layoutFlights(): void {
+    this.alignPlatformWalks();
+    for (const v of this.verticals) this.layoutBundle(v);
+    this.verticals.length = 0;
+  }
+
+  /**
+   * People walk along an island platform beside its stair wells, not over them: every node on a
+   * platform (boarding positions, stair heads) moves onto a walking line 1.6 m inside one edge.
+   * Very wide platform groups (Hankyu's merged 3-platform bays) keep their centre line.
+   */
+  private alignPlatformWalks(): void {
+    for (const n of this.nodes) {
+      const p = this.platformUnder(n);
+      if (!p) continue;
+      const f = platformFrame(p);
+      const lat = lateralOf(f.o, f.u, n);
+      const want = platformWalkOffset(p);
+      if (Math.abs(lat - want) < 0.05) continue;
+      n.x = Math.round((n.x + f.n.x * (want - lat)) * 10) / 10;
+      n.z = Math.round((n.z + f.n.z * (want - lat)) * 10) / 10;
     }
-    return this;
+  }
+
+  private layoutBundle(v: VerticalSpec): void {
+    const na = this.get(v.a);
+    const nb = this.get(v.b);
+    const [L, U] = na.y <= nb.y ? [na, nb] : [nb, na];
+    const rise = U.y - L.y;
+    // A few steps (or a ramp) between nearly level nodes: keep the direct link.
+    if (rise < 1.2) {
+      for (const m of v.modes) this.edge(m.kind, v.a, v.b, { ...m.o, dir: m.dir });
+      return;
+    }
+    const f = this.bundleFrame(L, U, v);
+    // Flights first (inner lanes), elevators after them (outer lane / beyond the anchored end).
+    const flights = v.modes.map((m, k) => ({ m, k })).filter(({ m }) => m.kind !== 'elevator');
+    const lifts = v.modes.map((m, k) => ({ m, k })).filter(({ m }) => m.kind === 'elevator');
+    const widthOf = (m: VerticalMode) => (m.kind === 'stairs' ? Math.min(8, Math.max(1.8, m.o.width ?? LANE_WIDTH.stairs)) : LANE_WIDTH[m.kind]);
+    const lanes = f.platform ? flights : [...flights, ...lifts];
+    const total = lanes.reduce((s, { m }) => s + widthOf(m), 0) + LANE_GAP * Math.max(0, lanes.length - 1);
+    const center = f.center(total);
+    const lat = new Map<number, number>();
+    let acc = center - total / 2;
+    for (const { m, k } of lanes) {
+      lat.set(k, acc + widthOf(m) / 2);
+      acc += widthOf(m) + LANE_GAP;
+    }
+    const at = (s: number, l: number): XZ => ({ x: f.o.x + f.u.x * s + f.n.x * l, z: f.o.z + f.u.z * s + f.n.z * l });
+    const tag = (k: number) => `${v.a}~${v.b}#${k}`;
+    const station = L.stationId ?? U.stationId;
+    const newNode = (id: string, p: XZ, level: NetNode, name: string, y = level.y) =>
+      this.node(id, 'vertical', name, p, level.level, { station: level.stationId ?? station, paid: level.paid, y });
+
+    // Longitudinal extent of each flight: aligned at the anchored end, 1.2 m clear of the node.
+    const CLEAR = 1.2;
+    const liftRoom = f.platform && lifts.length ? LANE_WIDTH.elevator + 0.8 : 0;
+    const span = new Map<number, [number, number]>();
+    const place = (ds: number, dl: number) => {
+      for (const { m, k } of flights) {
+        const R = flightRun(m.kind, rise);
+        const s0 = (f.anchor === 'bottom' ? CLEAR + liftRoom : f.anchor === 'top' ? f.len - CLEAR - liftRoom - R : (f.len - R) / 2) + ds;
+        span.set(k, [s0, s0 + R]);
+      }
+      for (const [k, l] of baseLat) lat.set(k, l + dl);
+    };
+    const baseLat = new Map(lat);
+    const lowPart = (k: number, m: VerticalMode): ORect => {
+      const [s0, s1] = span.get(k) as [number, number];
+      const w = widthOf(m);
+      // Headroom under a flight starts ≈2.3 m above the lower floor.
+      const sLow = s0 + (s1 - s0) * Math.min(1, 2.3 / rise);
+      // Obstacles stop 0.2 m short of the flight's ends: the end nodes (rounded to 0.1 m by
+      // node()) must lie outside, or no walkway could leave them.
+      return rectFromFrame(f.o, f.u, s0 + 0.2, sLow, (lat.get(k) as number) - w / 2 - 0.15, (lat.get(k) as number) + w / 2 + 0.15);
+    };
+    const well = (k: number, m: VerticalMode): ORect => {
+      const [s0, s1] = span.get(k) as [number, number];
+      const w = widthOf(m);
+      return rectFromFrame(f.o, f.u, s0 + 0.2, s1 - 0.2, (lat.get(k) as number) - w / 2 - 0.15, (lat.get(k) as number) + w / 2 + 0.15);
+    };
+    // Slide the bundle along (and, off platforms, across) its line until no corridor centre line
+    // on either level runs through a flight (its low end below, its well above) and it does not
+    // overlap flights laid out before it.
+    {
+      const near = (n: NetNode) => Math.min(Math.hypot(n.x - L.x, n.z - L.z), Math.hypot(n.x - U.x, n.z - U.z)) < 60 + flightRun('stairs', rise);
+      const lines: { a: XZ; b: XZ; level: 'low' | 'high' }[] = [];
+      for (const e of this.edges) {
+        if (e.kind === 'stairs' || e.kind === 'escalator' || e.kind === 'elevator') continue;
+        const a = this.get(e.a);
+        const b = this.get(e.b);
+        if (!near(a) && !near(b)) continue;
+        if (Math.abs(a.y - L.y) < 0.6 && Math.abs(b.y - L.y) < 0.6) lines.push({ a, b, level: 'low' });
+        else if (Math.abs(a.y - U.y) < 0.6 && Math.abs(b.y - U.y) < 0.6) lines.push({ a, b, level: 'high' });
+      }
+      const others = this.placedFlights.filter((p) => p.y0 < U.y + 2.3 && p.y1 > L.y - 2.3);
+      const cost = () => {
+        let c = 0;
+        for (const { m, k } of flights) {
+          const lo = inflate(lowPart(k, m), 0.6);
+          const hi = inflate(well(k, m), 0.4);
+          for (const ln of lines) if (segmentHitsRect(ln.level === 'low' ? lo : hi, ln.a, ln.b)) c++;
+          const w = well(k, m);
+          for (const o of others) if (rectsOverlap(w, o.rect)) c++;
+        }
+        return c;
+      };
+      const steps = f.anchor === 'top' ? [0, -1, -2, -3, -4, -5, -6, -8, -10, -12, -15, -18, -22] : f.anchor === 'bottom' ? [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 22] : [0, 1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 12, -12];
+      const across = f.platform ? [0, 0.5, -0.5, 1, -1] : [0, 1.5, -1.5, 3, -3, 5, -5, 8, -8];
+      let best = { c: Infinity, ds: 0, dl: 0, score: Infinity };
+      for (const ds of steps) {
+        for (const dl of across) {
+          place(ds, dl);
+          const c = cost();
+          const score = c * 1000 + Math.abs(ds) + 1.5 * Math.abs(dl);
+          if (score < best.score) best = { c, ds, dl, score };
+          if (c === 0) break;
+        }
+        if (best.c === 0) break;
+      }
+      place(best.ds, best.dl);
+      for (const { m, k } of flights) this.placedFlights.push({ rect: well(k, m), y0: L.y, y1: U.y });
+    }
+    const shafts: { k: number; s: number; l: number; rect: ORect }[] = [];
+    lifts.forEach(({ k }, i) => {
+      let s: number;
+      let l: number;
+      if (f.platform) {
+        // On a platform the shaft stands on the flights' line, between the node and the flights.
+        s = f.anchor === 'bottom' ? CLEAR + LANE_WIDTH.elevator / 2 : f.len - CLEAR - LANE_WIDTH.elevator / 2;
+        l = center + i * (LANE_WIDTH.elevator + LANE_GAP);
+      } else {
+        s = f.anchor === 'bottom' ? CLEAR + LANE_WIDTH.elevator / 2 : f.anchor === 'top' ? f.len - CLEAR - LANE_WIDTH.elevator / 2 : f.len / 2;
+        l = lat.get(k) as number;
+      }
+      const h = LANE_WIDTH.elevator / 2;
+      shafts.push({ k, s, l, rect: rectFromFrame(f.o, f.u, s - h, s + h, l - h, l + h) });
+    });
+    const lowObstacles = [...flights.map(({ m, k }) => lowPart(k, m)), ...shafts.map((x) => x.rect)];
+    const highObstacles = [...flights.map(({ m, k }) => well(k, m)), ...shafts.map((x) => x.rect)];
+
+    /** Level walkway from a flight end (or shaft) to a node, around wells and other shafts. */
+    const link = (from: string, to: string, level: 'low' | 'high', m: VerticalMode, w: number, own?: ORect) => {
+      const a = this.get(from);
+      const b = this.get(to);
+      const obstacles = (level === 'low' ? lowObstacles : highObstacles).filter((r) => r !== own);
+      const via = detour(a, b, obstacles);
+      const opts = { indoor: m.o.indoor, busy: m.o.busy, width: Math.max(w, 2.4) };
+      let prev = from;
+      via.forEach((p, i) => {
+        const id = `${from}>${to}~${i}`;
+        const n = this.has(id) ? id : newNode(id, p, a, a.name);
+        this.edge('walk', prev, n, opts);
+        prev = n;
+      });
+      if (prev !== to) this.edge('walk', prev, to, opts);
+    };
+
+    for (const { m, k } of flights) {
+      const [s0, s1] = span.get(k) as [number, number];
+      const l = lat.get(k) as number;
+      const label = m.o.name ?? (m.kind === 'stairs' ? '階段' : 'エスカレーター');
+      const foot = newNode(`${tag(k)}:foot`, at(s0, l), L, `${label}（${L.level}側）`);
+      const head = newNode(`${tag(k)}:head`, at(s1, l), U, `${label}（${U.level}側）`);
+      const opts = { ...m.o, dir: m.dir };
+      if (m.kind === 'stairs') {
+        const n = Math.max(0, Math.ceil(rise / STAIR_LANDING_EVERY - 1e-6) - 1);
+        const segRise = rise / (n + 1);
+        const segRun = segRise * STAIR_RUN_PER_RISE;
+        let prev = foot;
+        let s = s0;
+        for (let i = 1; i <= n; i++) {
+          const y = L.y + segRise * i;
+          const a1 = newNode(`${tag(k)}:l${i}a`, at(s + segRun, l), L, `${label} 踊り場`, y);
+          const b1 = newNode(`${tag(k)}:l${i}b`, at(s + segRun + STAIR_LANDING_DEPTH, l), L, `${label} 踊り場`, y);
+          this.get(a1).landing = true;
+          this.get(b1).landing = true;
+          this.edge('stairs', prev, a1, opts);
+          this.edge('stairs', a1, b1, opts);
+          prev = b1;
+          s += segRun + STAIR_LANDING_DEPTH;
+        }
+        this.edge('stairs', prev, head, opts);
+      } else {
+        this.edge('escalator', foot, head, opts);
+      }
+      link(L.id, foot, 'low', m, widthOf(m));
+      link(head, U.id, 'high', m, widthOf(m));
+    }
+    for (const sh of shafts) {
+      const m = v.modes[sh.k];
+      const label = m.o.name ?? 'エレベーター';
+      // The cabin rides at the shaft centre; the renderer draws the shaft around it.
+      const c = at(sh.s, sh.l);
+      const foot = newNode(`${tag(sh.k)}:foot`, c, L, `${label}（${L.level}）`);
+      const head = newNode(`${tag(sh.k)}:head`, c, U, `${label}（${U.level}）`);
+      this.edge('elevator', foot, head, { ...m.o });
+      link(L.id, foot, 'low', m, LANE_WIDTH.elevator, sh.rect);
+      link(head, U.id, 'high', m, LANE_WIDTH.elevator, sh.rect);
+    }
+  }
+
+  /**
+   * Plan frame of a bundle: origin o (s = 0 where L projects), unit u pointing the way people
+   * walk UP, n = u rotated +90°, len = where U projects, the anchor, and where the lanes go
+   * across (center(totalWidth) → lateral offset of the bundle's centre line).
+   */
+  private bundleFrame(
+    L: NetNode,
+    U: NetNode,
+    v: VerticalSpec,
+  ): { o: XZ; u: XZ; n: XZ; len: number; anchor: 'top' | 'bottom' | 'mid'; platform: Platform | null; center: (w: number) => number } {
+    const dx = U.x - L.x;
+    const dz = U.z - L.z;
+    const d = Math.hypot(dx, dz);
+    const pU = this.platformUnder(U);
+    const pL = this.platformUnder(L);
+    const plat = pU && pL ? null : (pU ?? pL ?? null);
+    const maxRun = Math.max(...v.modes.map((m) => flightRun(m.kind, U.y - L.y)));
+    let u: XZ;
+    if (v.o.bearingUp !== undefined) {
+      const r = (v.o.bearingUp * Math.PI) / 180;
+      u = { x: Math.sin(r), z: -Math.cos(r) };
+    } else if (plat) {
+      // Platform stairs run along the platform, inside its outline, ending towards the other node.
+      const pf = platformFrame(plat);
+      const on = plat === pU ? U : L;
+      const other = plat === pU ? L : U;
+      const t = alongOf(pf.o, pf.u, on);
+      const tOther = alongOf(pf.o, pf.u, other);
+      const score = (sg: 1 | -1) => {
+        // The flight leaves the platform node's end towards the other node's side.
+        const far = plat === pU ? tOther + sg * (maxRun + 5) : tOther - sg * (maxRun + 5);
+        const out = Math.max(0, -far, far - pf.len);
+        return out * 100 + Math.abs(far - t);
+      };
+      const sg = score(1) <= score(-1) ? 1 : -1;
+      u = { x: pf.u.x * sg, z: pf.u.z * sg };
+    } else if (d >= 1.5) {
+      u = { x: dx / d, z: dz / d };
+    } else {
+      // Stacked landings: continue straight on from the longest corridor arriving at the top.
+      let best: NetNode | null = null;
+      for (const e of this.edges) {
+        const other = e.a === U.id ? e.b : e.b === U.id ? e.a : null;
+        if (!other || e.kind === 'stairs' || e.kind === 'escalator' || e.kind === 'elevator') continue;
+        const n = this.get(other);
+        if (!best || Math.hypot(n.x - U.x, n.z - U.z) > Math.hypot(best.x - U.x, best.z - U.z)) best = n;
+      }
+      const bx = best ? best.x - U.x : 0;
+      const bz = best ? best.z - U.z : -1;
+      const bl = Math.hypot(bx, bz) || 1;
+      u = { x: bx / bl, z: bz / bl };
+    }
+    const n = { x: -u.z, z: u.x };
+    const len = dx * u.x + dz * u.z;
+    // Platform bundles are anchored at the concourse end (people walk along the platform to the
+    // stair head); otherwise at a declared landing node, else centred when there is room.
+    const anchor: 'top' | 'bottom' | 'mid' =
+      v.o.anchor ??
+      (plat === pU && plat ? 'bottom' : plat === pL && plat ? 'top' : L.kind === 'vertical' && U.kind !== 'vertical' ? 'bottom' : U.kind === 'vertical' && L.kind !== 'vertical' ? 'top' : len >= maxRun + 2.4 ? 'mid' : 'top');
+    const through = anchor === 'top' ? U : anchor === 'bottom' ? L : { x: (L.x + U.x) / 2, z: (L.z + U.z) / 2 };
+    const sAt = anchor === 'top' ? len : anchor === 'bottom' ? 0 : len / 2;
+    const o = { x: through.x - u.x * sAt, z: through.z - u.z * sAt };
+    let center: (w: number) => number = () => 0;
+    if (plat) {
+      // Across the platform: the walking line is at +walk (platform frame); keep 0.9 m clear of
+      // it and 0.7 m from the far edge.
+      const pf = platformFrame(plat);
+      const walk = platformWalkOffset(plat);
+      const sameSide = pf.n.x * n.x + pf.n.z * n.z > 0 ? 1 : -1;
+      const oLat = lateralOf(pf.o, pf.u, o);
+      center = (w) => {
+        const lim = Math.max(0, plat.width / 2 - 0.7 - w / 2);
+        const want = Math.max(-lim, Math.min(lim, walk - 0.9 - w / 2));
+        return (want - oLat) * sameSide;
+      };
+    }
+    return { o, u, n, len, anchor, platform: plat, center };
+  }
+
+  /** The platform whose slab a node stands on (same height, inside its outline), if any. */
+  private platformUnder(n: NetNode): Platform | undefined {
+    if (n.platformId) return this.platforms.find((p) => p.id === n.platformId);
+    return this.platforms.find((p) => {
+      if (Math.abs(p.y - n.y) > 0.6) return false;
+      const ax = p.b[0] - p.a[0];
+      const az = p.b[1] - p.a[1];
+      const al = Math.hypot(ax, az) || 1;
+      const t = ((n.x - p.a[0]) * ax + (n.z - p.a[1]) * az) / al;
+      const lat = Math.abs(((n.x - p.a[0]) * az - (n.z - p.a[1]) * ax) / al);
+      return t >= -2 && t <= al + 2 && lat <= p.width / 2 + 0.5;
+    });
   }
 
   /** Adds a platform with boarding nodes along it, chained by platform edges. Returns node ids by key. */
@@ -280,6 +657,7 @@ export class NetBuilder {
   }
 
   build(): Network {
+    this.layoutFlights();
     return {
       levels: this.levels,
       lines: this.lines,

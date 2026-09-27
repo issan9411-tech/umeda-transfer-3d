@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { Graph } from '../core/graph';
 import type { NetEdge, NetNode, Platform } from '../core/types';
+import { CLEARANCE, flightWidth, WalkSpace, type WalkPiece } from './walk-space';
 import * as TX from './walkway-tex';
 import { arrowFor, cabinCycle, destinationsVia, dominantAngle, hash01, isMallEdge, isVertical, laneOffsets, mouthTrims, subtractConvex, type P2, type SignTarget } from './walkway-util';
 
@@ -304,6 +305,44 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
   const visible = (e: NetEdge) => o.levelVisible(nodeOf(e.a).level) || o.levelVisible(nodeOf(e.b).level);
   const dim = o.dark ? 0.74 : 1;
   const col = (hex: string, k = 1) => new THREE.Color(hex).multiplyScalar(k);
+  const space = WalkSpace.of(g.net);
+  const Y0 = Y(0);
+  /** Scene height → real metres (walk-space.ts works in real metres). */
+  const real = (y: number) => (y - Y0) / ex;
+  /** Skip the walk-space pieces with these ids (a wall never clips against its own corridor). */
+  const not =
+    (...ids: string[]) =>
+    (p: WalkPiece) =>
+      ids.includes(p.id);
+  /**
+   * Vertical quad with bottom edge a→b and top edge d←c, emitted only where it does not stand in
+   * walkable space: no wall, parapet or shopfront ever blocks a path someone walks. Returns the
+   * kept parameter runs along a→b.
+   */
+  const vquad = (
+    target: Geo,
+    a: THREE.Vector3,
+    b: THREE.Vector3,
+    c2: THREE.Vector3,
+    d: THREE.Vector3,
+    uv: UV4,
+    want: THREE.Vector3,
+    color: THREE.Color | readonly THREE.Color[] = WHITE,
+    skip?: (p: WalkPiece) => boolean,
+  ): [number, number][] => {
+    const runs = space.open(a.x, a.z, b.x, b.z, real(Math.min(a.y, b.y)), real(Math.max(c2.y, d.y)), skip);
+    for (const [t0, t1] of runs) {
+      const u = (i0: number, i1: number, t: number) => uv[i0] + (uv[i1] - uv[i0]) * t;
+      const sub: UV4 = [u(0, 2, t0), u(1, 3, t0), u(0, 2, t1), u(1, 3, t1), u(6, 4, t1), u(7, 5, t1), u(6, 4, t0), u(7, 5, t0)];
+      let cols: THREE.Color | THREE.Color[] = color as THREE.Color;
+      if (Array.isArray(color)) {
+        const cl = color as readonly THREE.Color[];
+        cols = [cl[0].clone().lerp(cl[1], t0), cl[0].clone().lerp(cl[1], t1), cl[3].clone().lerp(cl[2], t1), cl[3].clone().lerp(cl[2], t0)];
+      }
+      target.quad(a.clone().lerp(b, t0), a.clone().lerp(b, t1), d.clone().lerp(c2, t1), d.clone().lerp(c2, t0), sub, want, cols);
+    }
+    return runs;
+  };
 
   const c = {
     wallStation: col('#ffffff', dim),
@@ -378,50 +417,104 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
   const floorQuad = (kind: FloorKind, a: THREE.Vector3, b: THREE.Vector3, cc: THREE.Vector3, d: THREE.Vector3) =>
     geo[kind].quad(a, b, cc, d, gridUV(a, b, cc, d, floorScale[kind]), UP);
 
-  // ------------------------------------------------------------------ vertical bundles (laid out first: their wells open the floors above)
-  const laneWidth = verticalLaneWidth;
-  const byPair = new Map<string, NetEdge[]>();
-  for (const e of g.edges) {
-    if (!isVertical(e) || !visible(e)) continue;
-    const key = e.a < e.b ? `${e.a}|${e.b}` : `${e.b}|${e.a}`;
-    const list = byPair.get(key) ?? [];
-    list.push(e);
-    byPair.set(key, list);
+  // ------------------------------------------------------------------ vertical flights (laid out first: their wells open the floors above)
+  // builder.ts lays every staircase out as straight flights joined by level landings (nodes
+  // flagged `landing`), every escalator as one 30° incline and every lift as a vertical shaft.
+  // A staircase is grouped back together here so its well, enclosure and balustrade span all of it.
+  interface Seg {
+    e: NetEdge;
+    a: NetNode;
+    b: NetNode;
   }
-  const bundles = [...byPair.values()].map((es) => {
-    const center = Math.max(0, es.findIndex((e) => route.has(e.id)));
-    const offs = laneOffsets(es.map(laneWidth), center);
-    const na = nodeOf(es[0].a);
-    const nb = nodeOf(es[0].b);
-    const [lo, hi] = na.y <= nb.y ? [P(na), P(nb)] : [P(nb), P(na)];
-    const { dir, left, run } = frame(lo, hi);
-    const rise = hi.y - lo.y;
-    const line = (s: number, lat: number, h = 0) =>
-      V(lo.x + dir.x * s + left.x * lat, lo.y + rise * (run > 1e-3 ? s / run : 0) + h, lo.z + dir.z * s + left.z * lat);
-    const lanes = es.map((e, k) => ({ e, k })).filter(({ e }) => e.kind !== 'elevator');
-    const lmin = lanes.length ? Math.min(...lanes.map(({ e, k }) => offs[k] - laneWidth(e) / 2)) - 0.15 : 0;
-    const lmax = lanes.length ? Math.max(...lanes.map(({ e, k }) => offs[k] + laneWidth(e) / 2)) + 0.15 : 0;
-    return { es, offs, na, nb, lo, hi, dir, left, run, rise, line, lmin, lmax, hasLanes: lanes.length > 0, indoor: es.every((e) => e.indoor) };
-  });
+  interface Flight {
+    kind: 'stairs' | 'escalator' | 'elevator';
+    segs: Seg[];
+    lo: NetNode;
+    hi: NetNode;
+    w: number;
+    indoor: boolean;
+    ids: Set<string>;
+  }
+  const flights: Flight[] = [];
+  {
+    const used = new Set<string>();
+    const vertAt = new Map<string, NetEdge[]>();
+    for (const e of g.edges) {
+      if (!isVertical(e)) continue;
+      for (const id of [e.a, e.b]) {
+        const l = vertAt.get(id) ?? [];
+        l.push(e);
+        vertAt.set(id, l);
+      }
+    }
+    for (const e of g.edges) {
+      if (!isVertical(e) || used.has(e.id) || !visible(e)) continue;
+      used.add(e.id);
+      const chain: NetEdge[] = [e];
+      const ends: string[] = [];
+      for (const start of [e.a, e.b]) {
+        let at = start;
+        let prev = e;
+        while (nodeOf(at).landing) {
+          const next = (vertAt.get(at) ?? []).find((x) => x !== prev && !used.has(x.id));
+          if (!next) break;
+          used.add(next.id);
+          chain.push(next);
+          prev = next;
+          at = next.a === at ? next.b : next.a;
+        }
+        ends.push(at);
+      }
+      const n0 = nodeOf(ends[0]);
+      const n1 = nodeOf(ends[1]);
+      const [lo, hi] = n0.y <= n1.y ? [n0, n1] : [n1, n0];
+      const segs: Seg[] = [];
+      const rest = new Set(chain);
+      let cur = lo.id;
+      while (rest.size) {
+        const next = [...rest].find((x) => x.a === cur || x.b === cur);
+        if (!next) break;
+        rest.delete(next);
+        const other = next.a === cur ? next.b : next.a;
+        segs.push({ e: next, a: nodeOf(cur), b: nodeOf(other) });
+        cur = other;
+      }
+      flights.push({ kind: e.kind as Flight['kind'], segs, lo, hi, w: flightWidth(e), indoor: chain.every((x) => x.indoor), ids: new Set(chain.map((x) => x.id)) });
+    }
+  }
 
-  /** Openings in the upper floor over each flight (and around elevator shafts). */
+  /** Openings in the upper floor over each staircase / escalator (and around lift shafts). */
   const wells: { poly: P2[]; y: number; box: [number, number, number, number] }[] = [];
-  const addWell = (pts: THREE.Vector3[], y: number) => {
-    const poly = pts.map((p) => [p.x, p.z] as P2);
+  /** Openings in ceilings the flights pass through (real heights). */
+  const ceilHoles: { poly: P2[]; y0: number; y1: number; box: [number, number, number, number] }[] = [];
+  const boxOf = (poly: P2[]): [number, number, number, number] => {
     const xs = poly.map((p) => p[0]);
     const zs = poly.map((p) => p[1]);
-    wells.push({ poly, y, box: [Math.min(...xs), Math.max(...xs), Math.min(...zs), Math.max(...zs)] });
+    return [Math.min(...xs), Math.max(...xs), Math.min(...zs), Math.max(...zs)];
   };
-  for (const b of bundles) {
-    if (b.run < 0.5 || b.rise < 1) continue;
-    if (b.hasLanes) addWell([b.line(0, b.lmin), b.line(b.run, b.lmin), b.line(b.run, b.lmax), b.line(0, b.lmax)], b.hi.y);
-    b.es.forEach((e, k) => {
-      if (e.kind !== 'elevator') return;
-      const S = b.line(b.run / 2, b.offs[k]);
-      const d = b.dir.clone().multiplyScalar(1.25);
-      const l = b.left.clone().multiplyScalar(1.25);
-      addWell([S.clone().sub(d).sub(l), S.clone().add(d).sub(l), S.clone().add(d).add(l), S.clone().sub(d).add(l)], b.hi.y);
-    });
+  const addWell = (pts: THREE.Vector3[], y: number) => {
+    const poly = pts.map((p) => [p.x, p.z] as P2);
+    wells.push({ poly, y, box: boxOf(poly) });
+  };
+  for (const f of flights) {
+    const A = P(f.lo);
+    const B = P(f.hi);
+    const { dir, left, run } = frame(A, B);
+    const hw = f.w / 2 + 0.15;
+    let pts: THREE.Vector3[];
+    if (f.kind === 'elevator' || run < 0.5) {
+      const d = dir.clone().multiplyScalar(1.3);
+      const l = left.clone().multiplyScalar(1.3);
+      pts = [A.clone().sub(d).sub(l), A.clone().add(d).sub(l), A.clone().add(d).add(l), A.clone().sub(d).add(l)];
+    } else {
+      const a0 = A.clone().sub(dir.clone().multiplyScalar(0.1));
+      const b0 = B.clone().sub(dir.clone().multiplyScalar(0.05));
+      const l = left.clone().multiplyScalar(hw);
+      pts = [a0.clone().sub(l), b0.clone().sub(l), b0.clone().add(l), a0.clone().add(l)];
+    }
+    if (B.y - A.y >= 1) addWell(pts, B.y);
+    const poly = pts.map((p) => [p.x, p.z] as P2);
+    ceilHoles.push({ poly, y0: f.lo.y, y1: f.hi.y + CLEARANCE, box: boxOf(poly) });
   }
 
   /** Solves value = a·x + b·z + c over a planar polygon from three of its corners. */
@@ -497,13 +590,38 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
   const gridOf = (kind: FloorKind) => (p: THREE.Vector3): [number, number] => [gu(p, floorScale[kind]), gv(p, floorScale[kind])];
   const floorPoly = (kind: FloorKind, pts: THREE.Vector3[], shade: number[] | null = null) => polyFloor(geo[kind], pts, gridOf(kind), shade);
 
+  /** Flat ceiling (convex, facing down) with openings where a flight passes through it. */
+  const ceilPoly = (pts: THREE.Vector3[]) => {
+    const yc = pts[0].y;
+    const yr = real(yc);
+    const bb = boxOf(pts.map((p) => [p.x, p.z] as P2));
+    let pieces: P2[][] = [pts.map((p) => [p.x, p.z] as P2)];
+    for (const h of ceilHoles) {
+      if (!(h.y0 < yr - 0.3 && h.y1 > yr) || h.box[1] < bb[0] || h.box[0] > bb[1] || h.box[3] < bb[2] || h.box[2] > bb[3]) continue;
+      pieces = pieces.flatMap((pc) => subtractConvex(pc, h.poly));
+    }
+    const uvc = (p: THREE.Vector3): [number, number] => [gu(p, TX.CEIL_M), gv(p, TX.CEIL_M)];
+    for (const pc of pieces) {
+      const vs = pc.map(([x, z]) => V(x, yc, z));
+      for (let i = 1; i + 1 < vs.length; i++) {
+        const a = uvc(vs[0]);
+        const b = uvc(vs[i]);
+        const cc = uvc(vs[i + 1]);
+        geo.ceil.tri(vs[0], vs[i], vs[i + 1], [a[0], a[1], b[0], b[1], cc[0], cc[1]], DOWN);
+      }
+    }
+  };
+
   // ------------------------------------------------------------------ junction arms
   const platformOf = new Map(g.net.platforms.map((p) => [p.id, p]));
+  /** Standing on a platform slab (boarding positions, stair heads and their walkways). */
+  const onPlatform = (n: NetNode) => n.kind === 'platform' || !!n.platformId || space.platformAt(n.x, n.z, n.y) !== null;
   /** Walkways running along a platform stay open to the tracks (no walls or ceiling). */
   const alongPlatform = (e: NetEdge) => {
     const a = nodeOf(e.a);
     const b = nodeOf(e.b);
     if (e.kind === 'platform') return true;
+    if (onPlatform(a) || onPlatform(b)) return true;
     if (a.platformId && a.platformId === b.platformId) return true;
     const ex_ = b.x - a.x;
     const ez = b.z - a.z;
@@ -545,7 +663,6 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     list.forEach((arm, k) => (arm.trim = Math.min(t[k], arm.run * 0.45)));
   }
   const trimAt = (nodeId: string, idx: number) => arms.get(nodeId)?.find((x) => x.idx === idx)?.trim ?? 0;
-  const onPlatform = (n: NetNode) => n.kind === 'platform' || !!n.platformId;
   const hasVertical = new Set<string>();
   for (const e of g.edges) if (isVertical(e) || e.kind === 'platform') hasVertical.add(e.a), hasVertical.add(e.b);
 
@@ -615,12 +732,20 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
       for (const side of [1, -1]) {
         const lat = side * hw;
         const inward = left.clone().multiplyScalar(-side);
-        geo.wall.quad(at(s0, lat), at(s1, lat), at(s1, lat, H), at(s0, lat, H), uvRect(s0 / TX.WALL_M, 0, s1 / TX.WALL_M, 1), inward, [low, low, tint, tint]);
-        if (mall) addShops(e, at, s0, s1, side, hw, H, inward);
-        else if (e.kind === 'walk') addAds(e, at, s0, s1, side, hw, inward);
+        const runs = vquad(geo.wall, at(s0, lat), at(s1, lat), at(s1, lat, H), at(s0, lat, H), uvRect(s0 / TX.WALL_M, 0, s1 / TX.WALL_M, 1), inward, [low, low, tint, tint], not(e.id));
+        // Shopfronts and adverts only on the wall that is actually there (not across openings).
+        for (const [t0, t1] of runs) {
+          const a0 = s0 + (s1 - s0) * t0;
+          const a1 = s0 + (s1 - s0) * t1;
+          if (mall) addShops(e, at, a0, a1, side, hw, H, inward);
+          else if (e.kind === 'walk') addAds(e, at, a0, a1, side, hw, inward);
+        }
       }
-      const q = [at(s0, hw, H), at(s1, hw, H), at(s1, -hw, H), at(s0, -hw, H)] as const;
-      geo.ceil.quad(q[0], q[1], q[2], q[3], gridUV(q[0], q[1], q[2], q[3], TX.CEIL_M), DOWN);
+      if (Math.abs(A.y - B.y) < 0.05) ceilPoly([at(s0, hw, H), at(s1, hw, H), at(s1, -hw, H), at(s0, -hw, H)]);
+      else {
+        const q = [at(s0, hw, H), at(s1, hw, H), at(s1, -hw, H), at(s0, -hw, H)] as const;
+        geo.ceil.quad(q[0], q[1], q[2], q[3], gridUV(q[0], q[1], q[2], q[3], TX.CEIL_M), DOWN);
+      }
       addLights(at, s0, s1, w, H);
       if (e.name?.includes('動く歩道')) addMovingWalkway(at, s0, s1, w, dir);
       else if (w >= 10 && e.kind === 'walk') addPillars(e, at, s0, s1, w, H);
@@ -629,8 +754,9 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
       for (const side of [1, -1]) {
         const lat = side * (hw - 0.05);
         const h = 1.1 * ex;
-        geo.glass.quad(at(s0, lat, lift), at(s1, lat, lift), at(s1, lat, h), at(s0, lat, h), uvRect(0, 0, 1, 1), left.clone().multiplyScalar(-side));
-        boxes.beam(at(s0, lat, h), at(s1, lat, h), 0.12, 0.1, c.railLight);
+        for (const [t0, t1] of vquad(geo.glass, at(s0, lat, lift), at(s1, lat, lift), at(s1, lat, h), at(s0, lat, h), uvRect(0, 0, 1, 1), left.clone().multiplyScalar(-side), WHITE, not(e.id))) {
+          boxes.beam(at(s0 + (s1 - s0) * t0, lat, h), at(s0 + (s1 - s0) * t1, lat, h), 0.12, 0.1, c.railLight);
+        }
       }
     }
   });
@@ -664,8 +790,9 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
       const l0 = side * (rowHalf - 0.3);
       const l1 = side * (w / 2 - 0.05);
       if (Math.abs(l1) - Math.abs(l0) < 0.3) continue;
-      geo.glass.quad(at(s, l0, 0.05), at(s, l1, 0.05), at(s, l1, h), at(s, l0, h), uvRect(0, 0, 1, 1), dir);
-      boxes.beam(at(s, l0, h), at(s, l1, h), 0.08, 0.08, c.railLight);
+      for (const [t0, t1] of vquad(geo.glass, at(s, l0, 0.05), at(s, l1, 0.05), at(s, l1, h), at(s, l0, h), uvRect(0, 0, 1, 1), dir, WHITE, not(e.id))) {
+        boxes.beam(at(s, l0 + (l1 - l0) * t0, h), at(s, l0 + (l1 - l0) * t1, h), 0.08, 0.08, c.railLight);
+      }
     }
     // 「改札」 sign above the row, both faces.
     const st = g.net.stations.find((x) => x.id === nodeOf(e.a).stationId || x.id === nodeOf(e.b).stationId);
@@ -681,7 +808,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     const lat = side * (hw - 0.04);
     const top = Math.min(2.8 * ex, H * 0.94);
     let s = s0 + 0.6;
-    let k = 0;
+    let k = Math.round(s0) * 7;
     while (s1 - 0.6 - s >= 3) {
       const r = hash01(e.id, k * 2 + (side > 0 ? 0 : 1));
       let L = 5 + r * 4;
@@ -699,7 +826,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
 
   function addAds(e: NetEdge, at: (s: number, lat: number, h?: number) => THREE.Vector3, s0: number, s1: number, side: number, hw: number, inward: THREE.Vector3): void {
     const lat = side * (hw - 0.05);
-    let k = 0;
+    let k = Math.round(s0) * 7;
     for (let s = s0 + 4; s + 3 < s1 - 3; s += 16, k++) {
       if (hash01(e.id, 300 + k * 2 + (side > 0 ? 0 : 1)) > 0.55) continue;
       const cell = TX.AD_CELLS[Math.floor(hash01(e.id, 400 + k) * TX.AD_CELLS.length)];
@@ -761,8 +888,13 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     const lats = [-w * 0.3, w * 0.3];
     const yaw = yawOf(at(1, 0).sub(at(0, 0)));
     let k = 0;
+    const own = not(e.id, `node:${e.a}`, `node:${e.b}`);
     for (let s = s0 + 4; s <= s1 - 4; s += 9, k++) {
       for (const lat of lats) {
+        // No pillar where another walkway crosses the concourse.
+        const p = at(s, lat);
+        const r = 0.45 * (Math.abs(Math.cos(yaw)) + Math.abs(Math.sin(yaw)));
+        if (space.intersectsBox(p.x - r, p.x + r, real(p.y), real(p.y) + H / ex, p.z - r, p.z + r, own)) continue;
         boxes.add(at(s, lat, H / 2), _s.set(0.8, H, 0.8), yaw, c.pillar);
         boxes.add(at(s, lat, 0.08 * ex), _s.set(0.86, 0.16 * ex, 0.86), yaw, c.pillarBase);
         // Every other pillar carries an illuminated advert wrap.
@@ -804,7 +936,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
       const H = a.H * ex;
       const lo = C.clone().sub(p);
       const hi = C.clone().add(p);
-      geo.wall.quad(lo, hi, hi.clone().setY(C.y + H), lo.clone().setY(C.y + H), uvRect(0, 0, a.width / TX.WALL_M, 1), d, c.wallStation);
+      vquad(geo.wall, lo, hi, hi.clone().setY(C.y + H), lo.clone().setY(C.y + H), uvRect(0, 0, a.width / TX.WALL_M, 1), d, c.wallStation, not(a.e.id, `node:${id}`));
       if (n.kind === 'entrance') {
         const dw = Math.min(a.width * 0.8, 7);
         const q = perpOf(a).multiplyScalar(dw / 2);
@@ -839,10 +971,9 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
 
     const hv = V(0, Hn, 0);
     for (let i = 0; i < poly.length; i++) {
-      const p0 = poly[i].clone().add(hv);
-      const p1 = poly[(i + 1) % poly.length].clone().add(hv);
-      const cc = C.clone().add(hv);
-      geo.ceil.tri(cc, p0, p1, [gu(cc, TX.CEIL_M), gv(cc, TX.CEIL_M), gu(p0, TX.CEIL_M), gv(p0, TX.CEIL_M), gu(p1, TX.CEIL_M), gv(p1, TX.CEIL_M)], DOWN);
+      const p0 = poly[i].clone().add(hv).setY(C.y + Hn);
+      const p1 = poly[(i + 1) % poly.length].clone().add(hv).setY(C.y + Hn);
+      ceilPoly([C.clone().add(hv), p0, p1]);
     }
     const lp = 0.8;
     geo.light.quad(C.clone().add(V(-lp, Hn - 0.03, -lp)), C.clone().add(V(lp, Hn - 0.03, -lp)), C.clone().add(V(lp, Hn - 0.03, lp)), C.clone().add(V(-lp, Hn - 0.03, lp)), uvRect(0, 0, 1, 1), DOWN);
@@ -855,7 +986,7 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
         const mid = p0.clone().add(p1).multiplyScalar(0.5);
         const inward = C.clone().sub(mid).setY(0);
         if (inward.lengthSq() < 1e-6) inward.copy(dirOf(list[k]));
-        geo.wall.quad(p0, p1, p1.clone().add(hv), p0.clone().add(hv), uvRect(0, 0, len / TX.WALL_M, 1), inward, c.wallStation);
+        vquad(geo.wall, p0, p1, p1.clone().add(hv), p0.clone().add(hv), uvRect(0, 0, len / TX.WALL_M, 1), inward, c.wallStation, not(`node:${id}`));
       }
       // Bulkhead above a lower corridor opening into a taller junction.
       const a = list[k];
@@ -918,60 +1049,91 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
    * overview).
    */
   // ------------------------------------------------------------------ stairs, escalators, elevators
-  for (const b of bundles) {
-    const { es, offs, na, nb, lo, dir, left, run, rise, line, lmin, lmax, indoor } = b;
-    const realRise = Math.abs(nb.y - na.y);
-    es.forEach((e, k) => {
-      const off = offs[k];
-      if (e.kind === 'stairs') addStairs(line, off, laneWidth(e), run, rise, realRise, dir, left, indoor);
-      else if (e.kind === 'escalator') addEscalator(e, line, off, run, rise, dir, na, nb);
-      else addElevator(e, line, off, run, b.lo, b.hi, dir, left);
-    });
+  for (const f of flights) {
+    const A = P(f.lo);
+    const B = P(f.hi);
+    const { dir, left, run } = frame(A, B);
+    const rise = B.y - A.y;
+    // Height profile along the staircase (flights and landings), s measured from its foot.
+    const prof = [{ s: 0, y: A.y }, ...f.segs.map((sg) => ({ s: Math.max(0, P(sg.b).sub(A).dot(dir)), y: P(sg.b).y }))];
+    const yOn = (s: number) => {
+      if (s <= prof[0].s) return prof[0].y;
+      for (let i = 1; i < prof.length; i++) {
+        const p0 = prof[i - 1];
+        const p1 = prof[i];
+        if (s <= p1.s) return p1.s - p0.s < 1e-6 ? p1.y : p0.y + ((p1.y - p0.y) * (s - p0.s)) / (p1.s - p0.s);
+      }
+      return prof[prof.length - 1].y;
+    };
+    const line = (s: number, lat: number, h = 0) => V(A.x + dir.x * s + left.x * lat, yOn(s) + h, A.z + dir.z * s + left.z * lat);
+    const skipOwn = (p: WalkPiece) => f.ids.has(p.id) || p.id === `node:${f.hi.id}` || p.id === `node:${f.lo.id}`;
+
+    if (f.kind === 'elevator') {
+      addElevator(f.segs[0].e, (s, lat, h = 0) => V(A.x + dir.x * s + left.x * lat, A.y + h, A.z + dir.z * s + left.z * lat), 0, 0, A, B, dir, left);
+      continue;
+    }
+    for (const sg of f.segs) {
+      const a = P(sg.a);
+      const b = P(sg.b);
+      const fr = frame(a, b);
+      const segRise = b.y - a.y;
+      const segLine = (s: number, lat: number, h = 0) => V(a.x + fr.dir.x * s + fr.left.x * lat, a.y + segRise * (fr.run > 1e-3 ? s / fr.run : 0) + h, a.z + fr.dir.z * s + fr.left.z * lat);
+      if (Math.abs(sg.b.y - sg.a.y) < 0.05) addLanding(segLine, fr.run, f.w, fr.dir, fr.left);
+      else if (f.kind === 'stairs') addStairs(segLine, 0, f.w, fr.run, segRise, Math.abs(sg.b.y - sg.a.y), fr.dir, fr.left, f.indoor);
+      else addEscalator(sg.e, segLine, 0, fr.run, segRise, fr.dir, nodeOf(sg.e.a), nodeOf(sg.e.b));
+    }
+    if (run < 0.5 || rise < 1) continue;
 
     // The upper landing is under a roof (a corridor or concourse) or open (a platform / deck).
-    const hiNode = na.y <= nb.y ? nb : na;
-    const upperRoofed = !onPlatform(hiNode) && (arms.get(hiNode.id) ?? []).every((a) => a.indoor || a.e.kind === 'platform');
+    const upperRoofed = !onPlatform(f.hi) && (arms.get(f.hi.id) ?? []).every((a) => a.indoor || a.e.kind === 'platform');
     const rh = 1.1 * ex;
+    const lmin = -f.w / 2 - 0.15;
+    const lmax = f.w / 2 + 0.15;
 
     // Balustrade around the opening in the upper floor (open at the top of the flight): glass
-    // in concourses, solid panels on platforms.
-    if (b.hasLanes && run >= 0.5 && rise >= 1) {
-      const edge = (s: number, lat: number) => line(s, lat).setY(b.hi.y);
-      const sides: [THREE.Vector3, THREE.Vector3, THREE.Vector3][] = [
-        [edge(0, lmin - 0.08), edge(run, lmin - 0.08), left.clone().negate()],
-        [edge(0, lmax + 0.08), edge(run, lmax + 0.08), left],
-        [edge(0, lmin - 0.08), edge(0, lmax + 0.08), dir.clone().negate()],
-      ];
-      for (const [p0, p1, out] of sides) {
-        const t0 = p0.clone().setY(p0.y + rh);
-        const t1 = p1.clone().setY(p1.y + rh);
-        if (upperRoofed || !indoor) geo.glass.quad(p0, p1, t1, t0, uvRect(0, 0, 1, 1), UP);
-        else geo.wall.quad(p0, p1, t1, t0, uvRect(0, 0, p0.distanceTo(p1) / TX.WALL_M, 0.3), out, c.wallStation);
-        boxes.beam(t0, t1, 0.08, 0.08, c.railLight);
-      }
+    // in concourses, solid panels on platforms. Clipped where a walkway meets the opening.
+    const edge = (s: number, lat: number) => line(s, lat).setY(B.y);
+    const sides: [THREE.Vector3, THREE.Vector3, THREE.Vector3][] = [
+      [edge(0, lmin - 0.08), edge(run, lmin - 0.08), left.clone().negate()],
+      [edge(0, lmax + 0.08), edge(run, lmax + 0.08), left],
+      [edge(0, lmin - 0.08), edge(0, lmax + 0.08), dir.clone().negate()],
+    ];
+    for (const [p0, p1, out] of sides) {
+      const t0 = p0.clone().setY(p0.y + rh);
+      const t1 = p1.clone().setY(p1.y + rh);
+      const runs =
+        upperRoofed || !f.indoor
+          ? vquad(geo.glass, p0, p1, t1, t0, uvRect(0, 0, 1, 1), UP, WHITE, skipOwn)
+          : vquad(geo.wall, p0, p1, t1, t0, uvRect(0, 0, p0.distanceTo(p1) / TX.WALL_M, 0.3), out, c.wallStation, skipOwn);
+      for (const [a0, a1] of runs) boxes.beam(t0.clone().lerp(t1, a0), t0.clone().lerp(t1, a1), 0.08, 0.08, c.railLight);
     }
 
-    // One enclosure around the stairs and escalators of the bundle: a double-height well with a
-    // flat ceiling at the upper level's ceiling height (parapet height under an open platform)
-    // and a bulkhead over the lower opening. A ceiling parallel to the flight would hang right in
-    // front of the eye: with the vertical exaggeration the flights are much steeper than real.
-    if (!indoor || run < 1 || !b.hasLanes) continue;
+    // One enclosure around the flight: a double-height well with a flat ceiling at the upper
+    // level's ceiling height (parapet height under an open platform) and a bulkhead over the
+    // lower opening. Walls are clipped wherever a walkway runs beside or across the well.
+    if (!f.indoor) continue;
     const H = 3.0 * ex;
-    const top = rise + (upperRoofed ? H : rh); // above lo
+    const top = rise + (upperRoofed ? H : rh); // above the foot
     const below = -1.4 * ex;
-    const flat = (s: number, lat: number, h: number) => line(s, lat).setY(lo.y + h);
+    const flat = (s: number, lat: number, h: number) => line(s, lat).setY(A.y + h);
     const tint = c.wallStation;
     const low = tint.clone().multiplyScalar(0.8);
     // Side walls stop at the lower level's ceiling: around the foot of the flight the lower
     // concourse stays open (people walk past it there).
-    const sx = Math.min(run, Math.max(0, ((H - below) / Math.max(rise, 1e-3)) * run));
+    let sx = run;
+    for (let s = 0; s <= run; s += 0.25) {
+      if (yOn(s) - A.y >= H - below) {
+        sx = s;
+        break;
+      }
+    }
     for (const [lat, want] of [[lmin, left], [lmax, left.clone().negate()]] as const) {
       if (sx > 0.05) {
         const v0 = H / top;
-        geo.wall.quad(flat(0, lat, H), flat(sx, lat, H), flat(sx, lat, top), flat(0, lat, top), [0, v0, sx / TX.WALL_M, v0, sx / TX.WALL_M, 1, 0, 1], want, tint);
+        vquad(geo.wall, flat(0, lat, H), flat(sx, lat, H), flat(sx, lat, top), flat(0, lat, top), [0, v0, sx / TX.WALL_M, v0, sx / TX.WALL_M, 1, 0, 1], want, tint, skipOwn);
       }
       if (sx < run - 0.05) {
-        geo.wall.quad(line(sx, lat, below), line(run, lat, below), flat(run, lat, top), flat(sx, lat, top), uvRect(sx / TX.WALL_M, 0, run / TX.WALL_M, 1), want, [low, low, tint, tint]);
+        vquad(geo.wall, line(sx, lat, below), line(run, lat, below), flat(run, lat, top), flat(sx, lat, top), uvRect(sx / TX.WALL_M, 0, run / TX.WALL_M, 1), want, [low, low, tint, tint], skipOwn);
       }
     }
     const bulkTop = upperRoofed ? top : rise;
@@ -981,10 +1143,23 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     if (!upperRoofed) continue;
     const q = [flat(0, lmin, top), flat(run, lmin, top), flat(run, lmax, top), flat(0, lmax, top)] as const;
     geo.ceil.quad(q[0], q[1], q[2], q[3], gridUV(q[0], q[1], q[2], q[3], TX.CEIL_M), DOWN);
-    const mid = (lmin + lmax) / 2;
     for (let s = 0.8; s + 2.4 <= run - 0.4; s += 3.4) {
-      geo.light.quad(flat(s, mid - 0.13, top - 0.03), flat(s + 2.4, mid - 0.13, top - 0.03), flat(s + 2.4, mid + 0.13, top - 0.03), flat(s, mid + 0.13, top - 0.03), uvRect(0, 0, 1, 1), DOWN);
+      geo.light.quad(flat(s, -0.13, top - 0.03), flat(s + 2.4, -0.13, top - 0.03), flat(s + 2.4, 0.13, top - 0.03), flat(s, 0.13, top - 0.03), uvRect(0, 0, 1, 1), DOWN);
     }
+  }
+
+  /** Level stair landing: slab with a soffit and side faces, same finish as the treads. */
+  function addLanding(line: (s: number, lat: number, h?: number) => THREE.Vector3, run: number, sw: number, dir: THREE.Vector3, left: THREE.Vector3): void {
+    const L0 = -sw / 2;
+    const L1 = sw / 2;
+    const th = 0.3;
+    geo.stair.quad(line(0, L0), line(run, L0), line(run, L1), line(0, L1), [0, 1, 0, 0.5, 1, 0.5, 1, 1], UP);
+    geo.stair.quad(line(0, L0, -th), line(run, L0, -th), line(run, L1, -th), line(0, L1, -th), [0, 0, 1, 0, 1, 0.25, 0, 0.25], DOWN);
+    geo.stair.quad(line(0, L0, -th), line(run, L0, -th), line(run, L0), line(0, L0), [0, 0, 1, 0, 1, 0.25, 0, 0.25], left.clone().negate());
+    geo.stair.quad(line(0, L1, -th), line(run, L1, -th), line(run, L1), line(0, L1), [0, 0, 1, 0, 1, 0.25, 0, 0.25], left);
+    const hr = 0.85 * ex;
+    for (const lat of [L0 + 0.12, L1 - 0.12]) boxes.beam(line(0, lat, hr), line(run, lat, hr), 0.06, 0.07, c.steel);
+    void dir;
   }
 
   function addStairs(

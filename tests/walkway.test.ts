@@ -116,37 +116,26 @@ describe('walk-through interiors', () => {
     disposeWalkway(group);
   });
 
-  it('lays the route’s staircase on the node line the walker follows', () => {
-    const stairs = g.edges.find((e) => e.kind === 'stairs' && e.a === 'f_mido_s' && e.b === 'f_jrf_b1')!;
-    const esc = g.edges.find((e) => e.kind === 'escalator' && e.a === 'f_mido_s' && e.b === 'f_jrf_b1')!;
-    const mid = (id: string) => {
-      const group = buildWalkway(g, { ...opts, routeEdges: new Set([id]) });
-      const m = group.getObjectByName('stairs') as THREE.Mesh;
-      const pos = m.geometry.getAttribute('position');
-      const a = g.nodes[g.nodeIndex.get('f_mido_s')!];
-      const b = g.nodes[g.nodeIndex.get('f_jrf_b1')!];
-      // Distance of the stair vertices closest to the segment a–b (plan view).
-      const dx = b.x - a.x;
-      const dz = b.z - a.z;
-      const len = Math.hypot(dx, dz);
-      // Mean signed lateral offset of the stair vertices from the segment a–b (plan view).
-      let sum = 0;
-      let n = 0;
-      for (let i = 0; i < pos.count; i++) {
-        const px = pos.getX(i) - a.x;
-        const pz = pos.getZ(i) - a.z;
-        const t = (px * dx + pz * dz) / (len * len);
-        const lat = (px * dz - pz * dx) / len;
-        // Only this flight: between its landings in plan and in height, within a few metres.
-        if (t < 0.2 || t > 0.8 || Math.abs(lat) > 6 || pos.getY(i) > a.y * 1.5 || pos.getY(i) < b.y * 1.5) continue;
-        sum += lat;
-        n++;
-      }
-      disposeWalkway(group);
-      return Math.abs(sum / n);
-    };
-    expect(mid(stairs.id)).toBeLessThan(0.5); // the flight straddles the line
-    expect(mid(esc.id)).toBeGreaterThan(0.5); // …and moves aside when the escalator is taken
+  it('draws each staircase along the flight the walker climbs', () => {
+    const flight = g.edges.find((e) => e.kind === 'stairs' && Math.abs(g.rise[g.edgeIndex.get(e.id)!]) > 2)!;
+    const a = g.nodes[g.nodeIndex.get(flight.a)!];
+    const b = g.nodes[g.nodeIndex.get(flight.b)!];
+    const group = buildWalkway(g, opts);
+    const pos = (group.getObjectByName('stairs') as THREE.Mesh).geometry.getAttribute('position');
+    const dx = b.x - a.x;
+    const dz = b.z - a.z;
+    const len = Math.hypot(dx, dz);
+    let n = 0;
+    for (let i = 0; i < pos.count; i++) {
+      const px = pos.getX(i) - a.x;
+      const pz = pos.getZ(i) - a.z;
+      const t = (px * dx + pz * dz) / (len * len);
+      const lat = Math.abs(px * dz - pz * dx) / len;
+      // Treads over the middle of the flight, within its width, between its landings' heights.
+      if (t > 0.3 && t < 0.7 && lat < 2 && pos.getY(i) > Math.min(a.y, b.y) * 1.5 && pos.getY(i) < Math.max(a.y, b.y) * 1.5 + 0.5) n++;
+    }
+    disposeWalkway(group);
+    expect(n).toBeGreaterThan(20);
   });
 
   it('animates escalators and elevator cabins without NaN', () => {

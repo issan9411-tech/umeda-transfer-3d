@@ -15,7 +15,7 @@ export function validateNetwork(g: Graph): string[] {
   for (const n of g.nodes) {
     const y = levelY.get(n.level);
     if (y === undefined) out.push(`node ${n.id}: unknown level ${n.level}`);
-    else if (Math.abs(y - n.y) > 4) out.push(`node ${n.id}: y=${n.y} far from level ${n.level} (${y})`);
+    else if (!n.landing && Math.abs(y - n.y) > 4) out.push(`node ${n.id}: y=${n.y} far from level ${n.level} (${y})`);
     if (n.stationId && !net.stations.some((s) => s.id === n.stationId)) out.push(`node ${n.id}: unknown station ${n.stationId}`);
     if (n.kind === 'platform' && !net.platforms.some((p) => p.id === n.platformId)) out.push(`node ${n.id}: unknown platform ${n.platformId}`);
   }
@@ -25,7 +25,8 @@ export function validateNetwork(g: Graph): string[] {
     const b = g.nodes[g.nodeIndex.get(e.b) as number];
     const rise = Math.abs(g.rise[i]);
     const vertical = e.kind === 'stairs' || e.kind === 'escalator' || e.kind === 'elevator';
-    if (vertical && rise < 1) out.push(`edge ${e.id}: ${e.kind} with no height change`);
+    // A stair landing (between two flights) is level by design.
+    if (vertical && rise < 1 && !(a.landing && b.landing)) out.push(`edge ${e.id}: ${e.kind} with no height change`);
     if (!vertical && e.kind !== 'gate' && g.hlen[i] < 0.5 && rise < 0.5) out.push(`edge ${e.id}: zero-length ${e.kind}`);
     if (!vertical && rise > 3.5) out.push(`edge ${e.id}: ${e.kind} climbs ${rise.toFixed(1)} m without stairs/escalator/elevator`);
     if (e.kind === 'gate') {

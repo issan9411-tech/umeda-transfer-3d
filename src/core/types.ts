@@ -34,6 +34,8 @@ export interface NetNode {
   paid?: boolean;
   /** Show a text label in the 3D view. */
   label?: boolean;
+  /** Intermediate stair landing between two levels (its y lies between them). */
+  landing?: boolean;
 }
 
 export type EdgeKind =
