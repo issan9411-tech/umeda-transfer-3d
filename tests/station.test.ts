@@ -1,10 +1,13 @@
 import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
+import type { NetEdge, NetNode, Network } from '../src/core/types';
 import { umeda } from '../src/data/umeda';
-import { buildStations, buildTrainModel, stationLayouts } from '../src/render/station';
-import { frameOf, hash01, rectArea, rectMinusHoles, toLocal, toWorld } from '../src/render/station-geo';
+import { buildStations, buildTrainModel, computeWells, FrameSpace, stationLayouts } from '../src/render/station';
+import { clipToRect, frameOf, gaps, hash01, rectArea, rectMinusHoles, toLocal, toWorld } from '../src/render/station-geo';
 import { signAtlas } from '../src/render/station-tex';
 import { bodyProfile, carsFor, liveryFor, trainLength, trainParts } from '../src/render/train';
+import { WalkSpace } from '../src/render/walk-space';
+import { verticalLaneOffsets } from '../src/render/walkway';
 
 const net = umeda.network;
 const walkOpts = { Y: (y: number) => y * 1.5, ex: 1.5, dark: false, levelVisible: () => true, walk: true };
@@ -53,6 +56,30 @@ describe('plan helpers', () => {
       expect(r.t1).toBeGreaterThan(r.t0);
     }
     expect(rectMinusHoles(outer, [])).toEqual([outer]);
+  });
+
+  it('clips convex polygons to rectangles', () => {
+    const tri: [number, number][] = [
+      [0, 0],
+      [4, 0],
+      [0, 4],
+    ];
+    const q = clipToRect(tri, { s0: 1, s1: 5, t0: -1, t1: 1 });
+    // Trapezoid 1 ≤ s ≤ 4 − t, 0 ≤ t ≤ 1: area (3 + 2) / 2.
+    let area = 0;
+    q.forEach(([a, b], i) => {
+      const [c, d] = q[(i + 1) % q.length];
+      area += a * d - c * b;
+    });
+    expect(Math.abs(area) / 2).toBeCloseTo(2.5);
+    expect(clipToRect(tri, { s0: 5, s1: 6, t0: 0, t1: 1 })).toEqual([]);
+    expect(clipToRect(tri, { s0: 4, s1: 6, t0: 0, t1: 1 })).toEqual([]); // touching only
+  });
+
+  it('lists the gaps between covered intervals', () => {
+    expect(gaps(0, 10, [[2, 3], [2.5, 5], [9, 12]])).toEqual([[0, 2], [5, 9]]);
+    expect(gaps(0, 10, [[2, 3]], 2.5)).toEqual([[3, 10]]);
+    expect(gaps(0, 10, [[-1, 11]])).toEqual([]);
   });
 
   it('hashes deterministically into [0, 1)', () => {
@@ -128,6 +155,143 @@ describe('buildStations', () => {
     const a = count(buildStations(net, { ...walkOpts, focus }));
     const b = count(buildStations(net, { ...walkOpts, focus, occupied: [{ platformId: 'ks-1-2', side: 1 }] }));
     expect(b).toBeLessThan(a);
+  });
+});
+
+describe('walkable space', () => {
+  /** A 4 m wide corridor along x from −10 to 10 at street level. */
+  const corridor = (): Network => {
+    const n = (id: string, x: number): NetNode => ({ id, kind: 'junction', name: id, x, y: 0, z: 0, level: '1F' });
+    const e: NetEdge = { id: 'c', a: 'a', b: 'b', kind: 'walk', indoor: true, width: 4 };
+    return { levels: [], lines: [], stations: [], platforms: [], nodes: [n('a', -10), n('b', 10)], edges: [e], footprints: [], roads: [] };
+  };
+  // s along +x from x = −20, t = −z.
+  const fs = new FrameSpace(WalkSpace.of(corridor()), frameOf([-20, 0], [20, 0]));
+
+  it('opens a wall where a walkway passes, keeping the sill and a lintel above its head room', () => {
+    const parts = fs.panel('t', 20, -5, 5, -1, 4);
+    const at = (u: number) => parts.filter((q) => q.s0 < u && q.s1 > u);
+    // Beside the corridor the wall is whole.
+    expect(at(-4)).toEqual([{ s0: -5, s1: expect.closeTo(-2, 5), t0: -1, t1: 4 }]);
+    expect(at(4)[0].t0).toBe(-1);
+    // Across it: sill up to the floor, lintel from the head room up.
+    const cut = at(0).sort((a, b) => a.t0 - b.t0);
+    expect(cut).toHaveLength(2);
+    expect(cut[0].t1).toBeCloseTo(-0.01);
+    expect(cut[1].t0).toBeCloseTo(2.31);
+    expect(cut[1].t1).toBe(4);
+  });
+
+  it('trims long boxes, recesses slabs over head room and holes them where walkways pass through', () => {
+    const runs = fs.runs('s', { s0: 0, s1: 40, t0: -0.1, t1: 0.1 }, 0.5, 1.5);
+    expect(runs.length).toBe(2);
+    expect(runs[0][1]).toBeLessThan(10);
+    expect(runs[1][0]).toBeGreaterThan(30);
+    const over = fs.slab({ s0: 0, s1: 40, t0: -5, t1: 5 }, 1.5, 3);
+    expect(over.holes).toEqual([]);
+    expect(over.recesses.length).toBeGreaterThan(0);
+    for (const r of over.recesses) expect(r.y).toBeCloseTo(0 + 2.3 + 0.02);
+    const low = fs.slab({ s0: 0, s1: 40, t0: -5, t1: 5 }, 1.5, 2.0);
+    expect(low.recesses).toEqual([]);
+    expect(low.holes.length).toBeGreaterThan(0);
+    // Far above, nothing to give up.
+    expect(fs.slab({ s0: 0, s1: 40, t0: -5, t1: 5 }, 5, 6)).toEqual({ holes: [], recesses: [] });
+    expect(fs.post({ s0: 19.8, s1: 20.2, t0: -0.2, t1: 0.2 }, 0, 4)).toEqual([[expect.closeTo(2.31, 5), 4]]);
+  });
+
+  it('cuts one well over a whole staircase, landings included', () => {
+    const wells = computeWells(net, walkOpts);
+    const vertical = net.edges.filter((e) => e.kind === 'stairs' || e.kind === 'escalator' || e.kind === 'elevator').length;
+    const landings = net.nodes.filter((n) => n.landing);
+    expect(landings.length).toBeGreaterThan(10);
+    // Each landing node joins two flights of the same staircase.
+    expect(wells).toHaveLength(vertical - landings.length);
+    const inside = (c: [number, number][], x: number, z: number) => {
+      let sign = 0;
+      for (let i = 0; i < c.length; i++) {
+        const [ax, az] = c[i];
+        const [bx, bz] = c[(i + 1) % c.length];
+        const k = Math.sign((bx - ax) * (z - az) - (bz - az) * (x - ax));
+        if (k && sign && k !== sign) return false;
+        sign ||= k;
+      }
+      return true;
+    };
+    for (const n of landings) expect(wells.some((w) => inside(w.corners, n.x, n.z) && w.lo < 1.5 * n.y && w.hi > 1.5 * n.y), n.id).toBe(true);
+  });
+
+  it('never stands in the walker’s way: no slab, wall, column or screen across any walkway', () => {
+    // Walk every edge as the walk-through does (centre line, stair lanes, feet just above the
+    // floor) and test the body against the station's solid meshes: horizontal faces between the
+    // knees and the head, vertical faces crossed at three body heights.
+    const group = buildStations(net, walkOpts);
+    const tris: number[] = [];
+    for (const name of ['station-structure', 'station-shell', 'station-glass']) {
+      const pos = (group.getObjectByName(name) as THREE.Mesh).geometry.getAttribute('position').array;
+      for (let i = 0; i < pos.length; i++) tris.push(pos[i]);
+    }
+    const cell = 4;
+    const grid = new Map<string, number[]>();
+    for (let t = 0; t < tris.length / 9; t++) {
+      const xs = [tris[t * 9], tris[t * 9 + 3], tris[t * 9 + 6]];
+      const zs = [tris[t * 9 + 2], tris[t * 9 + 5], tris[t * 9 + 8]];
+      const [x0, x1, z0, z1] = [Math.floor(Math.min(...xs) / cell), Math.floor(Math.max(...xs) / cell), Math.floor(Math.min(...zs) / cell), Math.floor(Math.max(...zs) / cell)];
+      if ((x1 - x0 + 1) * (z1 - z0 + 1) > 4000) continue;
+      for (let x = x0; x <= x1; x++) for (let z = z0; z <= z1; z++) grid.set(`${x},${z}`, [...(grid.get(`${x},${z}`) ?? []), t]);
+    }
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    const n = new THREE.Vector3();
+    const ray = new THREE.Ray();
+    const hit = new THREE.Vector3();
+    /** Whether segment p→q crosses a triangle that is horizontal (flat) or vertical (!flat). */
+    const crosses = (p: THREE.Vector3, q: THREE.Vector3, flat: boolean) => {
+      const len = p.distanceTo(q);
+      ray.set(p, q.clone().sub(p).normalize());
+      const seen = new Set<number>();
+      for (let x = Math.floor(Math.min(p.x, q.x) / cell); x <= Math.floor(Math.max(p.x, q.x) / cell); x++) {
+        for (let z = Math.floor(Math.min(p.z, q.z) / cell); z <= Math.floor(Math.max(p.z, q.z) / cell); z++) {
+          for (const t of grid.get(`${x},${z}`) ?? []) {
+            if (seen.has(t)) continue;
+            seen.add(t);
+            a.fromArray(tris, t * 9);
+            b.fromArray(tris, t * 9 + 3);
+            c.fromArray(tris, t * 9 + 6);
+            n.subVectors(b, a).cross(c.clone().sub(a)).normalize();
+            if (Math.abs(n.y) >= 0.5 !== flat) continue;
+            const r = ray.intersectTriangle(a, b, c, false, hit);
+            if (r && p.distanceTo(hit) > 1e-6 && p.distanceTo(hit) < len - 1e-6) return true;
+          }
+        }
+      }
+      return false;
+    };
+    const lanes = verticalLaneOffsets({ edges: net.edges, nodes: net.nodes });
+    const byId = new Map(net.nodes.map((x) => [x.id, x]));
+    const bad: string[] = [];
+    net.edges.forEach((e, i) => {
+      const na = byId.get(e.a)!;
+      const nb = byId.get(e.b)!;
+      const lift = 0.09 + (e.kind === 'stairs' ? 0.135 : e.kind === 'escalator' ? 0.35 : 0);
+      const A = new THREE.Vector3(na.x + lanes[i * 2], na.y * 1.5 + lift, na.z + lanes[i * 2 + 1]);
+      const B = new THREE.Vector3(nb.x + lanes[i * 2], nb.y * 1.5 + lift, nb.z + lanes[i * 2 + 1]);
+      const steps = Math.max(1, Math.ceil(A.distanceTo(B) / 0.5));
+      for (let k = 0; k <= steps; k++) {
+        const p = A.clone().lerp(B, k / steps);
+        if (e.kind !== 'elevator' && crosses(p.clone().setY(p.y + 0.35), p.clone().setY(p.y + 2), true)) {
+          bad.push(`${e.id} slab`);
+          return;
+        }
+        if (k === steps) continue;
+        const q = A.clone().lerp(B, (k + 1) / steps);
+        if ([0.7, 1.3, 1.9].some((h) => crosses(p.clone().setY(p.y + h), q.clone().setY(q.y + h), false))) {
+          bad.push(`${e.id} wall`);
+          return;
+        }
+      }
+    });
+    expect(bad).toEqual([]);
   });
 });
 

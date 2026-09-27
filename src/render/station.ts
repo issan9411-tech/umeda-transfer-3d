@@ -1,9 +1,10 @@
 import * as THREE from 'three';
-import type { EdgeKind, Line, NetNode, Network, Platform } from '../core/types';
-import { frameOf, hash01, Lines, Mesher, P, rectMinusHoles, toLocal, type Frame, type Rect, type V3 } from './station-geo';
+import type { EdgeKind, Line, NetEdge, NetNode, Network, Platform } from '../core/types';
+import { clipToRect, frameOf, gaps, hash01, Lines, Mesher, P, rectMinusHoles, toLocal, toWorld, type Frame, type Rect, type V3 } from './station-geo';
 import { BED_REPEAT, BED_WIDTH, signAtlas, trackBedTexture, type NameSign, type NumberSign, type SignSpec, type SignStyle } from './station-tex';
 import { carsFor, liveryFor, placeSoup, trainLength, trainMaterials, trainParts } from './train';
-import { verticalLaneOffsets, verticalLaneWidth } from './walkway';
+import { CLEARANCE, flightWidth, WalkSpace, type WalkPiece } from './walk-space';
+import { verticalLaneOffsets } from './walkway';
 
 export { disposeStationTextures } from './station-tex';
 export { disposeTrainTextures } from './train';
@@ -21,6 +22,12 @@ export { disposeTrainTextures } from './train';
  *   wall-mounted 駅名標 and advertising panels, tunnel mouths, a vaulted ceiling at 御堂筋線梅田.
  * - Hanging / standing 駅名標 and platform-number signs from one canvas atlas.
  * - Stationary trains on a deterministic subset of tracks (train.ts).
+ *
+ * In the walk-through the architecture gives way to the space people walk through (walk-space.ts):
+ * slabs open over whole staircases and are recessed over passages below them (the 桜橋口 中2階
+ * under the viaduct), walls get doorways with sills and lintels where walkways pass, beams and
+ * barriers are trimmed, piers and roof supports move aside, and platform columns keep off the
+ * walking lines. The walker, who follows the network's centre lines, never passes through them.
  *
  * Vertical sizes: positions come from `Y()`; local sizes (platform height, canopies, trains) are
  * scaled by `hs = min(ex, 2)`, i.e. real ×1.5 while walking (matching people and stairs) and
@@ -328,30 +335,54 @@ function layoutStation(net: Network, id: string, cfg: StationCfg): StationLayout
 // ------------------------------------------------------------------------------------------------
 // Stairwells: footprints of the stairs / escalators / elevators drawn by walkway.ts
 
-interface Well {
+export interface Well {
   kind: EdgeKind;
   /** Plan corners (x, z). */
   corners: [number, number][];
-  /** Scene Y of the lower and upper landings. */
+  /** Scene Y of the foot and the head of the whole staircase. */
   lo: number;
   hi: number;
-  /** Upper landing position (x, z), to find the entry side. */
-  top: [number, number];
+  /** Head position (x, z): the side people step off at, left open by the parapets. */
+  head: [number, number];
 }
 
 const VERTICAL = new Set<EdgeKind>(['stairs', 'escalator', 'elevator']);
 
-/** Same lane layout as walkway.ts (shared table: route flight centred, parallel flights beside it). */
-function computeWells(net: Network, o: StationOptions): Well[] {
+/**
+ * The openings flights need in the slabs they pass through. builder.ts lays a staircase out as
+ * straight flights joined by level landings (nodes flagged `landing`); like walkway.ts, the chain
+ * is one well from its foot to its head, so the slab over the lower flight and its landing is cut
+ * too. Plan outline as walkway.ts's floor wells (0.1 m before the foot to 0.05 m before the head,
+ * 0.15 m beside the flight); lane offsets from the shared table (route flight centred).
+ */
+export function computeWells(net: Network, o: Pick<StationOptions, 'Y' | 'levelVisible' | 'routeEdges'>): Well[] {
   const byId = new Map(net.nodes.map((n) => [n.id, n]));
   const lanes = verticalLaneOffsets(net, o.routeEdges);
+  const vertAt = new Map<string, number[]>();
+  net.edges.forEach((e, i) => {
+    if (!VERTICAL.has(e.kind)) return;
+    for (const id of [e.a, e.b]) vertAt.set(id, [...(vertAt.get(id) ?? []), i]);
+  });
+  const used = new Set<number>();
   const wells: Well[] = [];
   net.edges.forEach((e, ei) => {
-    const na = byId.get(e.a) as NetNode;
-    const nb = byId.get(e.b) as NetNode;
-    if (!o.levelVisible(na.level) && !o.levelVisible(nb.level)) return;
-    if (!VERTICAL.has(e.kind)) return;
-    const [lo, hi] = o.Y(na.y) <= o.Y(nb.y) ? [na, nb] : [nb, na];
+    if (!VERTICAL.has(e.kind) || used.has(ei)) return;
+    used.add(ei);
+    const ends: NetNode[] = [];
+    for (const start of [e.a, e.b]) {
+      let at = start;
+      let prev = ei;
+      while ((byId.get(at) as NetNode).landing) {
+        const next = (vertAt.get(at) ?? []).find((i) => i !== prev && !used.has(i));
+        if (next === undefined) break;
+        used.add(next);
+        prev = next;
+        at = net.edges[next].a === at ? net.edges[next].b : net.edges[next].a;
+      }
+      ends.push(byId.get(at) as NetNode);
+    }
+    const [lo, hi] = ends[0].y <= ends[1].y ? [ends[0], ends[1]] : [ends[1], ends[0]];
+    if (!o.levelVisible(lo.level) && !o.levelVisible(hi.level)) return;
     let dx = hi.x - lo.x;
     let dz = hi.z - lo.z;
     const run = Math.hypot(dx, dz);
@@ -362,24 +393,68 @@ function computeWells(net: Network, o: StationOptions): Well[] {
     const az = lo.z + lanes[ei * 2 + 1];
     const bx = hi.x + lanes[ei * 2];
     const bz = hi.z + lanes[ei * 2 + 1];
-    const hw = verticalLaneWidth(e) / 2 + 0.15;
+    const hw = flightWidth(e) / 2 + 0.15;
     let corners: [number, number][];
-    if (e.kind === 'elevator') {
+    if (e.kind === 'elevator' || run < 0.5) {
       const mx = (ax + bx) / 2;
       const mz = (az + bz) / 2;
       corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([u, v]) => [mx + dx * u * hw + lx * v * hw, mz + dz * u * hw + lz * v * hw]);
     } else {
-      const m = 0.35;
       corners = [
-        [ax - dx * m + lx * hw, az - dz * m + lz * hw],
-        [ax - dx * m - lx * hw, az - dz * m - lz * hw],
-        [bx + dx * m - lx * hw, bz + dz * m - lz * hw],
-        [bx + dx * m + lx * hw, bz + dz * m + lz * hw],
+        [ax - dx * 0.1 + lx * hw, az - dz * 0.1 + lz * hw],
+        [ax - dx * 0.1 - lx * hw, az - dz * 0.1 - lz * hw],
+        [bx - dx * 0.05 - lx * hw, bz - dz * 0.05 - lz * hw],
+        [bx - dx * 0.05 + lx * hw, bz - dz * 0.05 + lz * hw],
       ];
     }
-    wells.push({ kind: e.kind, corners, lo: o.Y(lo.y), hi: o.Y(hi.y), top: [bx, bz] });
+    wells.push({ kind: e.kind, corners, lo: o.Y(lo.y), hi: o.Y(hi.y), head: [bx, bz] });
   });
   return wells;
+}
+
+/**
+ * Walking lines along a station's platforms (builder.ts runs them beside the stair wells) in its
+ * frame, with how far people stray from them (crowd.ts lateralRoom for platforms, capped at 2 m).
+ */
+function walkingLines(net: Network, l: StationLayout): { t: number; s0: number; s1: number; room: number }[] {
+  const byId = new Map(net.nodes.map((n) => [n.id, n]));
+  const plats = new Set(l.surfs.map((s) => s.p.id));
+  const out: { t: number; s0: number; s1: number; room: number }[] = [];
+  for (const e of net.edges) {
+    if (e.kind !== 'platform') continue;
+    const a = byId.get(e.a) as NetNode;
+    const b = byId.get(e.b) as NetNode;
+    if (!a.platformId || !plats.has(a.platformId)) continue;
+    const [sa, ta] = toLocal(l.f, a.x, a.z);
+    const [sb, tb] = toLocal(l.f, b.x, b.z);
+    const w = Math.min(16, Math.max(3, e.width ?? 6));
+    out.push({ t: (ta + tb) / 2, s0: Math.min(sa, sb), s1: Math.max(sa, sb), room: Math.min(2, Math.max(0, w / 2 - 1.6)) });
+  }
+  return out;
+}
+
+/**
+ * Lateral positions of the column lines along platform surface s: each wanted line moved as little
+ * as possible (towards the platform's middle first) so that columns of half-width r keep clear of
+ * the people on the walking lines and 1.5 m from edges facing a track. Lines left without room,
+ * or closer than 1.5 m to one already placed, are dropped.
+ */
+function columnRows(ctx: Ctx, l: StationLayout, s: Surf, want: number[], r: number): number[] {
+  const lines = (ctx.lines.get(l) ?? []).filter((x) => x.s1 > s.s0 && x.s0 < s.s1);
+  const lo = s.t0 + (s.track[-1] !== undefined ? 1.5 : 0.5) + r;
+  const hi = s.t1 - (s.track[1] !== undefined ? 1.5 : 0.5) - r;
+  const ok = (t: number) => t >= lo && t <= hi && lines.every((x) => Math.abs(t - x.t) >= x.room + 0.3 + r);
+  const mid = (s.t0 + s.t1) / 2;
+  const rows: number[] = [];
+  for (const t of want) {
+    let best: number | null = null;
+    for (let d = 0; d <= s.t1 - s.t0 && best === null; d += 0.25) {
+      const inward = t < mid ? 1 : -1;
+      best = [t + inward * d, t - inward * d].find(ok) ?? null;
+    }
+    if (best !== null && rows.every((x) => Math.abs(x - (best as number)) >= 1.5)) rows.push(best);
+  }
+  return rows;
 }
 
 /** Local bounding rectangle of a well. */
@@ -394,6 +469,143 @@ function wellsThrough(wells: Well[], y: number): Well[] {
 }
 
 const overlaps = (a: Rect, b: Rect, m = 0) => a.s0 < b.s1 + m && a.s1 > b.s0 - m && a.t0 < b.t1 + m && a.t1 > b.t0 - m;
+
+// ------------------------------------------------------------------------------------------------
+// Walkable space (walk-space.ts) seen from a station's plan frame. In the walk-through every slab,
+// wall, beam and column is kept out of it, so the walker never passes through the architecture.
+
+type Skip = (p: WalkPiece) => boolean;
+
+/** Where a walk piece's clear volume meets a frame rectangle (real metres). */
+export interface Hit {
+  p: WalkPiece;
+  /** Bounding rectangle of the overlap in the frame. */
+  r: Rect;
+  /** Lowest floor and highest head room (floor + clearance) over the overlap. */
+  lo: number;
+  hi: number;
+}
+
+/** Vertical part of a panel or post: u range along it (s0/s1) and real heights (t0/t1). */
+export type Part = Rect;
+
+export class FrameSpace {
+  private readonly local = new Map<WalkPiece, { poly: [number, number][]; g0: number; gs: number; gt: number }>();
+
+  constructor(
+    readonly space: WalkSpace,
+    readonly f: Frame,
+  ) {}
+
+  private toLocal(p: WalkPiece) {
+    let l = this.local.get(p);
+    if (!l) {
+      const { ox, oz, dx, dz } = this.f;
+      // Floor plane f0 + fx·x + fz·z with x = ox + dx·s + dz·t, z = oz + dz·s − dx·t.
+      l = { poly: p.poly.map(([x, z]) => toLocal(this.f, x, z)), g0: p.f0 + p.fx * ox + p.fz * oz, gs: p.fx * dx + p.fz * dz, gt: p.fx * dz - p.fz * dx };
+      this.local.set(p, l);
+    }
+    return l;
+  }
+
+  /** Clear volumes that reach into the box r (shrunk by eps, or epsS / epsT) × real heights [y0, y1]. */
+  hits(r: Rect, y0: number, y1: number, skip?: Skip, eps = 0.02, epsT = eps): Hit[] {
+    const rr: Rect = { s0: r.s0 + eps, s1: r.s1 - eps, t0: r.t0 + epsT, t1: r.t1 - epsT };
+    if (rr.s1 <= rr.s0 || rr.t1 <= rr.t0) return [];
+    const cs = [toWorld(this.f, rr.s0, rr.t0), toWorld(this.f, rr.s1, rr.t0), toWorld(this.f, rr.s1, rr.t1), toWorld(this.f, rr.s0, rr.t1)];
+    const xs = cs.map((c) => c[0]);
+    const zs = cs.map((c) => c[1]);
+    const out: Hit[] = [];
+    for (const p of this.space.query(Math.min(...xs), Math.max(...xs), Math.min(...zs), Math.max(...zs))) {
+      if (skip?.(p)) continue;
+      const l = this.toLocal(p);
+      const q = clipToRect(l.poly, rr);
+      if (!q.length) continue;
+      const b: Rect = { s0: Infinity, s1: -Infinity, t0: Infinity, t1: -Infinity };
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (const [s, t] of q) {
+        const y = l.g0 + l.gs * s + l.gt * t;
+        lo = Math.min(lo, y);
+        hi = Math.max(hi, y);
+        b.s0 = Math.min(b.s0, s);
+        b.s1 = Math.max(b.s1, s);
+        b.t0 = Math.min(b.t0, t);
+        b.t1 = Math.max(b.t1, t);
+      }
+      hi += p.clear;
+      // Same tolerance as WalkSpace.intersectsBox: touching the floor or the head room is fine.
+      if (y1 > lo + 0.05 && y0 < hi - 0.05) out.push({ p, r: b, lo, hi });
+    }
+    return out;
+  }
+
+  /**
+   * A vertical panel on the line t = at (running along s: axis 's') or s = at (axis 't') from u0
+   * to u1, real heights y0…y1, minus the walkable space it would stand in: full-height runs where
+   * nothing passes and, over each passage, a sill below its floor and a lintel above its head room.
+   */
+  panel(axis: 's' | 't', at: number, u0: number, u1: number, y0: number, y1: number, skip?: Skip): Part[] {
+    const full: Part = { s0: u0, s1: u1, t0: y0, t1: y1 };
+    if (u1 - u0 < 1e-3 || y1 - y0 < 1e-3) return [];
+    const r: Rect = axis === 's' ? { s0: u0, s1: u1, t0: at - 0.05, t1: at + 0.05 } : { s0: at - 0.05, s1: at + 0.05, t0: u0, t1: u1 };
+    // Shrunk across the wall only: a walkway that reaches the end of the wall opens it to the end.
+    const spans = this.hits(r, y0, y1, skip, axis === 's' ? 0 : 0.02, axis === 's' ? 0.02 : 0).map((h) => ({ a: axis === 's' ? h.r.s0 : h.r.t0, b: axis === 's' ? h.r.s1 : h.r.t1, lo: h.lo, hi: h.hi }));
+    if (!spans.length) return [full];
+    const cuts = [...new Set([u0, u1, ...spans.flatMap((x) => [x.a, x.b]).filter((u) => u > u0 && u < u1)])].sort((a, b) => a - b);
+    const out: Part[] = [];
+    const push = (a: number, b: number, ya: number, yb: number) => {
+      if (yb - ya < 0.03 || b - a < 1e-4) return;
+      const prev = out.find((q) => Math.abs(q.s1 - a) < 1e-6 && Math.abs(q.t0 - ya) < 1e-6 && Math.abs(q.t1 - yb) < 1e-6);
+      if (prev) prev.s1 = b;
+      else out.push({ s0: a, s1: b, t0: ya, t1: yb });
+    };
+    for (let i = 0; i < cuts.length - 1; i++) {
+      const [a, b] = [cuts[i], cuts[i + 1]];
+      if (b - a < 1e-4) continue;
+      const m = (a + b) / 2;
+      const cov = spans.filter((x) => x.a <= m && x.b >= m);
+      if (!cov.length) {
+        push(a, b, y0, y1);
+        continue;
+      }
+      push(a, b, y0, Math.min(y1, Math.min(...cov.map((x) => x.lo)) - 0.01));
+      push(a, b, Math.max(y0, Math.max(...cov.map((x) => x.hi)) + 0.01), y1);
+    }
+    // No slivers of wall standing at the edge of an opening.
+    return out.filter((q) => q.s1 - q.s0 >= 0.05);
+  }
+
+  /** Real height ranges of a post (plan box r, real heights y0…y1) outside walkable space. */
+  post(r: Rect, y0: number, y1: number, skip?: Skip): [number, number][] {
+    const hs = this.hits(r, y0, y1, skip);
+    if (!hs.length) return [[y0, y1]];
+    const lo = Math.min(...hs.map((h) => h.lo)) - 0.01;
+    const hi = Math.max(...hs.map((h) => h.hi)) + 0.01;
+    return ([[y0, Math.min(y1, lo)], [Math.max(y0, hi), y1]] as [number, number][]).filter(([a, b]) => b - a >= 0.03);
+  }
+
+  /** Runs of a long box (plan r, real heights) along `axis` that stay clear of walkable space. */
+  runs(axis: 's' | 't', r: Rect, y0: number, y1: number, skip?: Skip, minLen = 0.3): [number, number][] {
+    const iv = this.hits(r, y0, y1, skip).map((h): [number, number] => (axis === 's' ? [h.r.s0 - 0.05, h.r.s1 + 0.05] : [h.r.t0 - 0.05, h.r.t1 + 0.05]));
+    return axis === 's' ? gaps(r.s0, r.s1, iv, minLen) : gaps(r.t0, r.t1, iv, minLen);
+  }
+
+  /**
+   * What a horizontal slab (plan r, real heights y0…y1) must give up: holes where walkable space
+   * passes through it, and recesses (raised undersides at real height y) where head room below
+   * reaches into it, e.g. the 桜橋口 中2階 passage under the viaduct.
+   */
+  slab(r: Rect, y0: number, y1: number, skip?: Skip): { holes: Rect[]; recesses: { r: Rect; y: number }[] } {
+    const holes: Rect[] = [];
+    const recesses: { r: Rect; y: number }[] = [];
+    for (const h of this.hits(r, y0, y1, skip)) {
+      if (h.hi < y1 - 0.03 && h.lo < y0 + 0.05) recesses.push({ r: h.r, y: h.hi + 0.02 });
+      else holes.push(h.r);
+    }
+    return { holes, recesses };
+  }
+}
 
 // ------------------------------------------------------------------------------------------------
 // Drawing context
@@ -468,6 +680,15 @@ interface Ctx {
   hs: number;
   c: Palette;
   wells: Well[];
+  /** Walkable space in each station's frame (walk-through only; null in the overview). */
+  spaces: Map<StationLayout, FrameSpace> | null;
+  /** Walk pieces people stand on at a platform: the slab itself and the walking lines along it. */
+  onPlatform: Skip;
+  /** Network lookups. */
+  nodeById: Map<string, NetNode>;
+  edgeById: Map<string, NetEdge>;
+  /** Walking lines along each platform (frame t, s range) and how far people stray from them. */
+  lines: Map<StationLayout, { t: number; s0: number; s1: number; room: number }[]>;
   st: Mesher;
   shell: Mesher;
   glass: Mesher;
@@ -528,32 +749,166 @@ function fBox(m: Mesher, f: Frame, s0: number, s1: number, y0: number, y1: numbe
   m.box(P(f, (s0 + s1) / 2, (y0 + y1) / 2, (t0 + t1) / 2), [f.dx, 0, f.dz], [0, 1, 0], s1 - s0, y1 - y0, t1 - t0, color, skip);
 }
 
-/** Box-with-holes slab: top and bottom faces minus holes, outer sides and hole liners. */
-function slab(m: Mesher, f: Frame, r: Rect, y0: number, y1: number, holes: Rect[], top: THREE.Color, side: THREE.Color, bottom: THREE.Color | null, sides = true): void {
-  const parts = rectMinusHoles(r, holes);
-  for (const q of parts) {
-    hRect(m, f, q, y1, 1, top);
-    if (bottom) hRect(m, f, q, y0, -1, bottom);
-  }
-  if (sides) {
-    tWall(m, f, r.t1, r.s0, r.s1, y0, y1, 1, side);
-    tWall(m, f, r.t0, r.s0, r.s1, y0, y1, -1, side);
-    sWall(m, f, r.s1, r.t0, r.t1, y0, y1, 1, side);
-    sWall(m, f, r.s0, r.t0, r.t1, y0, y1, -1, side);
-  }
-  // Hole liners face into the opening.
-  for (const h of clipHoles(r, holes)) {
-    tWall(m, f, h.t0, h.s0, h.s1, y0, y1, 1, side);
-    tWall(m, f, h.t1, h.s0, h.s1, y0, y1, -1, side);
-    sWall(m, f, h.s0, h.t0, h.t1, y0, y1, 1, side);
-    sWall(m, f, h.s1, h.t0, h.t1, y0, y1, -1, side);
-  }
-}
-
 function clipHoles(r: Rect, holes: Rect[], margin = 0): Rect[] {
   return holes
     .map((h) => ({ s0: Math.max(h.s0, r.s0 + margin), s1: Math.min(h.s1, r.s1 - margin), t0: Math.max(h.t0, r.t0 + margin), t1: Math.min(h.t1, r.t1 - margin) }))
     .filter((h) => h.s1 - h.s0 > 0.4 && h.t1 - h.t0 > 0.4);
+}
+
+// Primitives that give way to walkable space ------------------------------------------------------
+// Heights are scene heights here; FrameSpace works in real metres (scene = Y(real)).
+
+const realY = (ctx: Ctx, y: number) => (y - ctx.o.Y(0)) / ctx.o.ex;
+
+function frameSpace(ctx: Ctx, l: StationLayout): FrameSpace | null {
+  return ctx.spaces?.get(l) ?? null;
+}
+
+/** Parts (u range, scene heights) of a vertical panel that stand outside walkable space. */
+function wallParts(ctx: Ctx, l: StationLayout, axis: 's' | 't', at: number, u0: number, u1: number, y0: number, y1: number, skip?: Skip): Rect[] {
+  const fs = frameSpace(ctx, l);
+  if (!fs) return [{ s0: u0, s1: u1, t0: y0, t1: y1 }];
+  return fs.panel(axis, at, u0, u1, realY(ctx, y0), realY(ctx, y1), skip).map((q) => ({ s0: q.s0, s1: q.s1, t0: ctx.o.Y(q.t0), t1: ctx.o.Y(q.t1) }));
+}
+
+/** tWall with openings (sill and lintel kept) wherever a walkway passes through it. */
+function tWallW(ctx: Ctx, l: StationLayout, m: Mesher, T: number, s0: number, s1: number, y0: number, y1: number, face: 1 | -1, color: THREE.Color, skip?: Skip): void {
+  for (const q of wallParts(ctx, l, 's', T, s0, s1, y0, y1, skip)) tWall(m, l.f, T, q.s0, q.s1, q.t0, q.t1, face, color);
+}
+
+/** sWall with openings (sill and lintel kept) wherever a walkway passes through it. */
+function sWallW(ctx: Ctx, l: StationLayout, m: Mesher, S: number, t0: number, t1: number, y0: number, y1: number, face: 1 | -1, color: THREE.Color, skip?: Skip): void {
+  for (const q of wallParts(ctx, l, 't', S, t0, t1, y0, y1, skip)) sWall(m, l.f, S, q.s0, q.s1, q.t0, q.t1, face, color);
+}
+
+/** Whether a frame-aligned box stays out of walkable space. */
+function boxClear(ctx: Ctx, l: StationLayout, s0: number, s1: number, y0: number, y1: number, t0: number, t1: number, skip?: Skip): boolean {
+  const fs = frameSpace(ctx, l);
+  return !fs || fs.hits({ s0, s1, t0, t1 }, realY(ctx, y0), realY(ctx, y1), skip).length === 0;
+}
+
+/** A long frame-aligned box (along s or t) trimmed to the runs clear of walkable space. */
+function fBoxRuns(ctx: Ctx, l: StationLayout, m: Mesher, axis: 's' | 't', s0: number, s1: number, y0: number, y1: number, t0: number, t1: number, color: THREE.Color, faces = 0, skip?: Skip): void {
+  const fs = frameSpace(ctx, l);
+  const runs = fs ? fs.runs(axis, { s0, s1, t0, t1 }, realY(ctx, y0), realY(ctx, y1), skip) : [axis === 's' ? [s0, s1] : [t0, t1]];
+  for (const [a, b] of runs) {
+    if (axis === 's') fBox(m, l.f, a, b, y0, y1, t0, t1, color, faces);
+    else fBox(m, l.f, s0, s1, y0, y1, a, b, color, faces);
+  }
+}
+
+/**
+ * Runs along `axis` of a low frame-aligned box (a parapet at real floor height y) left standing
+ * where no walkway centre line comes within d of it; where one does, a doorway at least 2·w wide
+ * opens. A walkway's full width may brush the parapet (people keep off it); only paths that
+ * actually cross it open it.
+ */
+function pathRuns(ctx: Ctx, l: StationLayout, axis: 's' | 't', r: Rect, y: number, d: number, w: number): [number, number][] {
+  const [u0, u1] = axis === 's' ? [r.s0, r.s1] : [r.t0, r.t1];
+  const fs = frameSpace(ctx, l);
+  if (!fs) return [[u0, u1]];
+  const band = axis === 's' ? [r.t0 - d, r.t1 + d] : [r.s0 - d, r.s1 + d];
+  const blocked: [number, number][] = [];
+  for (const h of fs.hits({ s0: r.s0 - d, s1: r.s1 + d, t0: r.t0 - d, t1: r.t1 + d }, y, y + 1)) {
+    const e = h.p.kind === 'corridor' ? ctx.edgeById.get(h.p.id) : undefined;
+    if (!e) continue;
+    const [a, b] = [e.a, e.b].map((id) => ctx.nodeById.get(id) as NetNode).map((n) => toLocal(l.f, n.x, n.z));
+    // Parameter range of a→b inside the band across the parapet, then its extent along it.
+    const [pa, pb, qa, qb] = axis === 's' ? [a[1], b[1], a[0], b[0]] : [a[0], b[0], a[1], b[1]];
+    let [w0, w1] = [0, 1];
+    if (Math.abs(pb - pa) < 1e-9) {
+      if (pa < band[0] || pa > band[1]) continue;
+    } else {
+      const x0 = (band[0] - pa) / (pb - pa);
+      const x1 = (band[1] - pa) / (pb - pa);
+      [w0, w1] = [Math.max(0, Math.min(x0, x1)), Math.min(1, Math.max(x0, x1))];
+      if (w1 < w0) continue;
+    }
+    const [c0, c1] = [qa + (qb - qa) * w0, qa + (qb - qa) * w1];
+    blocked.push([Math.min(c0, c1) - w, Math.max(c0, c1) + w]);
+  }
+  return gaps(u0, u1, blocked, 0.3);
+}
+
+/** A post (column, mullion) from y0 to y1 cut back to above or below any walkway it would stand in. */
+function postParts(ctx: Ctx, l: StationLayout, r: Rect, y0: number, y1: number, skip?: Skip): [number, number][] {
+  const fs = frameSpace(ctx, l);
+  if (!fs) return [[y0, y1]];
+  return fs.post(r, realY(ctx, y0), realY(ctx, y1), skip).map(([a, b]) => [ctx.o.Y(a), ctx.o.Y(b)]);
+}
+
+/** The first offset at which `ok` holds (structure moved aside), or null. */
+function aside(offsets: number[], ok: (d: number) => boolean): number | null {
+  for (const d of offsets) if (ok(d)) return d;
+  return null;
+}
+
+/** Extends a cut that ends within a few centimetres of the slab edge to the edge itself. */
+function snap(q: Rect, r: Rect): Rect {
+  const e = 0.06;
+  return { s0: q.s0 - r.s0 < e ? r.s0 : q.s0, s1: r.s1 - q.s1 < e ? r.s1 : q.s1, t0: q.t0 - r.t0 < e ? r.t0 : q.t0, t1: r.t1 - q.t1 < e ? r.t1 : q.t1 };
+}
+
+/** Holes and recesses (scene heights) a slab r × [y0, y1] must give walkable space. */
+function slabCuts(ctx: Ctx, l: StationLayout, r: Rect, y0: number, y1: number, skip?: Skip): { holes: Rect[]; recesses: { r: Rect; y: number }[] } {
+  const fs = frameSpace(ctx, l);
+  if (!fs) return { holes: [], recesses: [] };
+  const c = fs.slab(r, realY(ctx, y0), realY(ctx, y1), skip);
+  return { holes: c.holes.map((q) => snap(q, r)), recesses: c.recesses.map((x) => ({ r: snap(x.r, r), y: ctx.o.Y(x.y) })) };
+}
+
+/** Undersides of a slab: its bottom at y0 minus holes, raised to y inside each recess (highest wins). */
+function undersides(r: Rect, holes: Rect[], recesses: { r: Rect; y: number }[], y0: number): { q: Rect; y: number }[] {
+  const out = rectMinusHoles(r, [...holes, ...recesses.map((x) => x.r)]).map((q) => ({ q, y: y0 }));
+  recesses.forEach((rc, i) => {
+    const higher = recesses.filter((x, j) => x.y > rc.y || (x.y === rc.y && j > i)).map((x) => x.r);
+    for (const q of rectMinusHoles(rc.r, [...holes, ...higher])) out.push({ q, y: rc.y });
+  });
+  return out;
+}
+
+/**
+ * Vertical faces around rectangle h (hole liners, recess steps) from y0 to y1, facing into it; the
+ * parts that lie inside another open rectangle, on the slab's outer edge or in walkable space are
+ * left out.
+ */
+function ring(ctx: Ctx, l: StationLayout, m: Mesher, h: Rect, y0: number, y1: number, color: THREE.Color, open: Rect[], outer?: Rect): void {
+  if (y1 - y0 < 0.02) return;
+  const e = 1e-3;
+  const along = (u0: number, u1: number, cover: (o: Rect) => [number, number] | null) => gaps(u0, u1, open.filter((o) => o !== h).map(cover).filter((x): x is [number, number] => x !== null), 0.05);
+  for (const [T, face] of [[h.t0, 1], [h.t1, -1]] as const) {
+    if (outer && (Math.abs(T - outer.t0) < e || Math.abs(T - outer.t1) < e)) continue;
+    for (const [a, b] of along(h.s0, h.s1, (o) => (o.t0 < T - e && o.t1 > T + e ? [o.s0, o.s1] : null))) tWallW(ctx, l, m, T, a, b, y0, y1, face, color);
+  }
+  for (const [S, face] of [[h.s0, 1], [h.s1, -1]] as const) {
+    if (outer && (Math.abs(S - outer.s0) < e || Math.abs(S - outer.s1) < e)) continue;
+    for (const [a, b] of along(h.t0, h.t1, (o) => (o.s0 < S - e && o.s1 > S + e ? [o.t0, o.t1] : null))) sWallW(ctx, l, m, S, a, b, y0, y1, face, color);
+  }
+}
+
+/**
+ * Box-with-holes slab: top and bottom faces minus holes, outer sides and hole liners. In the
+ * walk-through it also gives way to walkable space: holes where a walkway passes through it, a
+ * raised underside (with step faces) where the head room below reaches into it, openings in its
+ * vertical faces.
+ */
+function slab(ctx: Ctx, l: StationLayout, m: Mesher, r: Rect, y0: number, y1: number, holes: Rect[], top: THREE.Color, side: THREE.Color, bottom: THREE.Color | null, sides = true): void {
+  const f = l.f;
+  const cut = slabCuts(ctx, l, r, y0, y1);
+  const all = [...holes, ...cut.holes];
+  for (const q of rectMinusHoles(r, all)) hRect(m, f, q, y1, 1, top);
+  // A raised soffit is the ceiling of the passage beneath: lit like the station's own ceilings.
+  if (bottom) for (const { q, y } of undersides(r, all, cut.recesses, y0)) hRect(m, f, q, y, -1, y > y0 ? ctx.c.ceiling : bottom, undefined, y > y0);
+  if (sides) {
+    tWallW(ctx, l, m, r.t1, r.s0, r.s1, y0, y1, 1, side);
+    tWallW(ctx, l, m, r.t0, r.s0, r.s1, y0, y1, -1, side);
+    sWallW(ctx, l, m, r.s1, r.t0, r.t1, y0, y1, 1, side);
+    sWallW(ctx, l, m, r.s0, r.t0, r.t1, y0, y1, -1, side);
+  }
+  // Hole liners and recess steps face into the opening.
+  const lined = clipHoles(r, all);
+  for (const h of lined) ring(ctx, l, m, h, y0, y1, side, lined);
+  for (const rc of cut.recesses) ring(ctx, l, m, rc.r, y0, rc.y, side, lined, r);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -567,11 +922,21 @@ function clipHoles(r: Rect, holes: Rect[], margin = 0): Rect[] {
 export function buildStations(net: Network, o: StationOptions): THREE.Group {
   const group = new THREE.Group();
   group.name = 'stations';
+  const layouts = stationLayouts(net);
+  const space = WalkSpace.of(net);
+  const lineIds = new Set<string>();
+  for (const e of net.edges) if (e.kind === 'platform') lineIds.add(e.id).add(`node:${e.a}`).add(`node:${e.b}`);
   const ctx: Ctx = {
     o,
     hs: Math.min(o.ex, 2),
     c: palette(o.dark),
     wells: computeWells(net, o),
+    // Only the walk-through has a walker; the overview's heights are exaggerated anyway.
+    spaces: o.walk ? new Map(layouts.map((l) => [l, new FrameSpace(space, l.f)])) : null,
+    onPlatform: (p) => p.kind === 'platform' || lineIds.has(p.id),
+    nodeById: new Map(net.nodes.map((n) => [n.id, n])),
+    edgeById: new Map(net.edges.map((e) => [e.id, e])),
+    lines: new Map(layouts.map((l) => [l, walkingLines(net, l)])),
     st: new Mesher(),
     shell: new Mesher(),
     glass: new Mesher(),
@@ -587,7 +952,7 @@ export function buildStations(net: Network, o: StationOptions): THREE.Group {
     trainEquip: new Mesher(),
     net,
   };
-  for (const l of stationLayouts(net)) {
+  for (const l of layouts) {
     if (!o.levelVisible(l.level)) continue;
     drawTracks(ctx, l);
     if (l.cfg.kind === 'elevated') drawElevated(ctx, l);
@@ -689,53 +1054,56 @@ function drawPlatforms(ctx: Ctx, l: StationLayout, bottomY: number, underside: b
   const { plat } = heights(ctx, l);
   const c = ctx.c;
   const hs = ctx.hs;
-  const down = wellsThrough(ctx.wells, plat).map((w) => ({ w, r: wellRect(f, w) }));
+  const downWells = wellsThrough(ctx.wells, plat);
+  const down = downWells.map((w) => wellRect(f, w));
   // In the overview the view's coloured boxes are the platforms: keep ours just inside them.
   const inset = ctx.o.walk ? 0 : 0.08;
   const top = ctx.o.walk ? plat : plat - 0.06;
   for (const s of l.surfs) {
     const r: Rect = { s0: s.s0 + inset, s1: s.s1 - inset, t0: s.t0 + inset, t1: s.t1 - inset };
-    const holes = clipHoles(r, down.filter((d) => overlaps(d.r, r)).map((d) => d.r), 0.3);
+    // Stair openings over the whole staircase, and whatever else walkable space needs: passages
+    // underneath (the 桜橋口 中2階) raise the underside instead.
+    const cut = slabCuts(ctx, l, r, bottomY, top);
+    const holes = [...clipHoles(r, down.filter((d) => overlaps(d, r)), 0.3), ...cut.holes];
     const lip = 0.25 * hs;
-    // Top surface and bottom (with stair openings).
-    const parts = rectMinusHoles(r, holes);
-    for (const q of parts) {
-      hRect(ctx.st, f, q, top, 1, c.surface);
-      if (underside) hRect(ctx.st, f, q, bottomY, -1, c.deckBottom);
-    }
+    for (const q of rectMinusHoles(r, holes)) hRect(ctx.st, f, q, top, 1, c.surface);
+    if (underside) for (const { q, y } of undersides(r, holes, cut.recesses, bottomY)) hRect(ctx.st, f, q, y, -1, y > bottomY ? c.ceiling : c.deckBottom, undefined, y > bottomY);
     // Long sides: coping lip at the top, recessed wall below (the refuge space under the edge).
     for (const side of [-1, 1] as const) {
       const T = side === 1 ? r.t1 : r.t0;
       const hasTrack = s.track[side] !== undefined;
       if (hasTrack) {
-        tWall(ctx.st, f, T, r.s0, r.s1, top - lip, top, side, c.coping);
+        tWallW(ctx, l, ctx.st, T, r.s0, r.s1, top - lip, top, side, c.coping);
         hRect(ctx.st, f, { s0: r.s0, s1: r.s1, t0: Math.min(T, T - side * 0.35), t1: Math.max(T, T - side * 0.35) }, top - lip, -1, c.recess);
-        tWall(ctx.st, f, T - side * 0.35, r.s0, r.s1, bottomY, top - lip, side, c.platSide);
-      } else tWall(ctx.st, f, T, r.s0, r.s1, bottomY, top, side, c.platSide);
+        tWallW(ctx, l, ctx.st, T - side * 0.35, r.s0, r.s1, bottomY, top - lip, side, c.platSide);
+      } else tWallW(ctx, l, ctx.st, T, r.s0, r.s1, bottomY, top, side, c.platSide);
     }
-    for (const [S, face] of [[r.s0, -1], [r.s1, 1]] as const) sWall(ctx.st, f, S, r.t0, r.t1, bottomY, top, face, c.platSide);
-    // Stairwell liners and parapets (open on the entry side).
-    for (const h of holes) {
-      tWall(ctx.st, f, h.t0, h.s0, h.s1, bottomY, top, 1, c.platSide);
-      tWall(ctx.st, f, h.t1, h.s0, h.s1, bottomY, top, -1, c.platSide);
-      sWall(ctx.st, f, h.s0, h.t0, h.t1, bottomY, top, 1, c.platSide);
-      sWall(ctx.st, f, h.s1, h.t0, h.t1, bottomY, top, -1, c.platSide);
-    }
+    for (const [S, face] of [[r.s0, -1], [r.s1, 1]] as const) sWallW(ctx, l, ctx.st, S, r.t0, r.t1, bottomY, top, face, c.platSide);
+    // Stairwell liners and recess steps.
+    const lined = clipHoles(r, holes);
+    for (const h of lined) ring(ctx, l, ctx.st, h, bottomY, top, c.platSide, lined);
+    if (underside) for (const rc of cut.recesses) ring(ctx, l, ctx.st, rc.r, bottomY, rc.y, c.platSide, lined, r);
     if (ctx.o.walk) {
-      for (const d of down) {
-        if (d.w.kind === 'elevator') continue;
-        const h = clipHoles(r, [d.r], 0.3)[0];
-        if (!h) continue;
-        const [ts, tt] = toLocal(f, d.w.top[0], d.w.top[1]);
+      // Parapets around the stair openings, open at the head, and opened where a path crosses.
+      const parapet = (axis: 's' | 't', b: Rect) => {
+        for (const [u, v] of pathRuns(ctx, l, axis, b, l.py, 0.15, 0.6)) {
+          if (axis === 's') fBox(ctx.st, f, u, v, top, top + 1.1 * hs, b.t0, b.t1, c.parapet, 8);
+          else fBox(ctx.st, f, b.s0, b.s1, top, top + 1.1 * hs, u, v, c.parapet, 8);
+        }
+      };
+      downWells.forEach((w, i) => {
+        if (w.kind === 'elevator') return;
+        const h = clipHoles(r, [down[i]], 0.3)[0];
+        if (!h) return;
+        const [ts, tt] = toLocal(f, w.head[0], w.head[1]);
         const alongS = h.s1 - h.s0 >= h.t1 - h.t0;
         const entry = alongS ? (Math.abs(ts - h.s0) < Math.abs(ts - h.s1) ? 's0' : 's1') : Math.abs(tt - h.t0) < Math.abs(tt - h.t1) ? 't0' : 't1';
-        const ph = 1.1 * hs;
         const th = 0.12;
-        if (entry !== 't0') fBox(ctx.st, f, h.s0, h.s1, top, top + ph, h.t0 - th, h.t0, c.parapet, 8);
-        if (entry !== 't1') fBox(ctx.st, f, h.s0, h.s1, top, top + ph, h.t1, h.t1 + th, c.parapet, 8);
-        if (entry !== 's0') fBox(ctx.st, f, h.s0 - th, h.s0, top, top + ph, h.t0 - th, h.t1 + th, c.parapet, 8);
-        if (entry !== 's1') fBox(ctx.st, f, h.s1, h.s1 + th, top, top + ph, h.t0 - th, h.t1 + th, c.parapet, 8);
-      }
+        if (entry !== 't0') parapet('s', { s0: h.s0, s1: h.s1, t0: h.t0 - th, t1: h.t0 });
+        if (entry !== 't1') parapet('s', { s0: h.s0, s1: h.s1, t0: h.t1, t1: h.t1 + th });
+        if (entry !== 's0') parapet('t', { s0: h.s0 - th, s1: h.s0, t0: h.t0 - th, t1: h.t1 + th });
+        if (entry !== 's1') parapet('t', { s0: h.s1, s1: h.s1 + th, t0: h.t0 - th, t1: h.t1 + th });
+      });
       // Markings on edges that face a track: coping band, white line, yellow tactile strip.
       if (!s.head) {
         for (const side of [-1, 1] as const) {
@@ -770,18 +1138,22 @@ function drawElevated(ctx: Ctx, l: StationLayout): void {
   const deckBot = deckTop - 1.3 * hs;
   const surfRects = l.surfs.map((s) => ({ s0: s.s0, s1: s.s1, t0: s.t0, t1: s.t1 }));
   // Deck = everything under the tracks that is not a platform (platforms carry their own slabs).
-  slab(ctx.st, f, box, deckBot, deckTop, surfRects, c.deckTop, c.deckSide, c.deckBottom, true);
+  const deckHoles = [...surfRects, ...wellsThrough(ctx.wells, deckTop).map((w) => wellRect(f, w))];
+  slab(ctx, l, ctx.st, box, deckBot, deckTop, deckHoles, c.deckTop, c.deckSide, c.deckBottom, true);
   // Noise barriers along the outer edges beyond the platforms.
   const ps0 = Math.min(...surfRects.map((s) => s.s0));
   const ps1 = Math.max(...surfRects.map((s) => s.s1));
   for (const [a, b] of [[box.s0, ps0], [ps1, box.s1]]) {
     if (b - a < 1) continue;
-    fBox(ctx.st, f, a, b, deckTop, deckTop + 1.6 * hs, box.t0, box.t0 + 0.2, c.parapet);
-    fBox(ctx.st, f, a, b, deckTop, deckTop + 1.6 * hs, box.t1 - 0.2, box.t1, c.parapet);
-    // Viaduct piers every 15 m.
+    fBoxRuns(ctx, l, ctx.st, 's', a, b, deckTop, deckTop + 1.6 * hs, box.t0, box.t0 + 0.2, c.parapet);
+    fBoxRuns(ctx, l, ctx.st, 's', a, b, deckTop, deckTop + 1.6 * hs, box.t1 - 0.2, box.t1, c.parapet);
+    // Viaduct piers every 15 m, moved along the viaduct off the streets and passages below.
     const ground = Y(0);
     for (let s = a + 6; s < b - 3; s += 15) {
-      for (const t of [box.t0 + 2, (box.t0 + box.t1) / 2, box.t1 - 2]) fBox(ctx.st, f, s - 0.7, s + 0.7, ground, deckBot, t - 0.9, t + 0.9, c.pier, 12);
+      for (const t of [box.t0 + 2, (box.t0 + box.t1) / 2, box.t1 - 2]) {
+        const d = aside([0, 1.5, -1.5, 3, -3, 4.5, -4.5, 6, -6], (d) => boxClear(ctx, l, s + d - 0.7, s + d + 0.7, ground, deckBot, t - 0.9, t + 0.9));
+        if (d !== null) fBox(ctx.st, f, s + d - 0.7, s + d + 0.7, ground, deckBot, t - 0.9, t + 0.9, c.pier, 12);
+      }
     }
   }
   drawPlatforms(ctx, l, deckBot, true);
@@ -797,7 +1169,6 @@ function drawElevated(ctx: Ctx, l: StationLayout): void {
 
   const canopyY = plat + l.cfg.ceil * hs;
   for (const s of l.surfs) {
-    const w = s.t1 - s.t0;
     // s-ranges of this platform that are not under a covering roof.
     let ranges: [number, number][] = [[s.s0, s.s1]];
     for (const cv of covered) {
@@ -809,45 +1180,53 @@ function drawElevated(ctx: Ctx, l: StationLayout): void {
         return out.filter(([x, y]) => y - x > 4);
       });
     }
-    for (const [a, b] of ranges) drawCanopy(ctx, l, { s0: a, s1: b, t0: s.t0 - 0.25, t1: s.t1 + 0.25 }, canopyY, w, s.head === true);
+    for (const [a, b] of ranges) drawCanopy(ctx, l, { s0: a, s1: b, t0: s.t0 - 0.25, t1: s.t1 + 0.25 }, canopyY, s);
   }
 }
 
-/** A platform canopy: roof slab, fascia, two column rows, light strips underneath. */
-function drawCanopy(ctx: Ctx, l: StationLayout, r: Rect, y: number, w: number, head: boolean): void {
+/** A platform canopy: roof slab, fascia, one or two column rows, light strips underneath. */
+function drawCanopy(ctx: Ctx, l: StationLayout, r: Rect, y: number, sf: Surf): void {
   const { f } = l;
   const c = ctx.c;
   const hs = ctx.hs;
   const { plat } = heights(ctx, l);
   const th = 0.28 * hs;
-  const holes = wellsThrough(ctx.wells, y).map((wl) => wellRect(f, wl)).filter((h) => overlaps(h, r));
+  const w = sf.t1 - sf.t0;
+  // Open where a flight rises through the roof (to the 3F bridge).
+  const cut = slabCuts(ctx, l, r, y, y + th);
+  const holes = [...wellsThrough(ctx.wells, y).map((wl) => wellRect(f, wl)).filter((h) => overlaps(h, r)), ...cut.holes, ...cut.recesses.map((x) => x.r)];
   for (const q of rectMinusHoles(r, holes)) {
     hRect(ctx.st, f, q, y, -1, c.canopyUnder, undefined, true);
     // Seen from the chase camera just above it the top is drawn as faint glazing only.
     hRect(ctx.o.walk ? ctx.glass : ctx.roofTop, f, q, y + th, 1, ctx.o.walk ? c.glass : c.canopyTop);
   }
-  tWall(ctx.st, f, r.t1, r.s0, r.s1, y, y + th, 1, c.fascia);
-  tWall(ctx.st, f, r.t0, r.s0, r.s1, y, y + th, -1, c.fascia);
-  sWall(ctx.st, f, r.s0, r.t0, r.t1, y, y + th, -1, c.fascia);
-  sWall(ctx.st, f, r.s1, r.t0, r.t1, y, y + th, 1, c.fascia);
+  tWallW(ctx, l, ctx.st, r.t1, r.s0, r.s1, y, y + th, 1, c.fascia);
+  tWallW(ctx, l, ctx.st, r.t0, r.s0, r.s1, y, y + th, -1, c.fascia);
+  sWallW(ctx, l, ctx.st, r.s0, r.t0, r.t1, y, y + th, -1, c.fascia);
+  sWallW(ctx, l, ctx.st, r.s1, r.t0, r.t1, y, y + th, 1, c.fascia);
   const tc = (r.t0 + r.t1) / 2;
-  const rows = head ? [] : w < 7 ? [tc] : [tc - Math.max(1.2, w / 2 - 2.3), tc + Math.max(1.2, w / 2 - 2.3)];
+  const rows = sf.head ? [] : columnRows(ctx, l, sf, w < 7 ? [tc] : [tc - Math.max(1.2, w / 2 - 2.3), tc + Math.max(1.2, w / 2 - 2.3)], 0.2);
   const pitch = 12;
   const n = Math.max(1, Math.round((r.s1 - r.s0 - 4) / pitch));
   const allWells = ctx.wells.map((wl) => wellRect(f, wl));
-  for (let k = 0; k <= n; k++) {
+  for (let k = 0; k <= n && rows.length; k++) {
     const s = r.s0 + 2 + ((r.s1 - r.s0 - 4) * k) / n;
-    const colR: Rect = { s0: s - 0.4, s1: s + 0.4, t0: rows[0] - 0.4, t1: rows[rows.length - 1] + 0.4 };
-    if (rows.length === 0 || allWells.some((h) => overlaps(h, colR, 0.6))) continue;
-    for (const t of rows) {
+    const colR: Rect = { s0: s - 0.4, s1: s + 0.4, t0: Math.min(...rows) - 0.4, t1: Math.max(...rows) + 0.4 };
+    if (allWells.some((h) => overlaps(h, colR, 0.6))) continue;
+    // Columns stay off the paths to the stair heads; a bay without any keeps no cross beam.
+    const cols = rows.filter((t) => boxClear(ctx, l, s - 0.2, s + 0.2, plat, y, t - 0.2, t + 0.2, ctx.onPlatform));
+    if (!cols.length) continue;
+    for (const t of cols) {
       if (ctx.o.walk) ctx.st.prism(P(f, s, plat, t), P(f, s, y, t), 0.16, 8, c.column, false);
       else fBox(ctx.st, f, s - 0.2, s + 0.2, plat - 0.2, y, t - 0.2, t + 0.2, c.column, 12);
     }
     // Cross beam under the roof.
-    fBox(ctx.st, f, s - 0.1, s + 0.1, y - 0.25 * hs, y, r.t0 + 0.3, r.t1 - 0.3, c.fascia, 4);
+    fBoxRuns(ctx, l, ctx.st, 't', s - 0.1, s + 0.1, y - 0.25 * hs, y, r.t0 + 0.3, r.t1 - 0.3, c.fascia, 4);
   }
   if (ctx.o.walk) {
-    for (const t of w < 7 ? [tc] : [tc - w / 4, tc + w / 4]) hRect(ctx.lights, f, { s0: r.s0 + 1, s1: r.s1 - 1, t0: t - 0.12, t1: t + 0.12 }, y - 0.02, -1, c.light);
+    for (const t of w < 7 ? [tc] : [tc - w / 4, tc + w / 4]) {
+      for (const q of rectMinusHoles({ s0: r.s0 + 1, s1: r.s1 - 1, t0: t - 0.12, t1: t + 0.12 }, holes)) hRect(ctx.lights, f, q, y - 0.02, -1, c.light);
+    }
   }
 }
 
@@ -902,10 +1281,14 @@ function drawBigRoof(ctx: Ctx, l: StationLayout): Rect | null {
   for (let s = r.s0; s <= r.s1 + 0.01; s += (r.s1 - r.s0) / (ns * 4)) {
     for (let j = 0; j < nt; j++) ctx.grid.seg(P(f, s, hAt(tAt(j)), tAt(j)), P(f, s, hAt(tAt(j + 1)), tAt(j + 1)));
   }
-  // Supports at the eaves: tapered steel columns standing beside the track field.
+  // Supports at the eaves: tapered steel columns standing beside the track field, moved along the
+  // eave girder off the streets and decks below.
   for (const k of [0.08, 0.5, 0.92]) {
-    const s = r.s0 + (r.s1 - r.s0) * k;
     for (const t of [r.t0, r.t1]) {
+      const s0 = r.s0 + (r.s1 - r.s0) * k;
+      const d = aside([0, 3, -3, 6, -6, 9, -9, 12, -12, 15, -15], (d) => boxClear(ctx, l, s0 + d - 0.6, s0 + d + 0.6, Y(0), eave - 1, t - 1.8, t + 1.8));
+      if (d === null) continue;
+      const s = s0 + d;
       ctx.st.beam(P(f, s, Y(0), t - 1.2), P(f, s, eave - 1, t), 1.1, 1.1, c.steel);
       ctx.st.beam(P(f, s, Y(0), t + 1.2), P(f, s, eave - 1, t), 1.1, 1.1, c.steel);
     }
@@ -923,22 +1306,28 @@ function drawBridge(ctx: Ctx, l: StationLayout): void {
   if (ns.length < 2 || !ctx.o.levelVisible('3F')) return;
   const loc = ns.map((n) => toLocal(f, n.x, n.z));
   const y = Y(Math.max(...ns.map((n) => n.y)));
+  // The paid concourse spans every stair head and bridge landing inside the gates.
+  const paid = ns.filter((n) => n.paid).map((n) => toLocal(f, n.x, n.z)[0]);
   const sm = loc.reduce((a, p) => a + p[0], 0) / loc.length;
-  const r: Rect = { s0: sm - 11, s1: sm + 11, t0: Math.min(l.box.t0, ...loc.map((p) => p[1])) - 6, t1: Math.max(l.box.t1, ...loc.map((p) => p[1])) + 6 };
+  const [ps0, ps1] = paid.length >= 2 ? [Math.min(...paid) - 4, Math.max(...paid) + 4] : [sm - 11, sm + 11];
+  const r: Rect = { s0: Math.min(ps0, sm - 11), s1: Math.max(ps1, sm + 11), t0: Math.min(l.box.t0, ...loc.map((p) => p[1])) - 6, t1: Math.max(l.box.t1, ...loc.map((p) => p[1])) + 6 };
   const holes = wellsThrough(ctx.wells, y - 0.05).map((w) => wellRect(f, w)).filter((h) => overlaps(h, r));
-  slab(ctx.st, f, r, y - 1.5 * hs, y - 0.03, clipHoles(r, holes, 0.2), c.surface, c.deckSide, c.deckBottom);
+  slab(ctx, l, ctx.st, r, y - 1.5 * hs, y - 0.03, clipHoles(r, holes, 0.2), c.surface, c.deckSide, c.deckBottom);
   const wallH = 3.4 * hs;
   const ceilY = y + 4.8 * hs;
+  // Glass end walls with doorways (glass kept above them) where walkways and flights come in.
   for (const S of [r.s0, r.s1]) {
-    sWall(ctx.glass, f, S, r.t0, r.t1, y, ceilY, 1, c.glass);
-    for (let t = r.t0; t <= r.t1 + 0.01; t += 3) fBox(ctx.st, f, S - 0.08, S + 0.08, y, ceilY, t - 0.08, t + 0.08, c.steel);
-    fBox(ctx.st, f, S - 0.1, S + 0.1, y + wallH * 0.33, y + wallH * 0.33 + 0.08, r.t0, r.t1, c.steel);
+    sWallW(ctx, l, ctx.glass, S, r.t0, r.t1, y, ceilY, 1, c.glass);
+    for (let t = r.t0; t <= r.t1 + 0.01; t += 3) {
+      for (const [a, b] of postParts(ctx, l, { s0: S - 0.08, s1: S + 0.08, t0: t - 0.08, t1: t + 0.08 }, y, ceilY)) fBox(ctx.st, f, S - 0.08, S + 0.08, a, b, t - 0.08, t + 0.08, c.steel);
+    }
+    fBoxRuns(ctx, l, ctx.st, 't', S - 0.1, S + 0.1, y + wallH * 0.33, y + wallH * 0.33 + 0.08, r.t0, r.t1, c.steel);
   }
   // Ceiling (faces down only, so a camera above still sees in) with light strips.
   const ch = wellsThrough(ctx.wells, ceilY).map((w) => wellRect(f, w)).filter((h) => overlaps(h, r));
   for (const q of rectMinusHoles(r, ch)) hRect(ctx.st, f, q, ceilY, -1, c.ceiling, undefined, true);
   if (!ctx.o.walk) hRect(ctx.roofTop, f, r, ceilY + 1.2 * hs, 1, c.canopyTop);
-  else for (const s of [sm - 5, sm, sm + 5]) hRect(ctx.lights, f, { s0: s - 0.15, s1: s + 0.15, t0: r.t0 + 2, t1: r.t1 - 2 }, ceilY - 0.03, -1, c.light);
+  else for (let s = r.s0 + 6; s < r.s1 - 4; s += 5) hRect(ctx.lights, f, { s0: s - 0.15, s1: s + 0.15, t0: r.t0 + 2, t1: r.t1 - 2 }, ceilY - 0.03, -1, c.light);
 }
 
 /** 阪急 train shed over the gate end: skylights over the tracks, trusses, columns on the platforms. */
@@ -962,21 +1351,25 @@ function drawShed(ctx: Ctx, l: StationLayout): Rect {
   sWall(ctx.st, f, r.s1, r.t0, r.t1, y - 1.2 * hs, y + th, 1, c.fascia);
   sWall(ctx.st, f, r.s0, r.t0, r.t1, y - 1.2 * hs, y + th, -1, c.fascia);
   const allWells = ctx.wells.map((wl) => wellRect(f, wl));
+  const rows = l.surfs.map((sf) => {
+    if (sf.head) return [];
+    const w = sf.t1 - sf.t0;
+    const tc = (sf.t0 + sf.t1) / 2;
+    return columnRows(ctx, l, sf, w > 12 ? [tc - w / 2 + 2.6, tc + w / 2 - 2.6] : [tc - Math.max(1.2, w / 2 - 2.3), tc + Math.max(1.2, w / 2 - 2.3)], 0.25);
+  });
   for (let s = r.s0 + 4; s < r.s1; s += 15) {
     // Truss: top and bottom chords with a web of diagonals.
     fBox(ctx.st, f, s - 0.2, s + 0.2, y - 0.25, y, r.t0, r.t1, c.steel, 4);
     fBox(ctx.st, f, s - 0.2, s + 0.2, y - 1.4 * hs, y - 1.4 * hs + 0.3, r.t0, r.t1, c.steel);
     if (ctx.o.walk) for (let t = r.t0; t < r.t1 - 2; t += 3) ctx.st.beam(P(f, s, y - 1.4 * hs + 0.3, t), P(f, s, y - 0.25, t + 3), 0.12, 0.12, c.steel);
-    for (const sf of l.surfs) {
-      if (sf.head) continue;
-      const w = sf.t1 - sf.t0;
-      const tc = (sf.t0 + sf.t1) / 2;
-      for (const t of w > 12 ? [tc - w / 2 + 2.6, tc + w / 2 - 2.6] : [tc - Math.max(1.2, w / 2 - 2.3), tc + Math.max(1.2, w / 2 - 2.3)]) {
+    rows.forEach((ts) => {
+      for (const t of ts) {
         if (allWells.some((h) => overlaps(h, { s0: s - 0.5, s1: s + 0.5, t0: t - 0.5, t1: t + 0.5 }, 0.5))) continue;
+        if (!boxClear(ctx, l, s - 0.25, s + 0.25, plat, y - 1.4 * hs, t - 0.25, t + 0.25, ctx.onPlatform)) continue;
         if (ctx.o.walk) ctx.st.prism(P(f, s, plat, t), P(f, s, y - 1.4 * hs, t), 0.22, 8, c.column, false);
         else fBox(ctx.st, f, s - 0.25, s + 0.25, plat - 0.2, y - 1.4 * hs, t - 0.25, t + 0.25, c.column, 12);
       }
-    }
+    });
   }
   if (ctx.o.walk) {
     for (const sf of l.surfs) {
@@ -991,48 +1384,138 @@ function drawShed(ctx: Ctx, l: StationLayout): Rect {
 // ------------------------------------------------------------------------------------------------
 // Underground stations: inward-facing box, pillars, lights, doors, tunnel mouths
 
-interface Seg {
-  a: [number, number];
-  b: [number, number];
-  ya: number;
-  yb: number;
-  hw: number;
+/** A cell of an underground ceiling: plan rectangle and flat cap (scene height, Infinity = none). */
+interface CeilCell extends Rect {
+  cap: number;
 }
 
-/** Walkable segments (walks and lane-shifted vertical edges) in plan, with scene heights. */
-function walkSegments(ctx: Ctx): Seg[] {
-  const byId = new Map(ctx.net.nodes.map((n) => [n.id, n]));
-  const out: Seg[] = [];
-  for (const e of ctx.net.edges) {
-    if (VERTICAL.has(e.kind) || e.kind === 'platform') continue;
-    const a = byId.get(e.a) as NetNode;
-    const b = byId.get(e.b) as NetNode;
-    const hw = Math.min(16, Math.max(3, e.width ?? (e.kind === 'crossing' ? 8 : 6))) / 2;
-    out.push({ a: [a.x, a.z], b: [b.x, b.z], ya: ctx.o.Y(a.y), yb: ctx.o.Y(b.y), hw });
-  }
-  for (const w of ctx.wells) {
-    const [p0, p1, p2, p3] = w.corners;
-    out.push({ a: [(p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2], b: [(p2[0] + p3[0]) / 2, (p2[1] + p3[1]) / 2], ya: w.lo, yb: w.hi, hw: Math.hypot(p0[0] - p1[0], p0[1] - p1[1]) / 2 });
-  }
-  return out;
+interface CeilingField {
+  /** s breakpoints shared by every band. */
+  ss: number[];
+  /** Bands across t, each a row of cells between consecutive ss (null = open). */
+  bands: { t0: number; t1: number; cells: (CeilCell | null)[] }[];
+  /** Ceiling height at a plan point (the plain vault where open or outside). */
+  at: (s: number, t: number) => number;
 }
 
-/** Wall openings (u = along-wall coordinate, t0/t1 = scene heights) where segments cross a wall. */
-function openingsOn(f: Frame, segs: Seg[], axis: 's' | 't', at: number, u0: number, u1: number, y0: number, y1: number, hs: number): Rect[] {
-  const out: Rect[] = [];
-  for (const g of segs) {
-    const [sa, ta] = toLocal(f, g.a[0], g.a[1]);
-    const [sb, tb] = toLocal(f, g.b[0], g.b[1]);
-    const [pa, pb, qa, qb] = axis === 't' ? [ta, tb, sa, sb] : [sa, sb, ta, tb];
-    if ((pa - at) * (pb - at) >= 0) continue;
-    const k = (at - pa) / (pb - pa);
-    const u = qa + k * (qb - qa);
-    const y = g.ya + k * (g.yb - g.ya);
-    if (u < u0 - g.hw || u > u1 + g.hw || y < y0 - 1 || y > y1) continue;
-    const w = g.hw + 0.4;
-    out.push({ s0: u - w, s1: u + w, t0: y - 0.5 * hs, t1: Math.min(y1, y + 3.6 * hs) });
+/**
+ * The underground ceiling as cells over the station box: the vault (or flat ceiling) `ceilAt`,
+ * open over stairwells and wherever a flight rises through it, and capped as a flat soffit under
+ * walkways that pass above the platforms (the 梅田 vault under the B1 concourse), never lower than
+ * the platform's head room.
+ */
+function ceilingField(ctx: Ctx, l: StationLayout, ceilAt: (t: number) => number, nt: number, wellHoles: Rect[]): CeilingField {
+  const { box } = l;
+  const { plat } = heights(ctx, l);
+  const fs = frameSpace(ctx, l);
+  const holes = [...wellHoles];
+  const caps: { r: Rect; y: number }[] = [];
+  const tAt = (j: number) => box.t0 + ((box.t1 - box.t0) * j) / nt;
+  const tc = (box.t0 + box.t1) / 2;
+  if (fs) {
+    const lowest = realY(ctx, plat) + CLEARANCE + 0.05;
+    for (let j = 0; j < nt; j++) {
+      const [t0, t1] = [tAt(j), tAt(j + 1)];
+      const y0 = Math.min(ceilAt(t0), ceilAt(t1));
+      const y1 = tc > t0 && tc < t1 ? ceilAt(tc) : Math.max(ceilAt(t0), ceilAt(t1));
+      const strip: Rect = { s0: box.s0, s1: box.s1, t0, t1 };
+      for (const h of fs.hits(strip, realY(ctx, y0) - 0.01, realY(ctx, y1) + 0.01, undefined, 0)) {
+        const cap = h.lo - 0.15;
+        if (cap >= lowest) caps.push({ r: snap(h.r, strip), y: ctx.o.Y(cap) });
+        else holes.push(snap(h.r, strip));
+      }
+    }
   }
-  return out;
+  const cuts = [...holes, ...caps.map((x) => x.r)];
+  const uniq = (xs: number[]) => [...new Set(xs.map((x) => Math.round(x * 1e4) / 1e4))].sort((a, b) => a - b);
+  const ss = uniq([box.s0, box.s1, ...cuts.flatMap((q) => [q.s0, q.s1]).filter((s) => s > box.s0 && s < box.s1)]);
+  const ts = uniq([...Array.from({ length: nt + 1 }, (_, j) => tAt(j)), ...cuts.flatMap((q) => [q.t0, q.t1]).filter((t) => t > box.t0 && t < box.t1)]);
+  const inside = (q: Rect, s: number, t: number) => s > q.s0 && s < q.s1 && t > q.t0 && t < q.t1;
+  const bands: CeilingField['bands'] = [];
+  for (let j = 0; j < ts.length - 1; j++) {
+    const [t0, t1] = [ts[j], ts[j + 1]];
+    if (t1 - t0 < 1e-3) continue;
+    const tm = (t0 + t1) / 2;
+    const cells: (CeilCell | null)[] = [];
+    for (let i = 0; i < ss.length - 1; i++) {
+      const sm = (ss[i] + ss[i + 1]) / 2;
+      if (holes.some((q) => inside(q, sm, tm))) cells.push(null);
+      else cells.push({ s0: ss[i], s1: ss[i + 1], t0, t1, cap: Math.min(Infinity, ...caps.filter((x) => inside(x.r, sm, tm)).map((x) => x.y)) });
+    }
+    bands.push({ t0, t1, cells });
+  }
+  const at = (s: number, t: number) => {
+    const b = bands.find((x) => t >= x.t0 && t <= x.t1);
+    const i = ss.findIndex((x, k) => k < ss.length - 1 && s >= x && s <= ss[k + 1]);
+    const cell = b && i >= 0 ? b.cells[i] : null;
+    return Math.min(cell ? cell.cap : Infinity, ceilAt(t));
+  };
+  return { ss, bands, at };
+}
+
+/** Vertical quad on the line s = S from t0 to t1, bottom and top heights given at each end. */
+function sQuad(m: Mesher, f: Frame, S: number, t0: number, t1: number, b0: number, b1: number, h0: number, h1: number, face: 1 | -1, color: THREE.Color): void {
+  const a = P(f, S, b0, t0);
+  const b = P(f, S, b1, t1);
+  const c = P(f, S, h1, t1);
+  const d = P(f, S, h0, t0);
+  if (face === 1) m.quad(a, b, c, d, color);
+  else m.quad(b, a, d, c, color);
+}
+
+/** sQuad minus walkable space (the parts of its bounding panel that stay, trimmed to the quad). */
+function sQuadW(ctx: Ctx, l: StationLayout, m: Mesher, S: number, t0: number, t1: number, b0: number, b1: number, h0: number, h1: number, face: 1 | -1, color: THREE.Color): void {
+  const lerp = (a: number, b: number, t: number) => a + ((b - a) * (t - t0)) / (t1 - t0 || 1);
+  for (const q of wallParts(ctx, l, 't', S, t0, t1, Math.min(b0, b1), Math.max(h0, h1))) {
+    const [lo0, lo1] = [Math.max(q.t0, lerp(b0, b1, q.s0)), Math.max(q.t0, lerp(b0, b1, q.s1))];
+    const [hi0, hi1] = [Math.min(q.t1, lerp(h0, h1, q.s0)), Math.min(q.t1, lerp(h0, h1, q.s1))];
+    if (hi0 - lo0 > 0.01 || hi1 - lo1 > 0.01) sQuad(m, l.f, S, q.s0, q.s1, lo0, lo1, Math.max(lo0, hi0), Math.max(lo1, hi1), face, color);
+  }
+}
+
+/** The ceiling cells as downward faces, with steps where a flat soffit meets the vault. */
+function drawCeiling(ctx: Ctx, l: StationLayout, field: CeilingField, ceilAt: (t: number) => number, color: THREE.Color): void {
+  const { f } = l;
+  const { ss, bands } = field;
+  const h = (c: CeilCell, t: number) => Math.min(c.cap, ceilAt(t));
+  for (const b of bands) {
+    for (let i = 0; i < b.cells.length; ) {
+      const c0 = b.cells[i];
+      let j = i + 1;
+      while (j < b.cells.length && (b.cells[j]?.cap ?? null) === (c0?.cap ?? null)) j++;
+      if (c0) {
+        const [h0, h1] = [h(c0, b.t0), h(c0, b.t1)];
+        const a = P(f, ss[i], h0, b.t0);
+        const bb = P(f, ss[j], h0, b.t0);
+        const cc = P(f, ss[j], h1, b.t1);
+        const d = P(f, ss[i], h1, b.t1);
+        ctx.shell.quad(a, d, cc, bb, color, undefined, UP);
+      }
+      // Step to the next run, seen from under the higher side.
+      const c1 = b.cells[j];
+      if (c0 && c1) {
+        const [a0, a1, b0, b1] = [h(c0, b.t0), h(c0, b.t1), h(c1, b.t0), h(c1, b.t1)];
+        if (Math.max(Math.abs(a0 - b0), Math.abs(a1 - b1)) > 0.01) {
+          const up = a0 + a1 > b0 + b1;
+          sQuadW(ctx, l, ctx.shell, ss[j], b.t0, b.t1, Math.min(a0, b0), Math.min(a1, b1), Math.max(a0, b0), Math.max(a1, b1), up ? -1 : 1, color);
+        }
+      }
+      i = j;
+    }
+  }
+  for (let k = 1; k < bands.length; k++) {
+    const [A, B] = [bands[k - 1], bands[k]];
+    if (Math.abs(A.t1 - B.t0) > 1e-6) continue;
+    const T = B.t0;
+    for (let i = 0; i < ss.length - 1; i++) {
+      const ca = A.cells[i];
+      const cb = B.cells[i];
+      if (!ca || !cb || ca.cap === cb.cap) continue;
+      const [ha, hb] = [h(ca, T), h(cb, T)];
+      if (Math.abs(ha - hb) < 0.01) continue;
+      tWallW(ctx, l, ctx.shell, T, ss[i], ss[i + 1], Math.min(ha, hb), Math.max(ha, hb), ha > hb ? -1 : 1, color);
+    }
+  }
 }
 
 function drawUnderground(ctx: Ctx, l: StationLayout): void {
@@ -1065,61 +1548,51 @@ function drawUnderground(ctx: Ctx, l: StationLayout): void {
   if (walk) hRect(ctx.shell, f, box, pit, 1, c.pit);
   drawPlatforms(ctx, l, pit, false);
 
-  // Walls: inward faces, with openings where corridors and stairs pass through them.
-  const segs = walkSegments(ctx);
+  // Walls: inward faces, with openings (sill and lintel kept) where walkways and flights pass
+  // through them, and the tunnel mouths at the open ends.
   const top = ceil;
   const tunnelEnds = [cfg.ext[0] > 0, cfg.ext[1] > 0];
+  const tunnelTop = rail + 4.9 * hs;
+  /** Parts of the wall on t = at (axis 's') or s = at (axis 't'). */
   const wallRects = (axis: 's' | 't', at: number, u0: number, u1: number, tunnels: boolean) => {
-    const holes = openingsOn(f, segs, axis, at, u0, u1, pit, top, hs);
-    if (tunnels) for (const tr of l.tracks) holes.push({ s0: tr.t - 2.3, s1: tr.t + 2.3, t0: pit, t1: rail + 4.9 * hs });
-    return { holes, parts: rectMinusHoles({ s0: u0, s1: u1, t0: pit, t1: top }, holes) };
+    const holes = tunnels ? l.tracks.map((tr) => ({ s0: tr.t - 2.3, s1: tr.t + 2.3, t0: pit, t1: tunnelTop })) : [];
+    return wallParts(ctx, l, axis, at, u0, u1, pit, top).flatMap((q) => rectMinusHoles(q, holes));
   };
   for (const [T, face] of [[box.t0, 1], [box.t1, -1]] as const) {
-    const { parts } = wallRects('t', T, box.s0, box.s1, false);
-    for (const q of parts) tWall(ctx.shell, f, T, q.s0, q.s1, q.t0, q.t1, face, wallC);
+    for (const q of wallRects('s', T, box.s0, box.s1, false)) tWall(ctx.shell, f, T, q.s0, q.s1, q.t0, q.t1, face, wallC);
   }
   for (const [S, face, tun] of [[box.s0, 1, tunnelEnds[0]], [box.s1, -1, tunnelEnds[1]]] as const) {
-    const { parts } = wallRects('s', S, box.t0, box.t1, tun);
-    for (const q of parts) sWall(ctx.shell, f, S, q.s0, q.s1, q.t0, q.t1, face, wallC);
+    for (const q of wallRects('t', S, box.t0, box.t1, tun)) sWall(ctx.shell, f, S, q.s0, q.s1, q.t0, q.t1, face, wallC);
     if (tun) {
       // Tunnel mouths: a short dark tube behind each opening.
       for (const tr of l.tracks) {
         const d = -face * 6;
         const S1 = S + d;
         const [a, b] = [Math.min(S, S1), Math.max(S, S1)];
-        sWall(ctx.shell, f, S1, tr.t - 2.3, tr.t + 2.3, pit, rail + 4.9 * hs, face, c.tunnel);
-        tWall(ctx.shell, f, tr.t - 2.3, a, b, pit, rail + 4.9 * hs, 1, c.tunnel);
-        tWall(ctx.shell, f, tr.t + 2.3, a, b, pit, rail + 4.9 * hs, -1, c.tunnel);
-        hRect(ctx.shell, f, { s0: a, s1: b, t0: tr.t - 2.3, t1: tr.t + 2.3 }, rail + 4.9 * hs, -1, c.tunnel);
+        sWallW(ctx, l, ctx.shell, S1, tr.t - 2.3, tr.t + 2.3, pit, tunnelTop, face, c.tunnel);
+        tWallW(ctx, l, ctx.shell, tr.t - 2.3, a, b, pit, tunnelTop, 1, c.tunnel);
+        tWallW(ctx, l, ctx.shell, tr.t + 2.3, a, b, pit, tunnelTop, -1, c.tunnel);
+        const roof: Rect = { s0: a, s1: b, t0: tr.t - 2.3, t1: tr.t + 2.3 };
+        const cut = slabCuts(ctx, l, roof, tunnelTop - 0.02, tunnelTop);
+        for (const q of rectMinusHoles(roof, [...cut.holes, ...cut.recesses.map((x) => x.r)])) hRect(ctx.shell, f, q, tunnelTop, -1, c.tunnel);
       }
     }
   }
-  // Vault / flat ceiling above the wall tops, facing down, with stairwell openings.
+  // Vault / flat ceiling above the wall tops, facing down, open over the stairwells.
   const holes = wellsThrough(ctx.wells, ceil).map((w) => wellRect(f, w)).filter((h) => overlaps(h, box));
-  const nt = vault > 0 ? 14 : 1;
-  for (let j = 0; j < nt; j++) {
-    const t0 = box.t0 + ((box.t1 - box.t0) * j) / nt;
-    const t1 = box.t0 + ((box.t1 - box.t0) * (j + 1)) / nt;
-    for (const q of rectMinusHoles({ s0: box.s0, s1: box.s1, t0, t1 }, holes)) {
-      const a = P(f, q.s0, ceilAt(q.t0), q.t0);
-      const b = P(f, q.s1, ceilAt(q.t0), q.t0);
-      const cc = P(f, q.s1, ceilAt(q.t1), q.t1);
-      const d = P(f, q.s0, ceilAt(q.t1), q.t1);
-      ctx.shell.quad(a, d, cc, b, c.ceiling, undefined, UP);
-    }
-  }
+  const field = ceilingField(ctx, l, ceilAt, vault > 0 ? 14 : 1, holes);
+  drawCeiling(ctx, l, field, ceilAt, c.ceiling);
+  const soffits = field.bands.flatMap((b) => b.cells.filter((x): x is CeilCell => !!x && x.cap < Infinity));
+  const open = [...holes, ...field.bands.flatMap((b) => b.cells.map((x, i) => (x ? null : { s0: field.ss[i], s1: field.ss[i + 1], t0: b.t0, t1: b.t1 })).filter((x): x is Rect => !!x))];
   if (vault > 0) {
-    // Vault end walls (gable segments above the flat wall tops).
-    for (const [S, face] of [[box.s0, 1], [box.s1, -1]] as const) {
-      for (let j = 0; j < nt; j++) {
-        const t0 = box.t0 + ((box.t1 - box.t0) * j) / nt;
-        const t1 = box.t0 + ((box.t1 - box.t0) * (j + 1)) / nt;
-        const a = P(f, S, top, t0);
-        const b = P(f, S, top, t1);
-        const cc = P(f, S, ceilAt(t1), t1);
-        const d = P(f, S, ceilAt(t0), t0);
-        if (face === 1) ctx.shell.quad(a, b, cc, d, wallC);
-        else ctx.shell.quad(b, a, d, cc, wallC);
+    // Vault end walls (gable segments above the flat wall tops), following the ceiling cells.
+    for (const [S, face, i] of [[box.s0, 1, 0], [box.s1, -1, field.ss.length - 2]] as const) {
+      for (const b of field.bands) {
+        const cell = b.cells[i];
+        if (!cell) continue;
+        const [h0, h1] = [Math.min(cell.cap, ceilAt(b.t0)), Math.min(cell.cap, ceilAt(b.t1))];
+        if (Math.max(h0, h1) <= top + 0.01) continue;
+        sQuadW(ctx, l, ctx.shell, S, b.t0, b.t1, top, top, Math.max(top, h0), Math.max(top, h1), face, wallC);
       }
     }
   }
@@ -1132,9 +1605,11 @@ function drawUnderground(ctx: Ctx, l: StationLayout): void {
     const nearTrack = l.tracks.some((tr) => Math.abs(tr.t - T) < 3);
     if (!nearTrack) continue;
     const off = face * 0.03;
-    tWall(ctx.shell, f, T + off, box.s0, box.s1, pit, plat, face, c.pit);
-    tWall(ctx.shell, f, T + off, box.s0, box.s1, plat + 0.4 * hs, plat + 0.6 * hs, face, lineC);
+    tWallW(ctx, l, ctx.shell, T + off, box.s0, box.s1, pit, plat, face, c.pit);
+    tWallW(ctx, l, ctx.shell, T + off, box.s0, box.s1, plat + 0.4 * hs, plat + 0.6 * hs, face, lineC);
     for (let s = ps0 + 6, k = 0; s < ps1 - 6; s += 9, k++) {
+      // Nothing hangs in a doorway.
+      if (!boxClear(ctx, l, s - 1.6, s + 1.6, plat + 1.1 * hs, plat + 1.1 * hs + 1.4, T - 0.1, T + 0.1)) continue;
       if (k % 4 === 2) {
         // 駅名標 on the wall, facing the platform across the track.
         const y0 = plat + 1.3 * hs;
@@ -1160,29 +1635,37 @@ function drawUnderground(ctx: Ctx, l: StationLayout): void {
     const w = s.t1 - s.t0;
     const mid = (s.t0 + s.t1) / 2;
     if (cfg.pillars && w >= 7) {
-      for (const t of [mid - (w / 2 - 2.1), mid + (w / 2 - 2.1)]) {
+      // Two pillar lines, moved off the walking line beside the stair wells.
+      for (const t of columnRows(ctx, l, s, [mid - (w / 2 - 2.1), mid + (w / 2 - 2.1)], 0.43)) {
         for (let x = s.s0 + 5; x < s.s1 - 3; x += 9) {
           if (allWells.some((h) => overlaps(h, { s0: x - 0.5, s1: x + 0.5, t0: t - 0.5, t1: t + 0.5 }, 0.8))) continue;
-          fBox(ctx.st, f, x - 0.4, x + 0.4, plat, ceilAt(t), t - 0.4, t + 0.4, c.column, 12);
+          const yTop = field.at(x, t);
+          if (!boxClear(ctx, l, x - 0.43, x + 0.43, plat, yTop, t - 0.43, t + 0.43, ctx.onPlatform)) continue;
+          fBox(ctx.st, f, x - 0.4, x + 0.4, plat, yTop, t - 0.4, t + 0.4, c.column, 12);
           fBox(ctx.st, f, x - 0.43, x + 0.43, plat + 1.9 * hs, plat + 2.1 * hs, t - 0.43, t + 0.43, lineC, 12);
           fBox(ctx.st, f, x - 0.42, x + 0.42, plat, plat + 0.15, t - 0.42, t + 0.42, c.platSide, 12);
         }
       }
     }
-    // Light strips (or pendant lights along the crown of the vault).
+    // Light strips (or pendant lights along the crown of the vault), none over openings or under
+    // the soffits of passages above.
     const lightY = (t: number) => ceilAt(t) - 0.04;
+    const dark = [...open, ...soffits];
     if (vault > 0) {
       for (let x = s.s0 + 6; x < s.s1 - 4; x += 12) {
+        if (field.at(x, mid) < ceilAt(mid) - 0.01 || dark.some((q) => overlaps(q, { s0: x - 0.6, s1: x + 0.6, t0: mid - 0.6, t1: mid + 0.6 }))) continue;
         // Pendant lamp: a shallow shade with a glowing bowl beneath.
         fBox(ctx.st, f, x - 0.55, x + 0.55, lightY(mid) - 0.95 * hs, lightY(mid) - 0.85 * hs, mid - 0.55, mid + 0.55, c.steelDark);
         fBox(ctx.lights, f, x - 0.4, x + 0.4, lightY(mid) - 1.05 * hs, lightY(mid) - 0.95 * hs, mid - 0.4, mid + 0.4, c.light);
         fBox(ctx.st, f, x - 0.03, x + 0.03, lightY(mid) - 0.85 * hs, lightY(mid), mid - 0.03, mid + 0.03, c.steelDark);
       }
-      for (const t of [mid - w / 3, mid + w / 3]) hRect(ctx.lights, f, { s0: s.s0 + 1, s1: s.s1 - 1, t0: t - 0.12, t1: t + 0.12 }, lightY(t), -1, c.light);
+      for (const t of [mid - w / 3, mid + w / 3]) {
+        for (const q of rectMinusHoles({ s0: s.s0 + 1, s1: s.s1 - 1, t0: t - 0.12, t1: t + 0.12 }, dark)) hRect(ctx.lights, f, q, lightY(t), -1, c.light);
+      }
     } else {
       for (const t of [mid - w / 4, mid + w / 4]) {
         const r: Rect = { s0: s.s0 + 1, s1: s.s1 - 1, t0: t - 0.14, t1: t + 0.14 };
-        for (const q of rectMinusHoles(r, holes)) hRect(ctx.lights, f, q, lightY(t), -1, c.light);
+        for (const q of rectMinusHoles(r, dark)) hRect(ctx.lights, f, q, lightY(t), -1, c.light);
       }
     }
     if (cfg.doors) drawDoors(ctx, l, s, lineC);
@@ -1197,6 +1680,7 @@ function drawDoors(ctx: Ctx, l: StationLayout, s: Surf, lineC: THREE.Color): voi
   const { plat } = heights(ctx, l);
   const full = l.cfg.doors === 'full';
   const H = (full ? 2.4 : 1.3) * hs;
+  const fs = frameSpace(ctx, l);
   for (const side of [-1, 1] as const) {
     const ti = s.track[side];
     if (ti === undefined) continue;
@@ -1212,12 +1696,19 @@ function drawDoors(ctx: Ctx, l: StationLayout, s: Surf, lineC: THREE.Color): voi
     for (let k = 0; k < cars; k++) for (let d = 0; d < lv.doors; d++) doorsAt.push(start + k * pitch + (lv.carLen * (d + 0.5)) / lv.doors);
     const t0 = Math.min(T, T - side * 0.25);
     const t1 = Math.max(T, T - side * 0.25);
+    // The line of doors stops where a walkway runs along or across it (the walking lines along
+    // the platform stay well inside it).
+    const runs = fs ? fs.runs('s', { s0: s.s0 + 1, s1: s.s1 - 1, t0, t1 }, realY(ctx, plat), realY(ctx, plat + H), ctx.onPlatform, 0.6) : [[s.s0 + 1, s.s1 - 1]];
+    const within = (a: number, b: number) => runs.flatMap(([u, v]): [number, number][] => (Math.min(b, v) - Math.max(a, u) > 0.05 ? [[Math.max(a, u), Math.min(b, v)]] : []));
+    const inside = (a: number, b: number) => runs.some(([u, v]) => a >= u - 1e-6 && b <= v + 1e-6);
     if (full) {
       // Continuous glass screen with mullions and a header in the line colour.
-      tWall(ctx.glass, f, T, s.s0 + 1, s.s1 - 1, plat, plat + H, side, c.glass);
-      fBox(ctx.st, f, s.s0 + 1, s.s1 - 1, plat + H, plat + H + 0.45 * hs, t0, t1, c.doorBody);
-      fBox(ctx.st, f, s.s0 + 1, s.s1 - 1, plat + H + 0.12 * hs, plat + H + 0.22 * hs, side === 1 ? t0 - 0.01 : t0, side === 1 ? t1 : t1 + 0.01, lineC);
-      for (let x = s.s0 + 1; x <= s.s1 - 1; x += 1.6) fBox(ctx.st, f, x - 0.05, x + 0.05, plat, plat + H, t0 + 0.05, t1 - 0.05, c.steel);
+      for (const [a, b] of runs) {
+        tWall(ctx.glass, f, T, a, b, plat, plat + H, side, c.glass);
+        for (let x = s.s0 + 1; x <= s.s1 - 1; x += 1.6) if (x >= a - 0.05 && x <= b + 0.05) fBox(ctx.st, f, x - 0.05, x + 0.05, plat, plat + H, t0 + 0.05, t1 - 0.05, c.steel);
+      }
+      fBoxRuns(ctx, l, ctx.st, 's', s.s0 + 1, s.s1 - 1, plat + H, plat + H + 0.45 * hs, t0, t1, c.doorBody);
+      fBoxRuns(ctx, l, ctx.st, 's', s.s0 + 1, s.s1 - 1, plat + H + 0.12 * hs, plat + H + 0.22 * hs, side === 1 ? t0 - 0.01 : t0, side === 1 ? t1 : t1 + 0.01, lineC);
       continue;
     }
     // Half height: a door pocket on each side of every opening, glass panels in between.
@@ -1227,15 +1718,18 @@ function drawDoors(ctx: Ctx, l: StationLayout, s: Surf, lineC: THREE.Color): voi
       const p0 = d - 1.0;
       const p1 = d + 1.0;
       if (p0 - 1.1 > prev) {
-        tWall(ctx.glass, f, T, prev, p0 - 1.1, plat + 0.1, plat + H - 0.1 * hs, side, c.glass);
-        fBox(ctx.st, f, prev, p0 - 1.1, plat + H - 0.1 * hs, plat + H, t0 + 0.05, t1 - 0.05, c.steel);
+        for (const [a, b] of within(prev, p0 - 1.1)) {
+          tWall(ctx.glass, f, T, a, b, plat + 0.1, plat + H - 0.1 * hs, side, c.glass);
+          fBox(ctx.st, f, a, b, plat + H - 0.1 * hs, plat + H, t0 + 0.05, t1 - 0.05, c.steel);
+        }
       }
       for (const [a, b] of [[p0 - 1.1, p0], [p1, p1 + 1.1]]) {
+        if (!inside(a, b)) continue;
         fBox(ctx.st, f, a, b, plat, plat + H, t0, t1, c.doorBody);
         fBox(ctx.st, f, a, b, plat + H - 0.12 * hs, plat + H, side === 1 ? t0 - 0.01 : t0, side === 1 ? t1 : t1 + 0.01, lineC);
       }
       // Closed door leaves in the opening.
-      fBox(ctx.st, f, p0, p1, plat + 0.1, plat + H * 0.9, t0 + 0.08, t1 - 0.08, c.doorBody);
+      if (inside(p0, p1)) fBox(ctx.st, f, p0, p1, plat + 0.1, plat + H * 0.9, t0 + 0.08, t1 - 0.08, c.doorBody);
       prev = p1 + 1.1;
     }
   }
@@ -1291,6 +1785,7 @@ function drawPower(ctx: Ctx, l: StationLayout): void {
     if (s < shedEnd) continue;
     portals.push(s);
     for (const t of cols) {
+      if (!boxClear(ctx, l, s - 0.2, s + 0.2, bed, beamY + 0.4 * hs, t - 0.2, t + 0.2, ctx.onPlatform)) continue;
       fBox(ctx.st, f, s - 0.2, s + 0.2, bed, beamY + 0.4 * hs, t - 0.2, t + 0.2, c.steelDark, 8);
     }
     fBox(ctx.st, f, s - 0.15, s + 0.15, beamY, beamY + 0.35 * hs, Math.min(...cols), Math.max(...cols), c.steelDark);
@@ -1400,8 +1895,10 @@ function drawSigns(ctx: Ctx, l: StationLayout): void {
         const sign = nameSignFor(l, side === 1 ? lineL : lineR);
         ctx.signSpecs.push(sign);
         if (standing) {
-          const t = mid + side * Math.max(0.8, w / 2 - 2.4);
+          // Standing signs keep off the walking line and the paths to the stair heads, like columns.
+          const t = columnRows(ctx, l, s, [mid + side * Math.max(0.8, w / 2 - 2.4)], 0.1)[0];
           const y0 = plat + 1.05 * hs;
+          if (t === undefined || !boxClear(ctx, l, x - 1.3, x + 1.3, plat, y0 + 0.66, t - 0.1, t + 0.1, ctx.onPlatform)) continue;
           ctx.signs.push({ key: sign.key, q: signQuad(f, x, t + side * 0.06, y0, 2.4, 0.6, side) });
           fBox(ctx.st, f, x - 1.3, x + 1.3, y0 - 0.06, y0 + 0.66, t - 0.05, t + 0.05, c.signFrame);
           for (const sx of [-1.1, 1.1]) fBox(ctx.st, f, x + sx - 0.05, x + sx + 0.05, plat, y0, t - 0.05, t + 0.05, c.signFrame, 8);
