@@ -30,9 +30,10 @@ export function addMidosujiUmeda(b: NetBuilder): void {
   const gate = (key: string, at: LatLon, outAt: LatLon, name: string, stop: string, busy: number, towardPlatform: number) => {
     const inId = `m_${key}_in`;
     const conc = `m_${key}_conc`;
-    b.node(conc, 'vertical', `${name}内コンコース`, offset(at, towardPlatform, 8), 'B1', { station: st, paid: true, y: -5.5 });
+    // Gates and the in-gate concourse are on the same B1 floor as the malls outside them.
+    b.node(conc, 'vertical', `${name}内コンコース`, offset(at, towardPlatform, 8), 'B1', { station: st, paid: true, y: -6 });
     b.vertical(stop, conc, ['stairs', 'esc'], { busy });
-    b.node(inId, 'gate', `御堂筋線 ${name}`, at, 'B1', { station: st, paid: true, label: true, y: -5.5 });
+    b.node(inId, 'gate', `御堂筋線 ${name}`, at, 'B1', { station: st, paid: true, label: true, y: -6 });
     b.walk(conc, inId, { busy });
     b.node(`m_${key}_out`, 'junction', `御堂筋線 ${name}前`, outAt, 'B1', { station: st, y: -6 });
     b.gate(inId, `m_${key}_out`, `御堂筋線梅田 ${name}`, { busy, width: 20 });
