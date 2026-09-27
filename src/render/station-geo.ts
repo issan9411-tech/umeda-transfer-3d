@@ -251,9 +251,60 @@ export function rectMinusHoles(outer: Rect, holes: Rect[]): Rect[] {
   return out;
 }
 
+/**
+ * Convex polygon (s, t) clipped to a rectangle (Sutherland–Hodgman against its four sides);
+ * either winding. Returns [] when they do not overlap in a region of positive area.
+ */
+export function clipToRect(poly: [number, number][], r: Rect): [number, number][] {
+  let pts = poly;
+  const sides: [0 | 1, number, 1 | -1][] = [
+    [0, r.s0, 1],
+    [0, r.s1, -1],
+    [1, r.t0, 1],
+    [1, r.t1, -1],
+  ];
+  for (const [k, v, sg] of sides) {
+    const out: [number, number][] = [];
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const q = pts[(i + 1) % pts.length];
+      const dp = (p[k] - v) * sg;
+      const dq = (q[k] - v) * sg;
+      if (dp >= 0) out.push(p);
+      if (dp * dq < 0) {
+        const u = dp / (dp - dq);
+        out.push([p[0] + (q[0] - p[0]) * u, p[1] + (q[1] - p[1]) * u]);
+      }
+    }
+    pts = out;
+    if (pts.length < 3) return [];
+  }
+  let area = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const [s0, t0] = pts[i];
+    const [s1, t1] = pts[(i + 1) % pts.length];
+    area += s0 * t1 - s1 * t0;
+  }
+  return Math.abs(area) > 1e-6 ? pts : [];
+}
+
 /** Area of a rectangle list (tests / sanity checks). */
 export function rectArea(rs: Rect[]): number {
   return rs.reduce((a, r) => a + (r.s1 - r.s0) * (r.t1 - r.t0), 0);
+}
+
+/** The parts of [a, b] not covered by the intervals, each at least minLen long. */
+export function gaps(a: number, b: number, covered: [number, number][], minLen = 0): [number, number][] {
+  const iv = covered.filter(([x, y]) => y > a && x < b).sort((p, q) => p[0] - q[0]);
+  const out: [number, number][] = [];
+  let u = a;
+  for (const [x, y] of iv) {
+    if (x - u >= minLen && x > u) out.push([u, Math.min(x, b)]);
+    u = Math.max(u, y);
+    if (u >= b) break;
+  }
+  if (b - u >= minLen && b > u) out.push([u, b]);
+  return out;
 }
 
 /** Deterministic 0…1 hash of a string (stable train placement without Math.random). */
