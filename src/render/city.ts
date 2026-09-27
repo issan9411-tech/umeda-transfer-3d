@@ -4,7 +4,9 @@ import {
   analyseRoads,
   approach,
   BoxGrid,
+  CITY_SQUARE,
   convexHull,
+  cutBands,
   distanceToEdges,
   FACADE_STYLES,
   fadeTarget,
@@ -15,6 +17,7 @@ import {
   insideIntervals,
   insideLength,
   insideRings,
+  intersectConvex,
   isMajor,
   junctionStations,
   laneLayout,
@@ -48,6 +51,7 @@ import {
   WHEEL_HUB,
   WHEEL_PERIOD_S,
   WHEEL_RADIUS,
+  type Cutter,
   type FacadeStyle,
   type Lane,
   type MassPart,
@@ -75,10 +79,11 @@ import { polyArea, type P2 } from './walkway-util';
  * overview) are cut away smoothly. Each building has an id; a small texture holds its current
  * opacity, and each facade material is drawn in two passes — an opaque pass over the fully
  * solid buildings (which write depth) and a blended pass over the faded ones (no depth write, so
- * whatever is behind them stays visible). Vertices are grouped per building, so each pass draws
- * exactly its buildings through its own index list, rebuilt only when a building crosses
- * between them; per frame only the buildings near the camera–walker line (a grid query) are
- * tested. Merged geometry keeps the whole module at ~30 draw calls.
+ * whatever is behind them stays visible). Vertices are grouped per building: the opaque pass
+ * draws every building that rests solid through a fixed index list (its vertex shader folds a
+ * faded building's triangles away), and the blended pass's list is rebuilt from just the
+ * buildings fading at the moment; per frame only the buildings near the camera–walker line (a
+ * grid query) are tested. Merged geometry keeps the whole module at ~30 draw calls.
  */
 
 export interface CityOptions {
@@ -278,20 +283,36 @@ const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1).toNonIndexed();
 
 // ---------------------------------------------------------------- fade shader
 
+/** Fade-texture bytes (opacity × 255) at or above which a building is drawn in the solid pass… */
+const SOLID_BYTE = 254;
+/** …and at or below which it is not drawn at all. */
+const HIDDEN_BYTE = 1;
+
 /**
- * Per-building opacity from the fade texture at `aBid`. The solid pass draws fully opaque
- * buildings as they are; the ghost pass blends the others by their opacity.
+ * Per-building opacity from the fade texture at `aBid`. The solid pass draws the buildings that
+ * are fully opaque and folds the faded ones' triangles away (off-screen, so its index list never
+ * changes); the ghost pass blends the others by their opacity. (The shadow pass draws the solid
+ * list with three.js's own depth material: a building cut away for the camera still casts its
+ * shadow.)
  */
 function patchFade(mat: THREE.Material, uFade: { value: THREE.Texture | null }, pass: 'solid' | 'ghost', alphaScale = 1): void {
   mat.onBeforeCompile = (sh) => {
-    if (pass === 'solid') return;
     sh.uniforms.uFadeTex = uFade;
+    const fetch = `int fadeId = int(aBid + 0.5);\nfloat cityFade = texelFetch(uFadeTex, ivec2(fadeId % ${FADE_TEX_WIDTH}, fadeId / ${FADE_TEX_WIDTH}), 0).r;`;
+    // Every vertex of a building lands on the same point outside the clip volume: its
+    // triangles are degenerate and skipped.
+    const fold = (keep: string) => `#include <fog_vertex>\nif (!(${keep})) gl_Position = vec4(0.0, 0.0, 2.0, 1.0);`;
+    if (pass === 'solid') {
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', `#include <common>\nattribute float aBid;\nuniform sampler2D uFadeTex;`)
+        .replace('#include <begin_vertex>', `#include <begin_vertex>\n${fetch}`)
+        .replace('#include <fog_vertex>', fold(`cityFade * 255.0 > ${SOLID_BYTE - 0.5}`));
+      return;
+    }
     sh.vertexShader = sh.vertexShader
       .replace('#include <common>', `#include <common>\nattribute float aBid;\nuniform sampler2D uFadeTex;\nvarying float vFade;`)
-      .replace(
-        '#include <begin_vertex>',
-        `#include <begin_vertex>\nint fadeId = int(aBid + 0.5);\nvFade = texelFetch(uFadeTex, ivec2(fadeId % ${FADE_TEX_WIDTH}, fadeId / ${FADE_TEX_WIDTH}), 0).r;`,
-      );
+      .replace('#include <begin_vertex>', `#include <begin_vertex>\n${fetch}\nvFade = cityFade;`)
+      .replace('#include <fog_vertex>', fold(`cityFade * 255.0 > ${HIDDEN_BYTE + 0.5}`));
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', '#include <common>\nvarying float vFade;')
       .replace('#include <opaque_fragment>', `#include <opaque_fragment>\ngl_FragColor.a *= vFade * mix(${alphaScale.toFixed(2)}, 1.0, smoothstep(0.12, 0.45, vFade));`);
@@ -337,59 +358,95 @@ function patchReveal(mat: THREE.Material, uReveal: { value: THREE.Vector4 }, sof
 
 /**
  * The building meshes of one geometry: a solid-pass and a ghost-pass geometry sharing the
- * vertex buffers, each drawing only its buildings through an index list.
+ * vertex buffers. The solid pass draws every building that rests solid through a fixed index
+ * list (its shader folds away those faded at the moment); the ghost pass draws the buildings
+ * that rest faded (the overview's) from a fixed head of its list, then those currently faded
+ * out of the solid pass from a tail rebuilt from the few buildings in motion.
  */
 class PassGeometry {
   readonly solid = new THREE.BufferGeometry();
   readonly ghost = new THREE.BufferGeometry();
-  private readonly si: Uint32Array;
-  private readonly gi: Uint32Array;
-  private readonly sIndex: THREE.BufferAttribute;
-  private readonly gIndex: THREE.BufferAttribute;
+  private gi: Uint32Array;
+  private gIndex: THREE.BufferAttribute;
+  /** Index entries of the solid pass, and of the ghost list's fixed head. */
+  readonly solidCount: number;
+  private readonly head: number;
+  private tail = 0;
 
   constructor(
     attrs: Record<string, THREE.BufferAttribute>,
     /** Vertex range [start, end) of each building. */
     private readonly start: Int32Array,
     private readonly end: Int32Array,
+    /** Pass each building rests in (0 hidden, 1 ghost, 2 solid). */
+    private readonly restPass: Uint8Array,
   ) {
-    const n = attrs.position.count;
     for (const [k, a] of Object.entries(attrs)) {
       this.solid.setAttribute(k, a);
       this.ghost.setAttribute(k, a);
     }
-    this.si = new Uint32Array(Math.max(3, n));
-    this.gi = new Uint32Array(Math.max(3, n));
-    this.sIndex = new THREE.BufferAttribute(this.si, 1).setUsage(THREE.DynamicDrawUsage);
+    let ns = 0;
+    let ng = 0;
+    for (let b = 0; b < restPass.length; b++) {
+      if (restPass[b] === 2) ns += end[b] - start[b];
+      else if (restPass[b] === 1) ng += end[b] - start[b];
+    }
+    const si = new Uint32Array(Math.max(3, ns));
+    // Room for the tail: a few large buildings at a time (it grows if ever needed).
+    this.gi = new Uint32Array(Math.max(3, ng + Math.min(ns, 1 << 16)));
+    ns = 0;
+    ng = 0;
+    for (let b = 0; b < restPass.length; b++) {
+      const a = start[b];
+      const e = end[b];
+      if (restPass[b] === 2) for (let v = a; v < e; v++) si[ns++] = v;
+      else if (restPass[b] === 1) for (let v = a; v < e; v++) this.gi[ng++] = v;
+    }
+    this.solidCount = ns;
+    this.head = ng;
+    this.solid.setIndex(new THREE.BufferAttribute(si, 1));
+    this.solid.setDrawRange(0, ns);
     this.gIndex = new THREE.BufferAttribute(this.gi, 1).setUsage(THREE.DynamicDrawUsage);
-    this.solid.setIndex(this.sIndex);
     this.ghost.setIndex(this.gIndex);
+    this.ghost.setDrawRange(0, ng);
     this.solid.computeBoundingSphere();
     this.ghost.boundingSphere = this.solid.boundingSphere;
   }
 
-  /** Rebuilds both index lists from each building's pass (0 hidden, 1 ghost, 2 solid). */
-  update(state: Uint8Array): [number, number] {
-    let ns = 0;
-    let ng = 0;
-    for (let b = 0; b < state.length; b++) {
-      const s = state[b];
-      if (s === 0) continue;
-      const a = this.start[b];
-      const e = this.end[b];
-      if (s === 2) for (let v = a; v < e; v++) this.si[ns++] = v;
-      else for (let v = a; v < e; v++) this.gi[ng++] = v;
+  /**
+   * Rebuilds the ghost list's tail from the buildings in motion (`active`): those resting solid
+   * but faded now; only the tail is uploaded. Returns the solid and ghost index counts.
+   */
+  update(active: Int32Array, activeN: number, state: Uint8Array): [number, number] {
+    let need = this.head;
+    for (let k = 0; k < activeN; k++) {
+      const b = active[k];
+      if (this.restPass[b] === 2 && state[b] === 1) need += this.end[b] - this.start[b];
     }
-    for (const [attr, n, g] of [
-      [this.sIndex, ns, this.solid],
-      [this.gIndex, ng, this.ghost],
-    ] as const) {
-      g.setDrawRange(0, n);
-      attr.clearUpdateRanges();
-      attr.addUpdateRange(0, Math.max(1, n));
-      attr.needsUpdate = true;
+    let grown = false;
+    if (need > this.gi.length) {
+      const gi = new Uint32Array(Math.max(need, this.head + 2 * (this.gi.length - this.head)));
+      gi.set(this.gi.subarray(0, this.head));
+      this.gi = gi;
+      this.gIndex = new THREE.BufferAttribute(gi, 1).setUsage(THREE.DynamicDrawUsage);
+      this.ghost.setIndex(this.gIndex);
+      grown = true;
     }
-    return [ns, ng];
+    let ng = this.head;
+    for (let k = 0; k < activeN; k++) {
+      const b = active[k];
+      if (this.restPass[b] !== 2 || state[b] !== 1) continue;
+      for (let v = this.start[b], e = this.end[b]; v < e; v++) this.gi[ng++] = v;
+    }
+    const tail = ng - this.head;
+    if (tail || this.tail || grown) {
+      this.ghost.setDrawRange(0, ng);
+      this.gIndex.clearUpdateRanges();
+      if (tail && !grown) this.gIndex.addUpdateRange(this.head, tail);
+      if (tail || grown) this.gIndex.needsUpdate = true;
+    }
+    this.tail = tail;
+    return [this.solidCount, ng];
   }
 
   dispose(): void {
@@ -404,9 +461,31 @@ interface BuildingRec {
   id: string;
   prisms: Prism[];
   box: [number, number, number, number];
+  /** Resting opacity before distance fading (overview: landmark or not). */
+  base: number;
   /** Opacity it settles at when nothing needs cutting away. */
   rest: number;
 }
+
+/** Overview resting opacity of the ordinary blocks (landmarks, stations and towers: OVERVIEW_OPACITY). */
+const OVERVIEW_MINOR = 0.25;
+/** Overview: blocks fade from this distance (m) from the selected route (or the network)… */
+const FADE_NEAR = 150;
+/** …to 30 % of their resting opacity at this one. */
+const FADE_FAR = 400;
+
+/** Overview fading of a building `d` metres from the route: 1 near it, 0.3 far away. */
+function farFade(d: number): number {
+  const k = Math.max(0, Math.min(1, (d - FADE_NEAR) / (FADE_FAR - FADE_NEAR)));
+  return 1 - 0.7 * k * k * (3 - 2 * k);
+}
+
+/** An outdoor walk edge at least this high (m) is a deck (a mapped building is opened along it)… */
+const DECK_MIN_Y = 2.5;
+/** …where it runs at least this far (m) through the building. */
+const DECK_MIN_INSIDE = 8;
+/** Canopies at least this large (m²) stand on posts. */
+const MIN_POSTED_CANOPY = 20;
 
 export function buildCity(net: Network, opts: CityOptions): City {
   const ex = opts.ex ?? 1;
@@ -468,16 +547,17 @@ export function buildCity(net: Network, opts: CityOptions): City {
     return space.intersectsBox(cx - hx, cx + hx, (cy - sy / 2) / ex, (cy + sy / 2) / ex, cz - hz, cz + hz);
   };
 
-  // The city covers the walk-mode ground: the network's extent and 320 m around it.
+  // The city covers a fixed square around the stations (the walk-mode ground), so a small move
+  // of the network never makes buildings at its edges come and go.
   const nodeXs = net.nodes.map((n) => n.x);
   const nodeZs = net.nodes.map((n) => n.z);
   const nx0 = net.nodes.length ? Math.min(...nodeXs) : 0;
   const nx1 = net.nodes.length ? Math.max(...nodeXs) : 0;
   const nz0 = net.nodes.length ? Math.min(...nodeZs) : 0;
   const nz1 = net.nodes.length ? Math.max(...nodeZs) : 0;
-  const gx = (nx0 + nx1) / 2;
-  const gz = (nz0 + nz1) / 2;
-  const half = Math.max(nx1 - nx0, nz1 - nz0) / 2 + 320;
+  const gx = CITY_SQUARE.x;
+  const gz = CITY_SQUARE.z;
+  const half = CITY_SQUARE.half;
   // Distance to the nearest network node (for detail and the tree budget).
   const nodeCell = 60;
   const nodeGrid = new Map<string, NetNode[]>();
@@ -502,9 +582,19 @@ export function buildCity(net: Network, opts: CityOptions): City {
     return best;
   };
 
+  const nodeById = new Map<string, NetNode>(net.nodes.map((n) => [n.id, n]));
+  // Streets at ground level; elevated carriageways (decks) are drawn as viaducts further down.
+  const streetRoads = net.roads.filter((r) => !r.deck);
+  const deckRoads = net.roads.filter((r) => r.deck && r.deck.length === r.points.length && r.points.length >= 2);
+  const { infos, junctions, byRoad } = analyseRoads(streetRoads);
+  const roadIndex = new RoadIndex(infos);
+  /** The carriageways drawn (the overview leaves out the minor ones). */
+  const drawnRoads = walk ? roadIndex : new RoadIndex(infos.filter((info) => isMajor(info.road)));
+
   // Elevated stations (JR, 阪急): no mapped building may stand in their platform areas, which
-  // station.ts draws (the hull of each station's platforms, 1.5 m beyond their edges).
-  const cutters: { poly: P2[]; top: number }[] = [];
+  // station.ts draws (the hull of each station's platforms, 1.5 m beyond their edges), up to
+  // 12 m above the platforms — a tower standing over the hull keeps its floors above that.
+  const cutters: Cutter[] = [];
   const byStation = new Map<string, typeof net.platforms>();
   for (const p of net.platforms.flatMap(platformPieces)) {
     if (p.y < 0) continue;
@@ -527,8 +617,64 @@ export function buildCity(net: Network, opts: CityOptions): City {
       pts.push([p.a[0] - ux - nx, p.a[1] - uz - nz], [p.a[0] - ux + nx, p.a[1] - uz + nz], [p.b[0] + ux - nx, p.b[1] + uz - nz], [p.b[0] + ux + nx, p.b[1] + uz + nz]);
       top = Math.max(top, p.y + 12);
     }
-    cutters.push({ poly: convexHull(pts), top });
+    cutters.push({ poly: convexHull(pts), y0: -Infinity, top });
   }
+  // Open decks the network walks through a mapped building (the 2F deck along ノースゲート's
+  // north side, which OpenStreetMap draws inside its outline): the building is opened along the
+  // deck from its floor up — to the sky where the deck runs along a facade, else as a passage
+  // with its floors above (see deckCutters).
+  const decks: { poly: P2[]; ax: number; az: number; bx: number; bz: number; floor: number; ceil: number; hw: number }[] = [];
+  for (const e of net.edges) {
+    if (e.kind !== 'walk' || e.indoor) continue;
+    const a = nodeById.get(e.a);
+    const b = nodeById.get(e.b);
+    if (!a || !b || Math.min(a.y, b.y) < DECK_MIN_Y) continue;
+    const len = Math.hypot(b.x - a.x, b.z - a.z);
+    if (len < DECK_MIN_INSIDE) continue;
+    const hw = corridorWidth(e) / 2 + 0.8;
+    const ux = (b.x - a.x) / len;
+    const uz = (b.z - a.z) / len;
+    const [nx, nz] = [-uz * hw, ux * hw];
+    const poly: P2[] = [
+      [a.x - ux - nx, a.z - uz - nz],
+      [b.x + ux - nx, b.z + uz - nz],
+      [b.x + ux + nx, b.z + uz + nz],
+      [a.x - ux + nx, a.z - uz + nz],
+    ];
+    decks.push({ poly: convexHull(poly), ax: a.x, az: a.z, bx: b.x, bz: b.z, floor: Math.min(a.y, b.y) - 0.4, ceil: Math.max(a.y, b.y) + CLEARANCE + 2.2, hw });
+  }
+  const deckGrid = new BoxGrid(
+    decks.map((d) => polyBox(d.poly)),
+    40,
+  );
+  const deckBuf = new Int32Array(256);
+  /**
+   * Deck cutters for one part of a mapped building: the decks running at least
+   * DECK_MIN_INSIDE through it. Where the deck runs along a facade (one side of its strip lies
+   * mostly outside the building) the cut is open to the sky; through the middle it is a passage
+   * with head room and the floors above.
+   */
+  const deckCutters = (p: MassPart): Cutter[] => {
+    if (!decks.length) return [];
+    const [x0, x1, z0, z1] = polyBox(p.poly);
+    const rings = [p.poly, ...p.holes];
+    const out: Cutter[] = [];
+    deckGrid.begin();
+    const n = deckGrid.box(x0, x1, z0, z1, deckBuf, 0);
+    for (let k = 0; k < n; k++) {
+      const d = decks[deckBuf[k]];
+      if (d.floor >= p.y1 || d.ceil <= p.y0) continue;
+      const inside = insideLength(rings, d.ax, d.az, d.bx, d.bz);
+      if (inside < DECK_MIN_INSIDE) continue;
+      const len = Math.hypot(d.bx - d.ax, d.bz - d.az);
+      const ox = (-(d.bz - d.az) / len) * d.hw;
+      const oz = ((d.bx - d.ax) / len) * d.hw;
+      const side = (s: number) => insideLength(rings, d.ax + ox * s, d.az + oz * s, d.bx + ox * s, d.bz + oz * s);
+      const along = Math.min(side(1), side(-1)) < 0.5 * inside;
+      out.push({ poly: d.poly, y0: d.floor, top: along ? Infinity : d.ceil });
+    }
+    return out;
+  };
 
   // ------------------------------------------------------------ buildings
   const walls = new Map<FacadeStyle, Geo>(FACADE_STYLES.map((s) => [s, new Geo()]));
@@ -559,35 +705,103 @@ export function buildCity(net: Network, opts: CityOptions): City {
     if (inSquare(b) || !inSquare(b, 60)) continue;
     for (const p of massing(fp, 0).parts) if (p.y0 < 1) planRings.push([p.poly, ...p.holes]);
   }
-  // Overview: buildings far from the network recede, and so do the low ones (the thousands of
-  // small blocks), so the stations and the landmarks stay readable.
-  const restOf = (box: [number, number, number, number], top: number, landmark: boolean): number => {
-    if (walk) return 1;
-    const dx = Math.max(nx0 - box[1], 0, box[0] - nx1);
-    const dz = Math.max(nz0 - box[3], 0, box[2] - nz1);
-    const d = Math.hypot(dx, dz);
-    const k = Math.min(1, d / 300);
-    const size = landmark || top >= 60 ? 1 : top >= 30 ? 0.7 : 0.45;
-    return (OVERVIEW_OPACITY - 0.3 * k * k * (3 - 2 * k)) * size;
-  };
+  // Overview: the stations, the landmarks and the towers stay semi-solid and the thousands of
+  // other blocks fainter; everything recedes with distance from the selected route (from the
+  // network while none is selected), so the route and the network stay readable.
+  const baseRest = (top: number, landmark: boolean): number => (walk ? 1 : landmark || top >= 60 ? OVERVIEW_OPACITY : OVERVIEW_MINOR);
+  const netDistance = (box: [number, number, number, number]): number => Math.hypot(Math.max(nx0 - box[1], 0, box[0] - nx1), Math.max(nz0 - box[3], 0, box[2] - nz1));
 
-  function addPart(p: MassPart, cuts: P2[][], bid: number, uOff: number, vOff: number, detail: boolean, slot: P2[] | null, buildingTop: number): void {
+  // Massing of every drawn building up front: the street-level plans of the others tell a
+  // canopy where its posts can stand.
+  const masses = drawn.map((fp, index) => massing(fp, index));
+  const groundPlan = new PlanIndex(masses.flatMap((m) => m.parts.filter((p) => p.y0 < 1 && p.look.roof !== 'canopy').map((p) => [p.poly, ...p.holes])));
+
+  /**
+   * One horizontal band of a building part (a whole part unless cutters split it; see
+   * cutBands): its walls, less `cuts`, and the slabs that close it — its roof (with the rooftop
+   * dressing) when nothing stands on it, else just the floor of whatever the band above leaves
+   * open (`above` = that band's cuts), and underneath, where the band below is cut away
+   * (`below`), a soffit.
+   */
+  function addPart(p: MassPart, cuts: P2[][], bid: number, uOff: number, vOff: number, detail: boolean, slot: P2[] | null, buildingTop: number, below: P2[][] | null = null, above: P2[][] | null = null): void {
     const y0 = sceneHeight(p.y0, ex);
     const y1 = sceneHeight(p.y1, ex);
     const segs = prismWalls(p.poly, p.holes, cuts);
     if (!segs.length) return;
     const canopy = p.look.roof === 'canopy';
     const area = polyArea(p.poly) - p.holes.reduce((s, h) => s + polyArea(h), 0);
+    // A part split into bands keeps its facade texture continuous from band to band: each
+    // wall's texture runs from where its line passes nearest the origin.
+    const banded = below !== null || above !== null;
     let s = 0;
     for (const seg of segs) {
       const len = Math.hypot(seg.bx - seg.ax, seg.bz - seg.az);
+      const at = banded && len > 1e-6 ? (seg.ax * (seg.bx - seg.ax) + seg.az * (seg.bz - seg.az)) / len : s;
       if (canopy) addEdge(seg, y0, y1, bid);
-      else addWall(seg, y0, y1, p.look.style, col(p.look.tint), bid, uOff, vOff, s);
+      else addWall(seg, y0, y1, p.look.style, col(p.look.tint), bid, uOff, vOff, at);
       s += len;
     }
     const front = detail && p.y0 < 0.5 && buildingTop > 12 && !canopy && p.look.roof !== 'shed';
     if (front) for (const seg of segs) if (Math.hypot(seg.bx - seg.ax, seg.bz - seg.az) > 2.5) addStreetFront(seg, bid);
-    addRoof(p, cuts, y0, y1, bid, area, detail, segs, slot);
+    addRoof(p, cuts, y0, y1, bid, area, detail, segs, slot, below, above);
+  }
+
+  /**
+   * Where the thin posts under a canopy (building=roof, which OpenStreetMap maps without its
+   * supports) stand: at its corners and every ≤ 8 m along its edges, 0.4 m in, and on a 12 m
+   * grid under a large one — wherever they are clear of walkable space, the carriageways and
+   * other buildings. null for a canopy too low or too small to need any.
+   */
+  const postC = col('#8d9499');
+  function canopyPosts(p: MassPart): P2[] | null {
+    const top = sceneHeight(p.y0, ex);
+    if (top < 1.5 || polyArea(p.poly) < MIN_POSTED_CANOPY) return null;
+    const rings = [p.poly, ...p.holes];
+    const spots: P2[] = [];
+    const ring = p.poly;
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i];
+      const b = ring[(i + 1) % ring.length];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      const n = Math.max(1, Math.ceil(len / 8));
+      for (let k = 0; k < n; k++) spots.push([a[0] + ((b[0] - a[0]) * k) / n, a[1] + ((b[1] - a[1]) * k) / n]);
+    }
+    // Each spot moved 0.4 m into the canopy (towards its inside along the bisector of the corner).
+    const inset = spots.map(([x, z]): P2 | null => {
+      for (const [dx, dz] of [
+        [0.4, 0.4],
+        [0.4, -0.4],
+        [-0.4, 0.4],
+        [-0.4, -0.4],
+        [0.55, 0],
+        [-0.55, 0],
+        [0, 0.55],
+        [0, -0.55],
+      ]) {
+        if (insideRings(rings, x + dx, z + dz) && distanceToEdges(rings, x + dx, z + dz) > 0.2) return [x + dx, z + dz];
+      }
+      return null;
+    });
+    const o = orientedBox(p.poly);
+    if (o.hl > 7 && o.hw > 7) {
+      const vx = -o.uz;
+      const vz = o.ux;
+      for (let a = -o.hl + 6; a <= o.hl - 6; a += 12)
+        for (let w = -o.hw + 6; w <= o.hw - 6; w += 12) {
+          const x = o.cx + o.ux * a + vx * w;
+          const z = o.cz + o.uz * a + vz * w;
+          if (insideRings(rings, x, z) && distanceToEdges(rings, x, z) > 2) inset.push([x, z]);
+        }
+    }
+    const placed: P2[] = [];
+    for (const q of inset) {
+      if (!q) continue;
+      const [x, z] = q;
+      if (placed.some(([px, pz]) => Math.hypot(px - x, pz - z) < 2.5)) continue;
+      if (groundPlan.inside(x, z, 0.4) || roadIndex.onRoad(x, z, -1, 0.3) || boxInWalk(x, top / 2, z, 0.5, top, 0.5, 0)) continue;
+      placed.push(q);
+    }
+    return placed;
   }
 
   /** Scene-height bands of a wall: split at the top of the podium so the facade's floors follow its stretch. */
@@ -745,7 +959,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
     return faces.map((f) => f.map((i) => [all[i].x, all[i].y] as P2));
   }
 
-  function addRoof(p: MassPart, cuts: P2[][], y0: number, y1: number, bid: number, area: number, detail: boolean, segs: WallSeg[], slot: P2[] | null): void {
+  function addRoof(p: MassPart, cuts: P2[][], y0: number, y1: number, bid: number, area: number, detail: boolean, segs: WallSeg[], slot: P2[] | null, below: P2[][] | null, above: P2[][] | null): void {
     const kind = p.look.roof;
     const roofC = col(kind === 'shed' ? '#8e969c' : kind === 'canopy' ? '#a3a8ab' : '#9a9d9f');
     const edge = col('#b9bcbd');
@@ -754,19 +968,36 @@ export function buildCity(net: Network, opts: CityOptions): City {
     const holes = [...cuts, ...slabHoles(space, wells, y1 / ex, bx0, bx1, bz0, bz1)];
     if (slot) holes.push(slot);
     const tris = triangulate(p.poly, p.holes);
-    const slab = (y: number, up: boolean, hs: P2[][]) => {
+    /** The plan (less `hs`) as a horizontal slab at y; with `only`, just where it lies in those convex areas. */
+    const slab = (y: number, up: boolean, hs: P2[][], only?: P2[][]) => {
       const boxes = hs.map(polyBox);
       for (const t of tris) {
-        const [t0, t1, s0, s1] = polyBox(t);
-        const near = hs.filter((_, k) => boxes[k][0] < t1 && boxes[k][1] > t0 && boxes[k][2] < s1 && boxes[k][3] > s0);
-        if (!near.length) roofs.poly(t, y, roofC, bid, up);
-        else for (const piece of subtractAll(t, near)) roofs.poly(piece, y, roofC, bid, up);
+        let pieces: P2[][] = [t];
+        if (only) {
+          // The triangle inside the union of `only`: inside each area, less the ones before it.
+          pieces = only.flatMap((c, i) => {
+            const inC = intersectConvex(t, c);
+            return inC.length ? subtractAll(inC, only.slice(0, i)) : [];
+          });
+        }
+        for (const q of pieces) {
+          const [t0, t1, s0, s1] = polyBox(q);
+          const near = hs.filter((_, k) => boxes[k][0] < t1 && boxes[k][1] > t0 && boxes[k][2] < s1 && boxes[k][3] > s0);
+          if (!near.length) roofs.poly(q, y, roofC, bid, up);
+          else for (const piece of subtractAll(q, near)) roofs.poly(piece, y, roofC, bid, up);
+        }
       }
     };
-    slab(y1, true, holes);
-    // Raised volumes (a bridge, a canopy) have an underside.
-    if (p.y0 > 2.5 || kind === 'canopy') slab(y0, false, [...cuts, ...slabHoles(space, wells, y0 / ex, bx0, bx1, bz0, bz1)]);
-    if (kind === 'canopy' || cuts.length && !segs.length) return;
+    const underHoles = () => [...cuts, ...slabHoles(space, wells, y0 / ex, bx0, bx1, bz0, bz1)];
+    // A band with another on top of it (cutBands) shows its top only where that band is cut
+    // away, and a band standing on another its underside only where that one is cut away.
+    if (above) {
+      if (above.length) slab(y1, true, holes, above);
+    } else slab(y1, true, holes);
+    if (below) {
+      if (below.length) slab(y0, false, underHoles(), below);
+    } else if (p.y0 > 2.5 || kind === 'canopy') slab(y0, false, underHoles()); // raised volumes (a bridge, a canopy) have an underside
+    if (above || kind === 'canopy' || (cuts.length && !segs.length)) return;
     const realTop = p.y1;
     const r = rng(bid * 97 + Math.round(y1));
     const o = orientedBox(p.poly);
@@ -896,7 +1127,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
   }
   drawn.forEach((fp, index) => {
     const bid = buildings.length;
-    const { parts, landmark } = massing(fp, index);
+    const { parts, landmark } = masses[index];
     const box = polyBox(fp.poly);
     const detail = nearNet((box[0] + box[1]) / 2, (box[2] + box[3]) / 2) - Math.hypot(box[1] - box[0], box[3] - box[2]) / 2 < DETAIL_RADIUS;
     geos.forEach((g, k) => rangeStart[k].push(g.count));
@@ -905,8 +1136,27 @@ export function buildCity(net: Network, opts: CityOptions): City {
     const vOff = R();
     const top = Math.max(...parts.map((p) => p.y1));
     let wheelPart: MassPart | null = null;
-    for (const part of parts) {
-      prisms.push(makePrism(part.poly, part.holes, sceneHeight(part.y0, ex), sceneHeight(part.y1, ex)));
+    // Each part in bands (cutBands): a mapped building is kept out of the elevated stations'
+    // platform areas and opened along the decks the network walks through it.
+    const mapped = fp.source === 'osm' && fp.kind === 'building';
+    const banded = parts.map((part) => {
+      const cs = mapped ? [...cutters.filter((c) => part.y0 < c.top && polyTouchesConvex(part.poly, c.poly)), ...deckCutters(part)] : [];
+      return cutBands(part.y0, part.y1, cs);
+    });
+    // A canopy stands on its posts; one with nowhere to put any (it spans walking lines from
+    // edge to edge) is left out rather than drawn floating.
+    const posts = parts.map((part) => (part.look.roof === 'canopy' ? canopyPosts(part) : null));
+    const kept = parts.map((_, k) => posts[k]?.length !== 0);
+    for (let k = 0; k < parts.length; k++) {
+      const part = parts[k];
+      if (!kept[k]) continue;
+      // Cut-away tests see each band as it stands: a cut band as the convex pieces left of it.
+      for (const band of banded[k]) {
+        const b0 = sceneHeight(band.y0, ex);
+        const b1 = sceneHeight(band.y1, ex);
+        if (!band.cuts.length) prisms.push(makePrism(part.poly, part.holes, b0, b1));
+        else for (const t of triangulate(part.poly, part.holes)) for (const piece of subtractAll(t, band.cuts)) prisms.push(makePrism(piece, [], b0, b1));
+      }
       if (part.y0 < 1 && part.look.roof !== 'canopy') planRings.push([part.poly, ...part.holes]);
       if (landmark?.wheel && (!wheelPart || polyArea(part.poly) > polyArea(wheelPart.poly))) wheelPart = part;
     }
@@ -942,13 +1192,21 @@ export function buildCity(net: Network, opts: CityOptions): City {
         if (polyArea(slot) > 0 && (slot[1][0] - slot[0][0]) * (slot[2][1] - slot[1][1]) - (slot[1][1] - slot[0][1]) * (slot[2][0] - slot[1][0]) < 0) slot.reverse();
       }
     }
-    for (const part of parts) {
-      const cuts = fp.source === 'osm' && fp.kind === 'building' ? cutters.filter((c) => part.y0 < c.top && polyTouchesConvex(part.poly, c.poly)).map((c) => c.poly) : [];
-      addPart(part, cuts, bid, uOff, vOff, detail, part === wheelPart ? slot : null, top);
-    }
+    parts.forEach((part, k) => {
+      if (!kept[k]) return;
+      const bands = banded[k];
+      bands.forEach((band, j) => {
+        const piece = bands.length > 1 ? { ...part, y0: band.y0, y1: band.y1 } : part;
+        const last = j === bands.length - 1;
+        addPart(piece, band.cuts, bid, uOff, vOff, detail, part === wheelPart && last ? slot : null, top, j > 0 ? bands[j - 1].cuts : null, last ? null : bands[j + 1].cuts);
+      });
+      const h = sceneHeight(part.y0, ex);
+      for (const [x, z] of posts[k] ?? []) roofs.box(x, h / 2, z, 0.24, h, 0.24, 0, postC, bid);
+    });
     if (landmark?.wheel && wheelSpec) addWheelLegs(wheelSpec, sceneHeight(wheelPart?.y1 ?? 30, ex));
     geos.forEach((g, k) => rangeEnd[k].push(g.count));
-    buildings.push({ id: fp.id, prisms, box, rest: restOf(box, top, !!landmark || fp.kind === 'station') });
+    const base = baseRest(top, !!landmark || fp.kind === 'station');
+    buildings.push({ id: fp.id, prisms, box, base, rest: walk ? 1 : base * farFade(netDistance(box)) });
   });
 
   if (wheelSpec) {
@@ -985,13 +1243,23 @@ export function buildCity(net: Network, opts: CityOptions): City {
   const uFade = { value: fadeTex as THREE.Texture | null };
   const fade = new Float32Array(nb);
   const rest = new Float32Array(nb);
-  const passOf = (f: number) => (f >= 0.995 ? 2 : f < 0.004 ? 0 : 1);
+  // The pass a building is drawn in follows its byte in the fade texture, exactly as the shaders
+  // read it (patchFade): 2 solid, 1 ghost, 0 not at all.
+  const passOf = (f: number) => {
+    const byte = Math.round(f * 255);
+    return byte >= SOLID_BYTE ? 2 : byte <= HIDDEN_BYTE ? 0 : 1;
+  };
   const state = new Uint8Array(nb);
+  const restPass = new Uint8Array(nb);
   buildings.forEach((b, i) => {
     fade[i] = rest[i] = b.rest;
     fadeData[i] = Math.round(b.rest * 255);
-    state[i] = passOf(b.rest);
+    state[i] = restPass[i] = passOf(b.rest);
   });
+  /** Buildings whose opacity is on its way somewhere (not at rest). */
+  const active = new Int32Array(Math.max(1, nb));
+  const isActive = new Uint8Array(nb);
+  let activeN = 0;
   const passGeos: PassGeometry[] = [];
 
   // Facade materials: day map + night emissive map, two passes each.
@@ -1001,7 +1269,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
     const geo = walls.get(style) as Geo;
     if (geo.count === 0) return;
     const tex = textures.facade.get(style);
-    const pg = new PassGeometry(geo.attributes(true), Int32Array.from(rangeStart[gi]), Int32Array.from(rangeEnd[gi]));
+    const pg = new PassGeometry(geo.attributes(true), Int32Array.from(rangeStart[gi]), Int32Array.from(rangeEnd[gi]), restPass);
     passGeos.push(pg);
     for (const pass of ['solid', 'ghost'] as const) {
       const m = own(
@@ -1031,7 +1299,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
   const roofMats: THREE.MeshLambertMaterial[] = [];
   if (roofs.count) {
     const gi = geos.length - 1;
-    const pg = new PassGeometry(roofs.attributes(false), Int32Array.from(rangeStart[gi]), Int32Array.from(rangeEnd[gi]));
+    const pg = new PassGeometry(roofs.attributes(false), Int32Array.from(rangeStart[gi]), Int32Array.from(rangeEnd[gi]), restPass);
     passGeos.push(pg);
     for (const pass of ['solid', 'ghost'] as const) {
       const m = own(
@@ -1054,10 +1322,10 @@ export function buildCity(net: Network, opts: CityOptions): City {
     }
   }
   for (const pg of passGeos) own(pg);
-  /** Rebuilds the draw lists and hides empty passes. */
+  /** Rebuilds the ghost passes' moving tails and hides empty passes. */
   const refreshPasses = () => {
     passGeos.forEach((pg, i) => {
-      const [ns, ng] = pg.update(state);
+      const [ns, ng] = pg.update(active, activeN, state);
       passMeshes[i * 2].visible = ns > 0;
       passMeshes[i * 2 + 1].visible = ng > 0;
     });
@@ -1102,13 +1370,8 @@ export function buildCity(net: Network, opts: CityOptions): City {
   }
 
   // ------------------------------------------------------------ streets
-  // Streets at ground level; elevated carriageways (decks) are drawn as viaducts further down.
-  const streetRoads = net.roads.filter((r) => !r.deck);
-  const deckRoads = net.roads.filter((r) => r.deck && r.deck.length === r.points.length && r.points.length >= 2);
-  const { infos, junctions, byRoad } = analyseRoads(streetRoads);
-  const roadIndex = new RoadIndex(infos);
+  // (streetRoads, deckRoads and their analysis are set up above, before the buildings.)
   const plan = new PlanIndex(planRings);
-  const nodeById = new Map<string, NetNode>(net.nodes.map((n) => [n.id, n]));
   const crossings = net.edges
     .filter((e) => e.kind === 'crossing')
     .map((e) => ({ e, a: nodeById.get(e.a) as NetNode, b: nodeById.get(e.b) as NetNode }))
@@ -1213,6 +1476,9 @@ export function buildCity(net: Network, opts: CityOptions): City {
     const road = info.road;
     const w = road.width;
     const major = isMajor(road);
+    // The overview shows the main streets only (the side streets, lanes and service roads would
+    // bury the network); walking, every mapped carriageway is there.
+    if (!walk && !major) return;
     const js = byRoad[i].map((k) => junctions[k]);
     const stations = junctionStations(info, js);
     const inJunction = (s: number, extra: number) => stations.some((j) => Math.abs(j.s - s) < j.r + extra);
@@ -1411,7 +1677,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
     for (let d = 0.6; d < len - 0.6; d += 0.9) {
       const x = ax + dx * d;
       const z = az + dz * d;
-      if (!roadIndex.onRoad(x, z, -1, -0.8)) continue;
+      if (!drawnRoads.onRoad(x, z, -1, -0.8)) continue;
       const p0: P2 = [x - (lx * W) / 2, z - (lz * W) / 2];
       const p1: P2 = [x + (lx * W) / 2, z + (lz * W) / 2];
       surface(marks, [p0, p1, [p1[0] + dx * 0.45, p1[1] + dz * 0.45], [p0[0] + dx * 0.45, p0[1] + dz * 0.45]], Y_MARK + 0.005, white);
@@ -1597,8 +1863,11 @@ export function buildCity(net: Network, opts: CityOptions): City {
     const crownLow = tl + yl * 0.06;
     return box(0.35, 0, crownLow) || box((ginkgo ? 2.4 : 3.4) * 1.15 * 1.1, crownLow, tu + yu * 1.9);
   };
+  // Nor may a tree or lamp grow through a canopy.
+  const canopyPlan = new PlanIndex(masses.flatMap((m) => m.parts.filter((p) => p.look.roof === 'canopy').map((p) => [p.poly, ...p.holes])));
   const blocked = (x: number, z: number, what: 'tree' | 'lamp', kind: number) =>
     plan.inside(x, z, what === 'tree' ? 2.5 : 1) ||
+    canopyPlan.inside(x, z, what === 'tree' ? 3.5 : 1) ||
     crossings.some((c) => segDist(x, z, c.a.x, c.a.z, c.b.x, c.b.z) < (c.e.width ?? 8) / 2 + 4) ||
     net.nodes.some((n) => n.level === '1F' && n.kind !== 'junction' && Math.hypot(n.x - x, n.z - z) < 5) ||
     inWalk(x, z, what, kind);
@@ -1671,10 +1940,11 @@ export function buildCity(net: Network, opts: CityOptions): City {
   group.add(poolMesh);
 
   // ------------------------------------------------------------ traffic
+  // Walking only: in the overview the ~700 vehicles would just be noise around the route.
   const lanes: Lane[] = [];
   infos.forEach((info, ri) => {
     const road = info.road;
-    if (!isMajor(road) || road.terminal) return;
+    if (!walk || !isMajor(road) || road.terminal) return;
     const first = info.pts[0];
     const last = info.pts[info.pts.length - 1];
     const phase: 0 | 1 = Math.abs(last[0] - first[0]) > Math.abs(last[1] - first[1]) ? 1 : 0;
@@ -1699,7 +1969,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
   /** Scene height of the carriageway at each vertex, per lane road (null: street level). */
   const laneDeck: (Float32Array | null)[] = [...infos.map(() => null), ...deckTop];
   deckInfos.forEach((info, k) => {
-    for (const { lat, dir } of laneLayout(info.road)) lanes.push({ road: infos.length + k, dir, lat, stops: [], phase: 0 });
+    if (walk) for (const { lat, dir } of laneLayout(info.road)) lanes.push({ road: infos.length + k, dir, lat, stops: [], phase: 0 });
   });
   // Stretches of each lane (arc intervals, padded by half a bus) that run through a street-level
   // walking line: vehicles are not drawn there.
@@ -1755,7 +2025,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
     statics.push({ x, z, yaw, type, color });
   };
   infos.forEach((info, ri) => {
-    if (!info.road.terminal) return;
+    if (!walk || !info.road.terminal) return;
     const js = junctionStations(info, byRoad[ri].map((k) => junctions[k]));
     for (let s = 8; s < info.len - 8; s += 14) {
       if (js.some((j) => Math.abs(j.s - s) < j.r + 6) || vr() < 0.3) continue;
@@ -1808,6 +2078,8 @@ export function buildCity(net: Network, opts: CityOptions): City {
   carMesh.count = carLights.count = ci;
   busMesh.count = busLights.count = bi;
   for (const m of [carMesh, busMesh, carLights, busLights]) group.add(m);
+  carMesh.visible = ci > 0;
+  busMesh.visible = bi > 0;
 
   // ------------------------------------------------------------ state
   let night = opts.night;
@@ -1824,9 +2096,6 @@ export function buildCity(net: Network, opts: CityOptions): City {
   const cand = new Int32Array(Math.max(16, nb));
   const target = new Float32Array(nb);
   const seen = new Uint32Array(nb);
-  const active = new Int32Array(Math.max(1, nb));
-  const isActive = new Uint8Array(nb);
-  let activeN = 0;
   let frame = 0;
   const maxTop = buildings.reduce((m, b) => Math.max(m, ...b.prisms.map((p) => p.y1)), 0);
 
@@ -1863,7 +2132,8 @@ export function buildCity(net: Network, opts: CityOptions): City {
     headMat.color.set(night ? 0xffe8b8 : 0xd8dcdf);
     if (groundMesh) (groundMesh.material as THREE.MeshLambertMaterial).color.set(night ? 0x4a4845 : dark ? 0xa39a8c : 0xd9cfc0);
     poolMesh.visible = night;
-    carLights.visible = busLights.visible = night;
+    carLights.visible = night && carMesh.visible;
+    busLights.visible = night && busMesh.visible;
     if (beaconMesh) beaconMesh.visible = night;
     wheelMat.emissive.set(night ? 0xff2448 : 0x000000);
     wheelMat.emissiveIntensity = night ? 0.9 : 0;
@@ -1967,6 +2237,48 @@ export function buildCity(net: Network, opts: CityOptions): City {
     }
     if (dirtyTex) fadeTex.needsUpdate = true;
     if (dirtyPass) refreshPasses();
+  }
+
+  /**
+   * Overview: every building's resting opacity from its distance to the selected route (plan
+   * distance from its bounds to the route's polyline), or to the network while none is
+   * selected; the ones that change ease there.
+   */
+  function restToRoute(points: THREE.Vector3[] | null): void {
+    // The route in plan: its segments (a flight's vertical steps dropped) with their bounds.
+    const segs: number[] = [];
+    if (points) {
+      let p = points[0];
+      for (let k = 1; k < points.length; k++) {
+        const q = points[k];
+        if (Math.abs(q.x - p.x) + Math.abs(q.z - p.z) < 0.5) continue;
+        segs.push(p.x, p.z, q.x, q.z, Math.min(p.x, q.x), Math.max(p.x, q.x), Math.min(p.z, q.z), Math.max(p.z, q.z));
+        p = q;
+      }
+      if (!segs.length) segs.push(p.x, p.z, p.x, p.z, p.x, p.x, p.z, p.z);
+    }
+    for (let i = 0; i < nb; i++) {
+      const b = buildings[i];
+      const [x0, x1, z0, z1] = b.box;
+      let d: number;
+      if (!points) d = netDistance(b.box);
+      else {
+        // Only distances between FADE_NEAR and FADE_FAR matter (farFade is flat outside them):
+        // start at the far one, skip segments whose bounds are already further, stop at the near one.
+        d = FADE_FAR;
+        for (let k = 0; k < segs.length && d > FADE_NEAR; k += 8) {
+          if (Math.hypot(Math.max(segs[k + 4] - x1, 0, x0 - segs[k + 5]), Math.max(segs[k + 6] - z1, 0, z0 - segs[k + 7])) >= d) continue;
+          d = Math.min(d, boxSegmentDistance(x0, x1, z0, z1, segs[k], segs[k + 1], segs[k + 2], segs[k + 3]));
+        }
+      }
+      const r = b.base * farFade(d);
+      if (Math.abs(r - rest[i]) < 1e-4) continue;
+      rest[i] = r;
+      if (!isActive[i]) {
+        isActive[i] = 1;
+        active[activeN++] = i;
+      }
+    }
   }
 
   let revealR = 0;
@@ -2076,6 +2388,7 @@ export function buildCity(net: Network, opts: CityOptions): City {
         const n = Math.min(ROUTE_SAMPLES, points.length);
         for (let i = 0; i < n; i++) route.push(points[Math.round((i / Math.max(1, n - 1)) * (points.length - 1))].clone());
       }
+      if (!walk) restToRoute(points && points.length ? points : null);
     },
     stats() {
       let drawCalls = 0;
@@ -2114,6 +2427,32 @@ function segDist(px: number, pz: number, ax: number, az: number, bx: number, bz:
   const l2 = dx * dx + dz * dz || 1;
   const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / l2));
   return Math.hypot(px - ax - dx * t, pz - az - dz * t);
+}
+
+/** Plan distance between the box [x0, x1] × [z0, z1] and the segment a→b (0 where they meet). */
+function boxSegmentDistance(x0: number, x1: number, z0: number, z1: number, ax: number, az: number, bx: number, bz: number): number {
+  // Clip the segment to the box (Liang–Barsky): any part left means they meet.
+  let t0 = 0;
+  let t1 = 1;
+  const dx = bx - ax;
+  const dz = bz - az;
+  for (const [p, q] of [
+    [-dx, ax - x0],
+    [dx, x1 - ax],
+    [-dz, az - z0],
+    [dz, z1 - az],
+  ]) {
+    if (Math.abs(p) < 1e-12) {
+      if (q < 0) t1 = -1;
+      continue;
+    }
+    const r = q / p;
+    if (p < 0) t0 = Math.max(t0, r);
+    else t1 = Math.min(t1, r);
+  }
+  if (t0 <= t1) return 0;
+  const toBox = (x: number, z: number) => Math.hypot(Math.max(x0 - x, 0, x - x1), Math.max(z0 - z, 0, z - z1));
+  return Math.min(toBox(ax, az), toBox(bx, bz), segDist(x0, z0, ax, az, bx, bz), segDist(x1, z0, ax, az, bx, bz), segDist(x0, z1, ax, az, bx, bz), segDist(x1, z1, ax, az, bx, bz));
 }
 
 /** Arc position where the segment a→b crosses the road's centre line, or null. */
