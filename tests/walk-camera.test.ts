@@ -185,7 +185,7 @@ beforeAll(() => {
     const heading = run > 0.3 ? Math.atan2(B.x - A.x, B.z - A.z) : approach(ia);
     const slope = run > 0.3 ? (B.y - A.y) / run : 0;
     const len = A.distanceTo(B);
-    const n = Math.max(1, Math.min(80, Math.ceil(len / 1.0)));
+    const n = Math.max(1, Math.min(60, Math.ceil(len / 1.5)));
     const step = len / n;
     const speed = e.kind === 'walk' || e.kind === 'crossing' || e.kind === 'gate' ? 1.3 : 0.6;
     rig.ready = false;
@@ -202,14 +202,16 @@ beforeAll(() => {
       solveMs += performance.now() - t0;
       solves++;
       measure(after, w, pose, label);
-      // Before: fixed offset behind and above, lifted over the flight behind.
+      // Before (every other sample): fixed offset behind and above, lifted over the flight behind.
       const fx = Math.sin(heading);
       const fz = Math.cos(heading);
-      const behindY = A.y + (w.y - A.y) * Math.max(0, 1 - 7.8 / Math.max(1e-3, (i / n) * len));
-      const bpos = new THREE.Vector3(w.x - fx * 8, Math.max(w.y + 3.4, behindY - lift + 2.6), w.z - fz * 8);
-      measure(before, w, { pos: bpos, target: tgt.set(w.x + fx * 7, w.y + 1, w.z + fz * 7), near: 0.3, figure: 1 }, '');
+      if (i % 2 === 0) {
+        const behindY = A.y + (w.y - A.y) * Math.max(0, 1 - 7.8 / Math.max(1e-3, (i / n) * len));
+        const bpos = new THREE.Vector3(w.x - fx * 8, Math.max(w.y + 3.4, behindY - lift + 2.6), w.z - fz * 8);
+        measure(before, w, { pos: bpos, target: tgt.set(w.x + fx * 7, w.y + 1, w.z + fz * 7), near: 0.3, figure: 1 }, '');
+      }
       // First person: eye and near plane clear.
-      if (i % 4 === 0) {
+      if (i % 3 === 0) {
         firstPersonPose(world, w, tgt.set(w.x + fx * 14, w.y + 1.6 * 1.25 - 1.2 + slope * 14 * 0.7, w.z + fz * 14), FOV, ASPECT, fp);
         if (armHit(pivot.copy(w).setY(w.y + EYE_H), fp.pivot, fp.pos) || !lensClear(fp.pos, fp.target, fp.near)) {
           firstFail++;

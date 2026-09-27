@@ -1010,9 +1010,12 @@ export function chasePose(world: CollisionWorld | null, inp: ChaseInput, rig: Ca
   return out;
 }
 
+/** The walker's body stays at least this far (rad) below the middle of the frame. */
+const MIN_BELOW = 0.07;
+
 /**
  * Turns the view (not the camera) toward the walker's body if it would drift out of the middle
- * of the frame, e.g. with a steep arm up a lift shaft or a stairwell.
+ * of the frame, e.g. with a steep arm up a stairwell, or above it, e.g. seen from below.
  */
 function keepInFrame(out: WalkCameraPose, walker: THREE.Vector3, fov: number): void {
   const vt = _vt.subVectors(out.target, out.pos);
@@ -1022,6 +1025,21 @@ function keepInFrame(out: WalkCameraPose, walker: THREE.Vector3, fov: number): v
   if (lt < 1e-3 || lp < 2.5) return;
   vt.divideScalar(lt);
   vp.divideScalar(lp);
+  // Keep him in the lower half: a camera below the walker (climbing an enclosed flight) looks up.
+  const below = Math.asin(vt.y) - Math.asin(vp.y);
+  if (below < MIN_BELOW) {
+    const e = Math.min(1.2, Math.asin(vp.y) + MIN_BELOW);
+    let hx = vt.x;
+    let hz = vt.z;
+    let hl = Math.hypot(hx, hz);
+    if (hl < 1e-4) {
+      hx = vp.x;
+      hz = vp.z;
+      hl = Math.hypot(hx, hz) || 1;
+    }
+    vt.set((hx / hl) * Math.cos(e), Math.sin(e), (hz / hl) * Math.cos(e));
+    out.target.copy(out.pos).addScaledVector(vt, lt);
+  }
   const ang = Math.acos(Math.max(-1, Math.min(1, vt.dot(vp))));
   const limit = 0.55 * ((fov * Math.PI) / 360);
   if (ang <= limit || ang > Math.PI - 1e-3) return;
