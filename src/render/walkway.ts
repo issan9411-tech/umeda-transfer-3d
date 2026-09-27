@@ -1024,19 +1024,63 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     // Where the straight wall between two enclosed mouths would cut into the junction's floor
     // (a side with no corridor wider than 180°, a step in width), the room is closed round the
     // back instead (walkway-util.ts gapWall); its floor and ceiling reach out to that wall.
+    // The short steps off a flight's end that stop inside the room do not bound it: the wall runs
+    // between the corridors either side of them (round the back, or straight when that clears the
+    // floor) as long as the steps stay well inside it; otherwise each gap is closed on its own.
     const at2 = ([x, z]: P2) => V(C.x + x, C.y, C.z + z);
-    const backs = list.map((a, k) => {
-      const b = list[(k + 1) % list.length];
-      if (!roofed || !a.indoor || !b.indoor) return null;
-      const gw = gapWall(a, b, reach.get(id) ?? 0);
-      return gw && { poly: gw.poly.map(at2), wall: gw.wall.map(at2) };
+    const R0 = reach.get(id) ?? 0;
+    type Back = { poly: THREE.Vector3[]; wall: THREE.Vector3[]; next: number };
+    const backs: (Back | null)[] = list.map(() => null);
+    const inside = new Set<number>();
+    const between = (k: number, j: number) => {
+      const out: number[] = [];
+      for (let m = (k + 1) % list.length; m !== j; m = (m + 1) % list.length) out.push(m);
+      return out;
+    };
+    /** Far corners of an arm's strip, relative to the node. */
+    const ends = (a: ArmRec): P2[] => {
+      const [dx, dz, px, pz] = [Math.cos(a.angle), Math.sin(a.angle), -Math.sin(a.angle), Math.cos(a.angle)];
+      return [-1, 1].map((sd) => [dx * a.run + px * sd * (a.width / 2), dz * a.run + pz * sd * (a.width / 2)] as P2);
+    };
+    const within = (q: P2, wall: THREE.Vector3[], arc: boolean) => {
+      if (arc) return Math.hypot(q[0], q[1]) < Math.min(...wall.map((w) => Math.hypot(w.x - C.x, w.z - C.z))) - 0.3;
+      const [p0, p1] = [wall[0], wall[wall.length - 1]];
+      const ux = p1.x - p0.x;
+      const uz = p1.z - p0.z;
+      const side = (x: number, z: number) => ux * (z - p0.z) - uz * (x - p0.x);
+      const l = Math.hypot(ux, uz) || 1;
+      const sc = side(C.x, C.z);
+      const sq = side(C.x + q[0], C.z + q[1]);
+      return Math.sign(sq) === Math.sign(sc) && Math.abs(sq) / l > 0.3;
+    };
+    const bounding = list.map((_, k) => k).filter((k) => list[k].run > R0 + 1);
+    if (roofed && bounding.length >= 2) {
+      bounding.forEach((k, i) => {
+        const j = bounding[(i + 1) % bounding.length];
+        const stubs = between(k, j);
+        if (!stubs.length || !list[k].indoor || !list[j].indoor) return;
+        const gw = gapWall(list[k], list[j], R0);
+        const back: Back = gw ? { poly: gw.poly.map(at2), wall: gw.wall.map(at2), next: j } : { poly: [], wall: [mouths[k].hi, mouths[j].lo], next: j };
+        if (!stubs.every((m) => ends(list[m]).every((q) => within(q, back.wall, !!gw)))) return;
+        backs[k] = back;
+        for (const m of stubs) inside.add(m);
+      });
+    }
+    // Every other gap between neighbouring mouths on its own (walkway-util.ts gapWall).
+    list.forEach((a, k) => {
+      const j = (k + 1) % list.length;
+      if (!roofed || backs[k] || inside.has(k) || inside.has(j) || !a.indoor || !list[j].indoor) return;
+      const gw = gapWall(a, list[j], R0);
+      if (gw) backs[k] = { poly: gw.poly.map(at2), wall: gw.wall.map(at2), next: j };
     });
     const poly: THREE.Vector3[] = [];
     // Corners on enclosed corridors' walls get the same contact shadow as the corridor floors.
     const shade: number[] = [];
     list.forEach((a, k) => {
-      poly.push(mouths[k].lo, mouths[k].hi);
-      shade.push(a.indoor ? AO : 1, a.indoor ? AO : 1);
+      if (!inside.has(k)) {
+        poly.push(mouths[k].lo, mouths[k].hi);
+        shade.push(a.indoor ? AO : 1, a.indoor ? AO : 1);
+      }
       for (const q of backs[k]?.poly ?? []) {
         poly.push(q);
         shade.push(AO);
@@ -1058,21 +1102,23 @@ export function buildWalkway(g: Graph, o: WalkwayOptions): THREE.Group {
     }
     const lp = 0.8;
     geo.light.quad(C.clone().add(V(-lp, Hn - 0.03, -lp)), C.clone().add(V(lp, Hn - 0.03, -lp)), C.clone().add(V(lp, Hn - 0.03, lp)), C.clone().add(V(-lp, Hn - 0.03, lp)), uvRect(0, 0, 1, 1), DOWN);
-    const wallSeg = (p0: THREE.Vector3, p1: THREE.Vector3, fallback: THREE.Vector3) => {
+    // A wall round the back starts on the side lines of the corridors either side of it, which
+    // their own walkable strips border: only other walkable space (a flight arriving) opens it.
+    const wallSeg = (p0: THREE.Vector3, p1: THREE.Vector3, fallback: THREE.Vector3, sides: ArmRec[]) => {
       const len = p0.distanceTo(p1);
       if (len <= 0.05) return;
       const mid = p0.clone().add(p1).multiplyScalar(0.5);
       const inward = C.clone().sub(mid).setY(0);
       if (inward.lengthSq() < 1e-6) inward.copy(fallback);
-      vquad(geo.wall, p0, p1, p1.clone().add(hv), p0.clone().add(hv), uvRect(0, 0, len / TX.WALL_M, 1), inward, c.wallStation, not(`node:${id}`));
+      vquad(geo.wall, p0, p1, p1.clone().add(hv), p0.clone().add(hv), uvRect(0, 0, len / TX.WALL_M, 1), inward, c.wallStation, not(`node:${id}`, ...sides.map((x) => x.e.id)));
     };
     for (let k = 0; k < list.length; k++) {
       const next = (k + 1) % list.length;
       const back = backs[k];
       if (back) {
-        for (let i = 0; i + 1 < back.wall.length; i++) wallSeg(back.wall[i], back.wall[i + 1], dirOf(list[k]));
-      } else if (list[k].indoor && list[next].indoor) {
-        wallSeg(mouths[k].hi, mouths[next].lo, dirOf(list[k]));
+        for (let i = 0; i + 1 < back.wall.length; i++) wallSeg(back.wall[i], back.wall[i + 1], dirOf(list[k]), [list[k], list[back.next]]);
+      } else if (list[k].indoor && list[next].indoor && !inside.has(k) && !inside.has(next)) {
+        wallSeg(mouths[k].hi, mouths[next].lo, dirOf(list[k]), []);
       }
       // Bulkhead above a lower corridor opening into a taller junction.
       const a = list[k];

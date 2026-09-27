@@ -286,12 +286,14 @@ function layoutStation(net: Network, id: string, cfg: StationCfg): StationLayout
       const q = loc(p);
       const si = surfs.push({ p, t0: q.t - p.width / 2, t1: q.t + p.width / 2, s0: q.s0, s1: q.s1, track: {} }) - 1;
       const nums = p.nameJa.match(/\d+/g) ?? [];
+      // The tracks run on past the stopping area beside the platform's narrower sections.
+      const along = [q.s0, q.s1, ...(p.sections ?? []).flatMap((sec) => [toLocal(f, sec.a[0], sec.a[1])[0], toLocal(f, sec.b[0], sec.b[1])[0]])];
       for (const side of [-1, 1] as const) {
         if (cfg.oneSide?.[p.id] && cfg.oneSide[p.id] !== side) continue;
         const t = q.t + side * (p.width / 2 + EDGE_TO_TRACK);
         const lineId = p.lineIds[side === -1 ? 0 : Math.min(1, p.lineIds.length - 1)];
         const label = (side === -1 ? nums[0] : nums[nums.length - 1]) ?? '';
-        cand.push({ t, s0: q.s0, s1: q.s1, lineId, label, surf: si, side });
+        cand.push({ t, s0: Math.min(...along), s1: Math.max(...along), lineId, label, surf: si, side });
       }
     }
     cand.sort((a, b) => a.t - b.t);

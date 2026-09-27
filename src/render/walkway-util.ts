@@ -94,14 +94,16 @@ export function gapWall(a: Mouth, b: Mouth, reach: number): { poly: P2[]; wall: 
   const at = (d: P2, q: P2, s: number, l: number): P2 => [d[0] * s + q[0] * l, d[1] * s + q[1] * l];
   const hi = at(da, qa, a.trim, ha);
   const lo = at(db, qb, b.trim, -hb);
-  if (segmentDistance(hi, lo) >= reach - 0.4) return null;
+  let gap = b.angle - a.angle;
+  while (gap <= 1e-9) gap += Math.PI * 2;
+  // A straight wall only closes a gap narrower than a half turn (wider, it would stand on the
+  // other side of the node).
+  if (gap < Math.PI && segmentDistance(hi, lo) >= reach - 0.4) return null;
   // Just outside the walk-space disc (a 12-gon of circumradius (reach − 0.1) / cos 15°), with
   // chords of ≤ 20° that stay outside it too.
   const R = Math.max(0.5, reach - 0.1) / Math.cos(Math.PI / 12) + 0.15;
   const sa = Math.sqrt(Math.max(0, R * R - ha * ha));
   const sb = Math.sqrt(Math.max(0, R * R - hb * hb));
-  let gap = b.angle - a.angle;
-  while (gap <= 1e-9) gap += Math.PI * 2;
   const span = gap - Math.atan2(ha, sa) - Math.atan2(hb, sb);
   if (span <= 0.02) return null;
   const ea = at(da, qa, sa, ha);

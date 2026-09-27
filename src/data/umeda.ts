@@ -88,7 +88,7 @@ export const umeda: DataSet = {
     { title: '大阪駅.net：北新地→御堂筋線梅田', url: 'https://osaka-station.net/archives/1200' },
     { title: 'おにぎりフェイス：北新地⇔西梅田', url: 'https://onigiriface.jp/jr-kitashinchi-yotsubashi-nishiumeda.html' },
     { title: '旅シーズン：御堂筋線梅田→うめきた地下口', url: 'https://www.tabiseason.com/accsnr/asnrossri.html' },
-    { title: 'OpenStreetMap（Overture Maps 経由）', url: 'https://www.openstreetmap.org/copyright', note: '周辺の建物・道路：© OpenStreetMap contributors（ODbL）' },
+    { title: 'OpenStreetMap（Overture Maps 経由）', url: 'https://www.openstreetmap.org/copyright', note: '周辺の建物・道路、駅のホーム・改札・通路の位置：© OpenStreetMap contributors（ODbL）' },
   ],
   caveats: [
     '位置・高さ・通路長は公開情報と推定に基づく概略モデルです（誤差は数十m程度）。実際の構内図・案内表示を優先してください。',
