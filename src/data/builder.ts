@@ -718,22 +718,38 @@ export class NetBuilder {
         else if (t1 <= 0) left = Math.min(left, -t1 - 0.5);
         else left = right = 0;
       }
-      // On a platform people keep 1 m back from its edges (screens, tactile strip, the tracks).
-      const plat = e.kind === 'gate' ? undefined : (this.platformUnder(a) ?? this.platformUnder(b));
-      if (plat) {
-        const pl = Math.hypot(plat.b[0] - plat.a[0], plat.b[1] - plat.a[1]) || 1;
-        const po = { x: plat.a[0], z: plat.a[1] };
-        const pu = { x: (plat.b[0] - plat.a[0]) / pl, z: (plat.b[1] - plat.a[1]) / pl };
-        const c = -u.z * -pu.z + u.x * pu.x; // lateral rate of the edge's right-hand normal
-        const hw = plat.width / 2;
-        const steps = Math.max(1, Math.ceil(len));
-        for (let k = 0; k <= steps && Math.abs(c) > 0.05; k++) {
-          const p = { x: a.x + (b.x - a.x) * (k / steps), z: a.z + (b.z - a.z) * (k / steps) };
-          const t = alongOf(po, pu, p);
-          if (t < 0 || t > pl) continue;
-          const q = lateralOf(po, pu, p);
-          right = Math.min(right, (c > 0 ? hw - q : q + hw) / Math.abs(c) - 1);
-          left = Math.min(left, (c > 0 ? q + hw : hw - q) / Math.abs(c) - 1);
+      // On a platform people keep 1 m back from its edges (screens, tactile strip, the tracks),
+      // and beyond its end they keep back from the ends of the tracks.
+      if (e.kind !== 'gate') {
+        const n = { x: -u.z, z: u.x }; // the edge's right-hand side
+        for (const plat of this.platforms) {
+          if (Math.abs(plat.y - y) > 0.6) continue;
+          const pl = Math.hypot(plat.b[0] - plat.a[0], plat.b[1] - plat.a[1]) || 1;
+          const po = { x: plat.a[0], z: plat.a[1] };
+          const pu = { x: (plat.b[0] - plat.a[0]) / pl, z: (plat.b[1] - plat.a[1]) / pl };
+          // A 阪急-style group record is walked on its middle platform, between two tracks.
+          const hw = plat.width >= 16 ? plat.width / 4 - 1.65 : plat.width / 2;
+          const cq = n.x * -pu.z + n.z * pu.x; // lateral rate of the right-hand side
+          const ct = n.x * pu.x + n.z * pu.z; // along-platform rate of the right-hand side
+          const steps = Math.max(1, Math.ceil(len));
+          for (let k = 0; k <= steps; k++) {
+            const p = { x: a.x + (b.x - a.x) * (k / steps), z: a.z + (b.z - a.z) * (k / steps) };
+            const t = alongOf(po, pu, p);
+            const q = lateralOf(po, pu, p);
+            if (Math.abs(q) > hw + 0.5) continue;
+            if (t >= 0 && t <= pl) {
+              if (Math.abs(cq) < 0.05) continue;
+              right = Math.min(right, (cq > 0 ? hw - q : q + hw) / Math.abs(cq) - 1);
+              left = Math.min(left, (cq > 0 ? q + hw : hw - q) / Math.abs(cq) - 1);
+            } else {
+              const gap = t < 0 ? -t : t - pl;
+              if (gap > 12 || Math.abs(ct) < 0.05) continue;
+              // Buffer stops stand ≈1.5 m inside the platform end; trains stop short of them.
+              const d = gap / Math.abs(ct) + 0.5;
+              if ((t < 0) === (ct > 0)) right = Math.min(right, d);
+              else left = Math.min(left, d);
+            }
+          }
         }
       }
       if (left < 8 || right < 8) e.room = [Math.max(0, Math.min(8, left)), Math.max(0, Math.min(8, right))];
