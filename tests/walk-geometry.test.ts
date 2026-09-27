@@ -12,7 +12,8 @@ import { Soup, type Tri } from './support/soup';
  * Physical consistency of the walk-through (the user's complaint: 「壁を抜けたり、階段の位置が
  * おかしい」): build the walk-mode scene exactly as the view does, walk every edge of the network
  * the way the walker does (and along the outermost lanes the crowd uses), and check that nothing
- * solid stands in the way, nothing horizontal cuts through a body, and there is always a floor.
+ * solid stands in the way — walkway, station or city — nothing horizontal cuts through a body,
+ * and there is always a floor.
  */
 
 const EX = 1.5;
@@ -112,8 +113,13 @@ const total = (m: Map<string, number>, re: RegExp = /./) => [...m].filter(([k]) 
 
 describe('walking through the 3D model', () => {
   it('never walks the walker through the walkway geometry (walls, shops, glass, fittings, flights)', () => {
-    expect(total(tally.wall, /^(walls|shopfronts|glass|fittings|stairs|escalator-treads)$/)).toBeLessThanOrEqual(8);
-    expect(total(tally.slab, /^(floor-|ceilings|stairs|escalator-treads)/)).toBeLessThanOrEqual(10);
+    expect(total(tally.wall, /^(walls|shopfronts|glass|fittings|stairs|escalator-treads)$/)).toBeLessThanOrEqual(3);
+    expect(total(tally.slab, /^(floor-|ceilings|stairs|escalator-treads)/)).toBeLessThanOrEqual(3);
+  });
+
+  it('never walks the walker through a station or a building (structure, glass, trains, facades, roofs)', () => {
+    expect(total(tally.wall, /^(station-|train-|city-)/)).toBeLessThanOrEqual(2);
+    expect(total(tally.slab, /^(station-|city-)/)).toBeLessThanOrEqual(2);
   });
 
   it('always has a floor under the walker', () => {
@@ -122,6 +128,7 @@ describe('walking through the 3D model', () => {
 
   it('keeps the crowd on floors and out of the walkway geometry', () => {
     expect(total(tally.crowdWall, /^(walls|shopfronts|glass|fittings|stairs|escalator-treads)$/)).toBeLessThanOrEqual(10);
-    expect(tally.crowdFloating).toBeLessThanOrEqual(10);
+    expect(total(tally.crowdWall, /^(station-|train-|city-)/)).toBeLessThanOrEqual(20);
+    expect(tally.crowdFloating).toBeLessThanOrEqual(5);
   });
 });
