@@ -2,6 +2,8 @@
 
 大阪・梅田エリアの 8 駅について、**ホームからホームまでの最適な乗り換えルート**を 3D の歩行者ネットワーク上で計算・可視化するシミュレーターです。
 
+**▶ ブラウザで開く：https://issan9411-tech.github.io/umeda-transfer-3d/**（インストール不要。PC の Chrome / Edge / Safari 推奨）
+
 | 駅 | 事業者・路線 | ホーム階 |
 | --- | --- | --- |
 | JR大阪駅（1〜11番） | 環状線・JR京都線・JR神戸線・JR宝塚線・特急 | 2階（高架） |
@@ -36,13 +38,16 @@
 ## 使い方
 
 ```bash
-cd umeda-transfer-3d
 npm install
 npm run dev          # http://localhost:5173/
 npm test             # アルゴリズム・データ整合性・公表値との比較テスト
 npm run build        # dist/ に静的サイトを出力
 npm run build:single # dist-single/index.html（1ファイルで完結する版）を出力
 ```
+
+### 公開（GitHub Pages）
+
+`main` に push すると `.github/workflows/deploy-pages.yml` が型チェックとビルドを行い、`dist/` を GitHub Pages に公開します（テストは同じワークフローの別ジョブで実行）。初回だけ、リポジトリの Settings → Pages → Build and deployment の Source を「GitHub Actions」にしてください。
 
 ## 計算モデル
 
